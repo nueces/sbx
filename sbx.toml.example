@@ -1,0 +1,20 @@
+[sbx]
+agent = "pi"
+name = "pi"
+image = "~/.smolvm/images/debian-sbx"
+memory = 2048
+cpus = 2
+boot_timeout = 60
+run_user = "agent"
+
+# Mount this repo into the guest for testing.
+project_path = "."
+writable_mounts = true
+
+# Keep the VM around after the first test run so you can inspect it.
+stop_on_exit = false
+
+# The image already contains Pi; do not copy host credentials by default.
+copy_host_credentials = false
+env = []
+git_config = true
