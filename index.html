@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <meta
+            name="description"
+            content="sbx runs coding agents in disposable small-box VMs so you can explore risky code safely."
+        />
+        <title>sbx — small boxes for dungeon runs</title>
+        <link rel="icon" href="assets/sbx-icon.svg" type="image/svg+xml" />
+        <link rel="stylesheet" href="styles.css" />
+    </head>
+    <body>
+        <input
+            class="theme-toggle"
+            id="theme-toggle"
+            type="checkbox"
+            aria-label="Use dark dungeon theme"
+        />
+        <header class="site-header">
+            <nav class="nav" aria-label="Main navigation">
+                <a class="brand" href="#top" aria-label="sbx home">
+                    <img
+                        src="assets/sbx-icon.svg"
+                        alt=""
+                        width="40"
+                        height="40"
+                    />
+                    <span>sbx</span>
+                </a>
+                <div class="nav-links">
+                    <a href="#why">why</a>
+                    <a href="#how">how it works</a>
+                    <a href="#commands">commands</a>
+                    <a href="#safety">safety</a>
+                    <a href="https://github.com/nueces/sbx">github</a>
+                    <label class="theme-label" for="theme-toggle"
+                        ><span class="light-label">dark</span
+                        ><span class="dark-label">light</span></label
+                    >
+                </div>
+            </nav>
+        </header>
+
+        <section id="top" class="hero">
+            <div class="hero-copy pixel-frame">
+                <span class="eyebrow">LOW-FI DUNGEON MACHINE · DEV TOOL</span>
+                <h1>Small boxes for dungeon runs.</h1>
+                <p class="subtitle">
+                    sbx sends your coding agent into a disposable VM, so you can
+                    explore risky code safely without handing the dungeon your
+                    host credentials.
+                </p>
+                <div class="hero-actions">
+                    <a class="button" href="#commands">Start a run</a>
+                    <a class="button secondary" href="#safety"
+                        >Read the safety rules</a
+                    >
+                </div>
+            </div>
+            <div
+                class="hero-art pixel-frame"
+                aria-label="Pixel dungeon scene with sbx pouch"
+            >
+                <div class="logo-card">
+                    <img
+                        src="assets/sbx-logo.svg"
+                        alt="sbx low-fi pouch logo"
+                    />
+                </div>
+                <div class="dungeon" aria-hidden="true">
+                    <span class="brick b1"></span>
+                    <span class="brick b2"></span>
+                    <span class="brick b3"></span>
+                    <span class="brick b4"></span>
+                    <span class="door"></span>
+                    <span class="torch"></span>
+                </div>
+            </div>
+        </section>
+
+        <main>
+            <section id="why">
+                <h2>The quest: Explore risky code safely.</h2>
+                <p class="section-intro">
+                    Coding agents are powerful, but unknown repositories are
+                    dungeons. Build scripts, package installs, shell commands,
+                    and generated patches can all hide traps. sbx lets the agent
+                    explore inside a small box instead of your host machine.
+                </p>
+                <div class="cards">
+                    <article class="card pixel-frame">
+                        <div class="rune">▣</div>
+                        <h3>Disposable VM</h3>
+                        <p>
+                            Create, enter, inspect, and throw away a QEMU-backed
+                            SmolVM sandbox when the run is done.
+                        </p>
+                    </article>
+                    <article class="card pixel-frame">
+                        <div class="rune">$</div>
+                        <h3>Agent-ready</h3>
+                        <p>
+                            Run Pi, Claude, or Codex inside the guest while
+                            keeping your host environment out of reach by
+                            default.
+                        </p>
+                    </article>
+                    <article class="card pixel-frame">
+                        <div class="rune">◇</div>
+                        <h3>Credential cautious</h3>
+                        <p>
+                            Host credentials are not copied unless you
+                            explicitly ask for them. Safe Git identity
+                            forwarding is separate.
+                        </p>
+                    </article>
+                </div>
+            </section>
+
+            <section id="how" class="split">
+                <div>
+                    <h2>The dungeon loop</h2>
+                    <div class="steps">
+                        <div class="step pixel-frame">
+                            <div>
+                                <h3>Pick a box</h3>
+                                <p>
+                                    Use a preset image or a local ready-to-run
+                                    image for your agent.
+                                </p>
+                            </div>
+                        </div>
+                        <div class="step pixel-frame">
+                            <div>
+                                <h3>Enter the run</h3>
+                                <p>
+                                    <code>sbx run</code> creates or starts the
+                                    VM, exposes auth callback forwarding, and
+                                    attaches to the agent.
+                                </p>
+                            </div>
+                        </div>
+                        <div class="step pixel-frame">
+                            <div>
+                                <h3>Explore</h3>
+                                <p>
+                                    Mount your project, run commands, test
+                                    patches, and keep risky effects inside the
+                                    guest.
+                                </p>
+                            </div>
+                        </div>
+                        <div class="step pixel-frame">
+                            <div>
+                                <h3>Leave clean</h3>
+                                <p>
+                                    Stop, recreate, or destroy the sandbox when
+                                    the dungeon has been mapped.
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div>
+                    <h3>Summoning steps / Installation</h3>
+                    <div
+                        class="terminal"
+                        aria-label="Example terminal commands"
+                    >
+                        <pre><span class="comment"># clone and install the tool</span>
+<span class="prompt">$</span> git clone https://github.com/nueces/sbx.git
+<span class="prompt">$</span> uv tool install --editable sbx
+
+<span class="comment"># select you quest and jump into it</span>
+<span class="prompt">$</span> cd into/your/project
+
+<span class="comment"># create if missing, start if stopped, attach to your Agent</span>
+<span class="prompt">$</span> sbx run the-quest
+
+<span class="comment"># open a shell in an existing box</span>
+<span class="prompt">$</span> sbx shell the-quest
+
+<span class="comment"># throw away the dungeon state</span>
+<span class="prompt">$</span> sbx recreate the-quest --force</pre>
+                    </div>
+                </div>
+            </section>
+
+            <section id="commands">
+                <h2>What the small box carries</h2>
+                <div class="split">
+                    <div class="card pixel-frame">
+                        <h3>Core commands</h3>
+                        <ul class="feature-list">
+                            <li>
+                                <code>sbx run [NAME]</code> — main agent
+                                workflow
+                            </li>
+                            <li>
+                                <code>sbx create [NAME]</code> — provision
+                                without attaching
+                            </li>
+                            <li>
+                                <code>sbx shell [NAME]</code> — open a guest
+                                shell
+                            </li>
+                            <li>
+                                <code>sbx recreate [NAME]</code> — delete and
+                                start fresh
+                            </li>
+                            <li>
+                                <code>sbx network status [NAME]</code> — inspect
+                                tunnels
+                            </li>
+                        </ul>
+                    </div>
+                    <div class="card pixel-frame">
+                        <h3>Treasure maps for repeatable runs</h3>
+                        <p>
+                            Put the route in <code>.sbx.toml</code>: agent,
+                            image, mounts, user, and safety defaults. The next
+                            dungeon run starts from the same map, so teammates
+                            and future-you can reproduce the same sandbox path.
+                        </p>
+                        <div class="terminal">
+                            <pre>
+[sbx]
+agent = "pi"
+name = "project-sbx"
+project_path = "."
+writable_mounts = true
+run_user = "agent"
+copy_host_credentials = false</pre
+                            >
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section id="safety">
+                <h2>Safety rules</h2>
+                <div class="split">
+                    <article class="card pixel-frame">
+                        <h3>Protected by default</h3>
+                        <ul class="feature-list">
+                            <li>Agents run in the VM, not on the host.</li>
+                            <li>
+                                Host credential files are not copied by default.
+                            </li>
+                            <li>
+                                Project mounts can be explicit and disposable.
+                            </li>
+                            <li>
+                                OAuth callback forwarding is tracked by sbx.
+                            </li>
+                        </ul>
+                    </article>
+                    <article class="card pixel-frame warning">
+                        <h3>Know the trap doors</h3>
+                        <p>
+                            <strong>sbx is isolation, not magic.</strong> Only
+                            copy host credentials when you mean it. Treat
+                            writable mounts as shared ground between the
+                            adventurer and the dungeon.
+                        </p>
+                    </article>
+                </div>
+            </section>
+
+            <section>
+                <h2>
+                    Coming soon: package auth without handing over the treasure
+                </h2>
+                <p class="section-intro">
+                    Package-auth mediation is in progress. The goal is to let
+                    tools like <code>uv sync</code> reach authenticated package
+                    indexes from inside the VM while real package tokens stay on
+                    the host.
+                </p>
+                <div class="card pixel-frame warning">
+                    <h3>Not public-ready yet</h3>
+                    <p>
+                        This feature is still being hardened. When it lands, the
+                        intended flow is: the guest receives a placeholder
+                        credential, and a host-side proxy swaps it only for the
+                        configured package path.
+                    </p>
+                </div>
+            </section>
+
+            <footer class="footer">
+                <div>
+                    <strong>sbx</strong><br />small boxes for dungeon runs
+                </div>
+                <div>
+                    <a href="https://github.com/nueces/sbx"
+                        >github.com/nueces/sbx</a
+                    >
+                </div>
+            </footer>
+        </main>
+    </body>
+</html>
