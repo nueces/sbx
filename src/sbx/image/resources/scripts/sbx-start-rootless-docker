@@ -1,0 +1,42 @@
+#!/usr/bin/env sh
+set -eu
+
+DOCKER_USER="${SBX_DOCKER_USER:-agent}"
+DOCKER_UID="${SBX_DOCKER_UID:-1000}"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$DOCKER_UID}"
+SOCK="unix://$RUNTIME_DIR/docker.sock"
+DOCKER_PATH="/usr/sbin:/sbin:$PATH"
+LOG_PATH="${1:-/var/log/dockerd-rootless.log}"
+
+if [ "$(id -u)" != 0 ]; then
+  exec sudo "$0" "$@"
+fi
+
+as_user() {
+  sudo -iu "$DOCKER_USER" env PATH="$DOCKER_PATH" XDG_RUNTIME_DIR="$RUNTIME_DIR" DOCKER_HOST="$SOCK" "$@"
+}
+
+if as_user docker version >/dev/null 2>&1; then
+  exit 0
+fi
+
+printf 'nameserver 10.0.2.3\nnameserver 8.8.8.8\nnameserver 8.8.4.4\n' > /etc/resolv.conf
+mkdir -p /sys/fs/cgroup /dev/net "$RUNTIME_DIR"
+mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
+mknod /dev/net/tun c 10 200 2>/dev/null || true
+chmod 666 /dev/net/tun 2>/dev/null || true
+chown "$DOCKER_USER:$DOCKER_USER" "$RUNTIME_DIR"
+chmod 700 "$RUNTIME_DIR"
+
+as_user dockerd-rootless.sh >"$LOG_PATH" 2>&1 &
+
+i=0
+while ! as_user docker version >/dev/null 2>&1; do
+  i=$((i + 1))
+  if [ "$i" -ge 30 ]; then
+    echo "rootless Docker did not start; log: $LOG_PATH" >&2
+    tail -80 "$LOG_PATH" >&2 || true
+    exit 1
+  fi
+  sleep 1
+done

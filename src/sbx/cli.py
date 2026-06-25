@@ -18,7 +18,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+import sbx.image.ls
 from sbx.completion import SUPPORTED_SHELLS, completion_script
+from sbx.image import build_debian
 
 try:  # Python 3.11+
     import tomllib
@@ -1354,6 +1356,14 @@ def cmd_completion(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_image_build_debian(args: argparse.Namespace) -> int:
+    return build_debian.main_from_args(args)
+
+
+def cmd_image_ls(args: argparse.Namespace) -> int:
+    return sbx.image.ls.main_from_args(args)
+
+
 def cmd_start(args: argparse.Namespace) -> int:
     config = args.config_data
     sbx_cfg = _sbx_config(config)
@@ -2059,6 +2069,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     network_status.set_defaults(func=cmd_network_status)
 
+    image = sub.add_parser("image", help="Advanced local image helpers.")
+    image_sub = image.add_subparsers(dest="image_action", required=True)
+    build_debian_parser = image_sub.add_parser(
+        "build-debian", help="Build a local Debian Pi image for sbx."
+    )
+    build_debian.add_arguments(build_debian_parser)
+    build_debian_parser.set_defaults(func=cmd_image_build_debian)
+
+    list_images_parser = image_sub.add_parser("ls", help="List local sbx images.")
+    sbx.image.ls.add_arguments(list_images_parser)
+    list_images_parser.set_defaults(func=cmd_image_ls)
+
     doctor = sub.add_parser("doctor", help="Run non-sudo diagnostics for the configured backend.")
     doctor.set_defaults(func=cmd_doctor)
 
@@ -2098,7 +2120,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _debug(f"argv: {raw_argv}")
     if normalized_argv != raw_argv:
         _debug(f"normalized argv: {normalized_argv}")
-    if args.action == "completion":
+    if args.action in {"completion", "image"}:
         args.config_data = {}
     else:
         try:

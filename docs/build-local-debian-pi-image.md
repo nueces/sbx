@@ -1,34 +1,40 @@
 # Build and run a local Debian Pi image
 
-This project can run `sbx` from a local ready-to-run SmolVM image directory. In this mode the image is expected to already contain Pi, so `sbx` boots the image directly and attaches to run `pi`; it does not run SmolVM's preset installer.
+`sbx image build-debian` builds a ready-to-run SmolVM image directory that already contains Pi. `sbx` boots that image directly and attaches to run `pi`; it does not run SmolVM's preset installer.
 
-## 1. Customize the Containerfiles
+## 1. Image build command
 
-The image recipe is split into two Containerfile fragments:
+The builder is an advanced `sbx` subcommand:
+
+```bash
+sbx image build-debian
+```
+
+The image recipe is packaged with `sbx` and split into two Containerfile fragments:
 
 ```text
-Containers/
+src/sbx/image/resources/Containers/
 ├── Debian/
 │   └── Base.Containerfile
 └── Agents/
     └── Pi.Containerfile
 ```
 
-`Containers/Debian/Base.Containerfile` defines the reusable Debian base OS layer. It currently:
+`src/sbx/image/resources/Containers/Debian/Base.Containerfile` defines the reusable Debian base OS layer. It currently:
 
 - starts from `debian:stable-slim`
 - configures the NodeSource Node.js 22.x apt repository directly
 - installs Node.js and basic tools
 - creates an `agent` user with passwordless sudo
 
-`Containers/Agents/Pi.Containerfile` defines the agent/tooling layer. It currently:
+`src/sbx/image/resources/Containers/Agents/Pi.Containerfile` defines the agent/tooling layer. It currently:
 
 - installs `@earendil-works/pi-coding-agent` for the `agent` user
 - links `pi` into `/home/agent/.local/bin/pi`
 - installs `uv`
 - installs spec-kit CLI with `uv tool install specify-cli --from git+https://github.com/github/spec-kit.git`
 
-The build script combines these fragments into a temporary Containerfile. Docker layer caching still makes the base OS layer reusable across tooling changes.
+The build command reads these packaged resources with `importlib.resources` and combines them into a temporary Containerfile. Docker layer caching still makes the base OS layer reusable across tooling changes.
 
 Because Pi and uv tools are installed for `agent`, the matching `sbx` config should use:
 
@@ -36,55 +42,73 @@ Because Pi and uv tools are installed for `agent`, the matching `sbx` config sho
 run_user = "agent"
 ```
 
-## 2. Build the image
+## 2. Install the tools
 
-Run:
+Install the currently supported tools first:
 
 ```bash
-./scripts/build-debian-image.py
+uv tool install --editable .
+uv tool install 'smolvm==0.0.19'
+```
+
+`sbx` pins SmolVM `0.0.19` for now. Newer SmolVM compatibility is separate work.
+
+## 3. Build the image
+
+Run the image build command:
+
+```bash
+sbx image build-debian
 ```
 
 Useful options:
 
 ```bash
-./scripts/build-debian-image.py \
+sbx image build-debian \
   --name debian-sbx \
   --rootfs-size-mb 40960
 ```
 
-The script combines the base and agent Containerfiles, builds that combined Containerfile first, and passes the resulting Docker image into SmolVM's Debian image builder. If the combined Containerfile ends with `USER agent`, the script wraps it with a tiny `USER root` image so SmolVM's builder can still run its root-level SSH/init setup.
+The subcommand combines the base/agent Containerfiles, plus Docker when `--with-docker` is set, builds that combined Containerfile first, and passes the resulting Docker image into SmolVM's Debian image builder. If the combined Containerfile ends with `USER agent`, the subcommand wraps it with a tiny `USER root` image so SmolVM's builder can still run its root-level SSH/init setup.
 
-You can override the fragments:
+For local experiments, you can override the packaged fragments with your own files:
 
 ```bash
-./scripts/build-debian-image.py \
-  --base-containerfile Containers/Debian/Base.Containerfile \
-  --agent-containerfile Containers/Agents/Pi.Containerfile
+sbx image build-debian \
+  --base-containerfile path/to/Base.Containerfile \
+  --agent-containerfile path/to/Pi.Containerfile
 ```
 
 Or pass a fully composed Containerfile directly:
 
 ```bash
-./scripts/build-debian-image.py --containerfile path/to/Containerfile
+sbx image build-debian --containerfile path/to/Containerfile
 ```
 
-By default the script prints only the built image paths and a minimal `sbx` config snippet. To also print a SmolVM SDK usage sketch after building, pass `--sdk-sketch`.
+By default the subcommand prints only the built image paths and a minimal `sbx` config snippet. To also print a SmolVM SDK usage sketch after building, pass `--sdk-sketch`.
 
 To print the SDK sketch later without rebuilding the image, run:
 
 ```bash
-./scripts/build-debian-image.py --print-sdk-sketch ~/.smolvm/images/debian-sbx
+sbx image build-debian --print-sdk-sketch ~/.smolvm/images/debian-sbx
 ```
 
-The script also writes a local image manifest:
+The subcommand also writes a local image manifest:
 
 ```text
 ~/.smolvm/images/debian-sbx/smolvm-image.json
 ```
 
-and uses SmolVM's QEMU-compatible kernel by default.
+List built images:
 
-## 3. Local image directory layout
+```bash
+sbx image ls
+sbx image ls --json
+```
+
+and uses SmolVM's QEMU-compatible kernel by default. With `--with-docker`, it builds a Docker-capable kernel from pinned SmolVM kernel build inputs and stores it as `vmlinux-docker.bin` in the image directory.
+
+## 4. Local image directory layout
 
 After a successful build, the image directory should look like:
 
@@ -92,6 +116,7 @@ After a successful build, the image directory should look like:
 ~/.smolvm/images/debian-sbx/
 ├── smolvm-image.json
 ├── vmlinux.bin
+├── vmlinux-docker.bin  # only when built with --with-docker
 └── rootfs.ext4
 ```
 
@@ -105,12 +130,13 @@ Example manifest:
   "boot_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init",
   "sbx": {
     "agent": "pi",
+    "features": [],
     "launch_command": "pi"
   }
 }
 ```
 
-## 4. Configure `sbx`
+## 5. Configure `sbx`
 
 Create or update `.sbx.toml`:
 
@@ -121,7 +147,6 @@ name = "debian-pi-test"
 image = "~/.smolvm/images/debian-sbx"
 memory = 2048
 cpus = 2
-disk_size = 40960
 boot_timeout = 60
 run_user = "agent"
 
@@ -140,7 +165,7 @@ Important: `copy_host_credentials = false` prevents host credential/config copyi
 
 `git_config = true` is the default and only copies a safe subset of host Git identity/workflow settings, such as `user.name` and `user.email`, so commits inside the VM have the expected author. It does not copy Git credentials, SSH keys, GPG/signing keys, credential helpers, includes, or URL rewrite rules.
 
-## 5. Run it
+## 6. Run it
 
 Use the configured name from `.sbx.toml`:
 
@@ -156,11 +181,99 @@ sbx --debug run pi
 
 means "run a sandbox named `pi`", not "run the Pi agent".
 
+## Docker guest usage
+
+### Host
+
+Install Docker on the host, then build the Docker-capable image and point `.sbx.toml` at it. Kernel compile tools run inside the packaged `Containers/Build/Kernel.Containerfile`; the guest image installs Docker from Docker's official Debian apt repository. No host kernel compiler packages are required.
+
+Ensure Docker works on the host for the image build:
+
+```bash
+docker version
+```
+
+```bash
+sbx image build-debian \
+  --with-docker \
+  --name debian-sbx-docker \
+  --rootfs-size-mb 81920
+```
+
+```toml
+[sbx]
+image = "~/.smolvm/images/debian-sbx-docker"
+run_user = "agent"
+```
+
+Create or recreate the VM after changing the image. If the rootfs was built with `--rootfs-size-mb 81920`, omit `disk_size` unless you intentionally want SmolVM to grow the per-VM disk.
+
+Rootless Docker starts at VM boot in Docker-capable images. Inside the guest, use Docker normally:
+
+```bash
+docker run --rm hello-world
+```
+
+Rootless Docker data lives on the VM disk under Docker's default rootless data directory:
+
+```text
+/home/agent/.local/share/docker
+```
+
+The runtime socket/state is separate and recreated at boot:
+
+```text
+/run/user/1000/docker.sock
+/run/user/1000/dockerd-rootless
+```
+
+SmolVM does not run systemd/logind, so the image creates `/run/user/1000` and exports `XDG_RUNTIME_DIR`/`DOCKER_HOST`; this matches the normal rootless Docker path for uid 1000.
+
+To persist pulled images/build cache across VM recreation, mount a host directory at the rootless Docker data path:
+
+```toml
+[sbx]
+mount = ["/host/path/docker-data:/home/agent/.local/share/docker"]
+writable_mounts = true
+```
+
+Use an ext4-backed host path if possible. 9p/workspace mounts may be slow or unsupported for Docker storage; if it fails, keep Docker data on the VM disk. Mounted workspaces can still be used as build contexts initially; if 9p is slow or fails, copy the context into the VM disk first.
+
 ## Troubleshooting
+
+### Rootless Docker did not start
+
+Check the boot logs:
+
+```bash
+sudo cat /var/log/sbx-rootless-docker.log
+sudo cat /var/log/dockerd-rootless.log
+```
+
+Restart manually if needed:
+
+```bash
+sudo /usr/local/bin/sbx-start-rootless-docker
+```
+
+The helper applies the temporary SmolVM/QEMU DNS workaround: `10.0.2.3` is QEMU slirp DNS; `10.0.2.2` is the gateway and can add ~5s resolver delays.
+
+### Rootful Docker troubleshooting
+
+Run rootful Docker directly only for debugging:
+
+```bash
+sudo mkdir -p /sys/fs/cgroup
+sudo mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
+sudo dockerd --host=unix:///var/run/docker.sock >/tmp/dockerd.log 2>&1 &
+sudo docker run --rm hello-world
+```
+
+Rootful Docker data lives under `/var/lib/docker`.
 
 ### `QEMU exited early` / `Error loading uncompressed kernel without PVH ELF Note`
 
-The image was likely built with SmolVM's Firecracker-compatible ELF kernel. Rebuild with the current `scripts/build-debian-image.py`; it selects SmolVM's QEMU-compatible kernel by default.
+The image was likely built with SmolVM's Firecracker-compatible ELF kernel. Rebuild with the current `sbx image build-debian` command; it selects SmolVM's QEMU-compatible kernel by default.
 
 ### VM starts but SSH readiness times out
 
@@ -185,7 +298,7 @@ boot_timeout = 90
 
 ### `bash: exec: pi: not found`
 
-Pi is installed under `/home/agent/.local/bin/pi` by `Containers/Agents/Pi.Containerfile`. Ensure `.sbx.toml` includes:
+Pi is installed under `/home/agent/.local/bin/pi` by the packaged `Containers/Agents/Pi.Containerfile`. Ensure `.sbx.toml` includes:
 
 ```toml
 run_user = "agent"

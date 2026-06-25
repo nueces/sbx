@@ -4,7 +4,6 @@ name = "pi"
 image = "~/.smolvm/images/debian-sbx"
 memory = 2048
 cpus = 2
-boot_timeout = 60
 run_user = "agent"
 
 # Mount this repo into the guest for testing.
