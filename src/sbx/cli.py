@@ -18,7 +18,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+import sbx.image.ls
 from sbx.completion import SUPPORTED_SHELLS, completion_script
+from sbx.image import build_debian
 
 try:  # Python 3.11+
     import tomllib
@@ -1355,9 +1357,11 @@ def cmd_completion(args: argparse.Namespace) -> int:
 
 
 def cmd_image_build_debian(args: argparse.Namespace) -> int:
-    from sbx.image import build_debian
-
     return build_debian.main_from_args(args)
+
+
+def cmd_image_ls(args: argparse.Namespace) -> int:
+    return sbx.image.ls.main_from_args(args)
 
 
 def cmd_start(args: argparse.Namespace) -> int:
@@ -2070,10 +2074,12 @@ def build_parser() -> argparse.ArgumentParser:
     build_debian_parser = image_sub.add_parser(
         "build-debian", help="Build a local Debian Pi image for sbx."
     )
-    from sbx.image import build_debian
-
     build_debian.add_arguments(build_debian_parser)
     build_debian_parser.set_defaults(func=cmd_image_build_debian)
+
+    list_images_parser = image_sub.add_parser("ls", help="List local sbx images.")
+    sbx.image.ls.add_arguments(list_images_parser)
+    list_images_parser.set_defaults(func=cmd_image_ls)
 
     doctor = sub.add_parser("doctor", help="Run non-sudo diagnostics for the configured backend.")
     doctor.set_defaults(func=cmd_doctor)

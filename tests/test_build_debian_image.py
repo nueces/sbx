@@ -87,6 +87,8 @@ def test_build_debian_image_omits_sdk_sketch_by_default(
     assert "run_user = 'agent'" in out
     assert "SDK usage sketch:" not in out
     assert "from smolvm import SmolVM" not in out
+    manifest = json.loads((tmp_path / "image" / "smolvm-image.json").read_text())
+    assert manifest["sbx"]["features"] == []
 
 
 def test_build_debian_image_prints_sdk_sketch_when_requested(
@@ -400,6 +402,7 @@ def test_build_debian_image_with_docker_inserts_fragment_and_uses_docker_kernel(
     assert docker_kernel_args["arch"] == "amd64"
     manifest = json.loads((tmp_path / "docker-image" / "smolvm-image.json").read_text())
     assert manifest["kernel"] == "vmlinux-docker.bin"
+    assert manifest["sbx"]["features"] == ["docker"]
     assert manifest["sbx"]["launch_command"] == "pi"
     init_script = (tmp_path / "docker-image" / "init-script.txt").read_text(encoding="utf-8")
     assert "sbx-start-rootless-docker" in init_script

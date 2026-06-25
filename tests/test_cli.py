@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -1554,3 +1555,61 @@ def test_image_build_debian_subcommand(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert cli.main(["image", "build-debian", "--with-docker", "--name", "docker-image"]) == 0
     assert captured == {"with_docker": True, "name": "docker-image"}
+
+
+def test_image_ls_lists_local_images(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    images = tmp_path / ".smolvm" / "images"
+    docker_image = images / "debian-sbx-docker"
+    plain_image = images / "debian-sbx"
+    invalid_image = images / "invalid"
+    docker_image.mkdir(parents=True)
+    plain_image.mkdir()
+    invalid_image.mkdir()
+    (docker_image / "smolvm-image.json").write_text(
+        '{"name":"debian-sbx-docker","kernel":"vmlinux-docker.bin","rootfs":"rootfs.ext4","sbx":{"agent":"pi","features":["docker"]}}',
+        encoding="utf-8",
+    )
+    (plain_image / "smolvm-image.json").write_text(
+        '{"name":"debian-sbx","kernel":"vmlinux.bin","rootfs":"rootfs.ext4","sbx":{"agent":"pi","features":[]}}',
+        encoding="utf-8",
+    )
+    (invalid_image / "smolvm-image.json").write_text("not json", encoding="utf-8")
+
+    assert cli.main(["image", "ls"]) == 0
+
+    out = capsys.readouterr().out
+    assert "NAME" in out
+    assert "FEATURES" in out
+    assert "debian-sbx-docker" in out
+    assert "docker" in out
+    assert "debian-sbx" in out
+    assert "invalid" not in out
+
+
+def test_image_ls_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    image = tmp_path / ".smolvm" / "images" / "debian-sbx-docker"
+    image.mkdir(parents=True)
+    (image / "smolvm-image.json").write_text(
+        '{"kernel":"vmlinux-docker.bin","rootfs":"rootfs.ext4","sbx":{"agent":"pi","features":["docker"]}}',
+        encoding="utf-8",
+    )
+
+    assert cli.main(["image", "ls", "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == [
+        {
+            "agent": "pi",
+            "features": ["docker"],
+            "kernel": "vmlinux-docker.bin",
+            "name": "debian-sbx-docker",
+            "path": str(image),
+            "rootfs": "rootfs.ext4",
+        }
+    ]

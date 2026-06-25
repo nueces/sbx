@@ -104,6 +104,7 @@ sbx run my-sbx --agent claude
 | `network auth-port [NAME]`       | Expert helper: manually expose the OAuth callback port for an already-running sandbox.   |
 | `network close-auth-port [NAME]` | Expert helper: close the tracked OAuth callback tunnel.                                  |
 | `image build-debian`             | Advanced helper: build a local Debian/Pi image, optionally with `--with-docker`.         |
+| `image ls`                       | List local ready-to-run images under `~/.smolvm/images`.                                |
 | `doctor`                         | Run non-sudo SmolVM diagnostics for QEMU.                                                |
 | `completion SHELL`               | Generate shell completion for `bash`, `zsh`, or `fish`.                                  |
 
@@ -111,35 +112,45 @@ When `NAME` is omitted, commands that operate on one sandbox use `[sbx].name` fr
 
 We intentionally keep `recreate` separate from a possible future `restart`/`reboot`: `recreate` means delete and create a fresh VM, while a soft restart would reuse the same VM disk/state.
 
-## Development
+## Images and features
 
-For a fresh checkout or agent environment, create an isolated test venv outside the
-repository. This avoids accidentally reusing a `.venv` copied from another machine
-and keeps test dependencies reproducible:
+List local ready-to-run images:
 
 ```bash
-cd /path/to/sbx/main
-UV_PROJECT_ENVIRONMENT=/tmp/sbx-test-venv uv run --extra dev pytest --no-cov
+sbx image ls
 ```
 
-Useful follow-up commands:
+Build the default Debian/Pi image:
 
 ```bash
-# Run the full test suite.
-UV_PROJECT_ENVIRONMENT=/tmp/sbx-test-venv uv run --extra dev pytest --no-cov
-
-# Run focused tests while iterating.
-UV_PROJECT_ENVIRONMENT=/tmp/sbx-test-venv uv run --extra dev pytest --no-cov tests/test_cli.py
-
-# Lint/format.
-UV_PROJECT_ENVIRONMENT=/tmp/sbx-test-venv uv run --extra dev ruff check .
-UV_PROJECT_ENVIRONMENT=/tmp/sbx-test-venv uv run --extra dev ruff format .
+sbx image build-debian --name debian-sbx
 ```
 
-Before making code changes in a fresh environment, first run the full test suite
-once with the command above to verify the checkout and tool environment are
-healthy. After changing CLI behavior, add/update focused tests and run both the
-focused tests and the full suite.
+Use it from `.sbx.toml`:
+
+```toml
+[sbx]
+image = "~/.smolvm/images/debian-sbx"
+run_user = "agent"
+```
+
+Build with Docker support:
+
+```bash
+sbx image build-debian --with-docker --name debian-sbx-docker --rootfs-size-mb 81920
+```
+
+Use the Docker-capable image:
+
+```toml
+[sbx]
+image = "~/.smolvm/images/debian-sbx-docker"
+run_user = "agent"
+```
+
+These Debian/Pi images should run as `agent`; Docker rootless also uses that user. Docker-capable images show `docker` in `sbx image ls` and start rootless Docker at boot.
+
+For details, see [`docs/build-local-debian-pi-image.md`](docs/build-local-debian-pi-image.md). For contributor setup and test commands, see [`docs/development.md`](docs/development.md).
 
 ## Configuration
 
@@ -171,7 +182,7 @@ boot_timeout = 60
 # Optional: use a local ready-to-run image directory with smolvm-image.json.
 # image = "./images/debian-pi"
 
-mount = [".:/workspace"]
+mount = ["/foo/bar:/workspace"]
 project_path = "."
 writable_mounts = true
 run_user = "agent"

@@ -55,12 +55,13 @@ The local image manifest is `smolvm-image.json`:
   "boot_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init",
   "sbx": {
     "agent": "pi",
+    "features": [],
     "launch_command": "pi"
   }
 }
 ```
 
-`sbx` reads this manifest to locate the kernel/rootfs and to validate the configured agent.
+`sbx` reads this manifest to locate the kernel/rootfs, validate the configured agent, and list image features with `sbx image ls`.
 
 ## Runtime flow
 

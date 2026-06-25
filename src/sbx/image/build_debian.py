@@ -492,6 +492,7 @@ def main_from_args(args: argparse.Namespace) -> int:
         "boot_args": boot_args,
         "sbx": {
             "agent": "pi",
+            "features": ["docker"] if args.with_docker else [],
             "launch_command": "pi",
         },
     }

@@ -99,6 +99,13 @@ The subcommand also writes a local image manifest:
 ~/.smolvm/images/debian-sbx/smolvm-image.json
 ```
 
+List built images:
+
+```bash
+sbx image ls
+sbx image ls --json
+```
+
 and uses SmolVM's QEMU-compatible kernel by default. With `--with-docker`, it builds a Docker-capable kernel from pinned SmolVM kernel build inputs and stores it as `vmlinux-docker.bin` in the image directory.
 
 ## 4. Local image directory layout
@@ -123,6 +130,7 @@ Example manifest:
   "boot_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init",
   "sbx": {
     "agent": "pi",
+    "features": [],
     "launch_command": "pi"
   }
 }
