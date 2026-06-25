@@ -11,10 +11,12 @@ COMMANDS = (
     "shell",
     "ls",
     "network",
+    "image",
     "doctor",
     "completion",
 )
 NETWORK_COMMANDS = ("auth-port", "close-auth-port", "status")
+IMAGE_COMMANDS = ("build-debian",)
 AGENTS = ("pi", "claude", "codex")
 
 GLOBAL_OPTIONS = ("--config", "--debug", "--help")
@@ -65,6 +67,23 @@ STOP_OPTIONS = ("--help",)
 RECREATE_EXTRA_OPTIONS = ("--force",)
 AUTH_PORT_OPTIONS = ("--guest-port", "--host-port", "--replace", "--help")
 NETWORK_STATUS_OPTIONS = ("--host-port", "--help")
+IMAGE_BUILD_DEBIAN_OPTIONS = (
+    "--name",
+    "--base-image",
+    "--containerfile",
+    "--dockerfile",
+    "--base-containerfile",
+    "--agent-containerfile",
+    "--with-docker",
+    "--rootfs-size-mb",
+    "--ssh-public-key",
+    "--cache-dir",
+    "--kernel-url",
+    "--json",
+    "--sdk-sketch",
+    "--print-sdk-sketch",
+    "--help",
+)
 COMPLETION_SHELLS = SUPPORTED_SHELLS
 
 
@@ -92,8 +111,10 @@ def bash_completion() -> str:
     rm_options = _words(RM_OPTIONS)
     stop_options = _words(STOP_OPTIONS)
     network_commands = _words(NETWORK_COMMANDS)
+    image_commands = _words(IMAGE_COMMANDS)
     auth_port_options = _words(AUTH_PORT_OPTIONS)
     network_status_options = _words(NETWORK_STATUS_OPTIONS)
+    image_build_debian_options = _words(IMAGE_BUILD_DEBIAN_OPTIONS)
     agents = _words(AGENTS)
     shells = _words(COMPLETION_SHELLS)
     return f"""# bash completion for sbx
@@ -162,6 +183,20 @@ _sbx_complete() {{
                 COMPREPLY=( $(compgen -W "{network_status_options}" -- "$cur") )
             fi
             ;;
+        image)
+            subcmd=""
+            for word in "${{COMP_WORDS[@]:2:COMP_CWORD-2}}"; do
+                case "$word" in
+                    --*) ;;
+                    *) subcmd="$word"; break ;;
+                esac
+            done
+            if [[ -z "$subcmd" ]]; then
+                COMPREPLY=( $(compgen -W "{image_commands}" -- "$cur") )
+            elif [[ "$subcmd" == "build-debian" ]]; then
+                COMPREPLY=( $(compgen -W "{image_build_debian_options}" -- "$cur") )
+            fi
+            ;;
         completion)
             COMPREPLY=( $(compgen -W "{shells}" -- "$cur") )
             ;;
@@ -176,15 +211,20 @@ def zsh_completion() -> str:
     start_options = " ".join(f"'{option}'" for option in START_OPTIONS)
     shell_options = " ".join(f"'{option}'" for option in SHELL_OPTIONS)
     network_commands = " ".join(f"'{command}'" for command in NETWORK_COMMANDS)
+    image_commands = " ".join(f"'{command}'" for command in IMAGE_COMMANDS)
+    image_build_debian_options = " ".join(f"'{option}'" for option in IMAGE_BUILD_DEBIAN_OPTIONS)
     shells = " ".join(f"'{shell}'" for shell in COMPLETION_SHELLS)
     return f"""#compdef sbx
 # zsh completion for sbx
 _sbx() {{
-  local -a commands start_options shell_options network_commands shells
+  local -a commands start_options shell_options network_commands
+  local -a image_commands image_build_debian_options shells
   commands=({commands})
   start_options=({start_options})
   shell_options=({shell_options})
   network_commands=({network_commands})
+  image_commands=({image_commands})
+  image_build_debian_options=({image_build_debian_options})
   shells=({shells})
 
   case $CURRENT in
@@ -202,6 +242,15 @@ _sbx() {{
         network)
           if (( CURRENT == 3 )); then
             _describe 'network command' network_commands
+          else
+            _arguments '*: :->args'
+          fi
+          ;;
+        image)
+          if (( CURRENT == 3 )); then
+            _describe 'image command' image_commands
+          elif [[ $words[3] == "build-debian" ]]; then
+            _describe 'option' image_build_debian_options
           else
             _arguments '*: :->args'
           fi
@@ -264,6 +313,17 @@ def fish_completion() -> str:
         lines.append(
             "complete -c sbx -f -n '__fish_seen_subcommand_from network; "
             f"and not __fish_seen_subcommand_from {network_subcommands}' -a {command}"
+        )
+    image_subcommands = _words(IMAGE_COMMANDS)
+    for command in IMAGE_COMMANDS:
+        lines.append(
+            "complete -c sbx -f -n '__fish_seen_subcommand_from image; "
+            f"and not __fish_seen_subcommand_from {image_subcommands}' -a {command}"
+        )
+    for option in IMAGE_BUILD_DEBIAN_OPTIONS:
+        lines.append(
+            "complete -c sbx -f -n '__fish_seen_subcommand_from build-debian' "
+            f"{_fish_flag(option)}"
         )
     for shell in COMPLETION_SHELLS:
         lines.append(f"complete -c sbx -f -n '__fish_seen_subcommand_from completion' -a {shell}")

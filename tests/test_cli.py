@@ -1538,3 +1538,19 @@ def test_invalid_agent_in_config_returns_usage_error(
 
     assert rc == 2
     assert "[sbx].agent must be one of" in capsys.readouterr().err
+
+
+def test_image_build_debian_subcommand(monkeypatch: pytest.MonkeyPatch) -> None:
+    from sbx.image import build_debian
+
+    captured = {}
+
+    def fake_main_from_args(args: object) -> int:
+        captured["with_docker"] = args.with_docker
+        captured["name"] = args.name
+        return 0
+
+    monkeypatch.setattr(build_debian, "main_from_args", fake_main_from_args)
+
+    assert cli.main(["image", "build-debian", "--with-docker", "--name", "docker-image"]) == 0
+    assert captured == {"with_docker": True, "name": "docker-image"}

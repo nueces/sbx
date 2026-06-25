@@ -17,16 +17,18 @@ import subprocess
 import sys
 import tempfile
 import urllib.request
+from collections.abc import Iterator
+from contextlib import contextmanager
+from importlib.resources import files
+from importlib.resources.abc import Traversable
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_BASE_CONTAINERFILE = PROJECT_ROOT / "Containers" / "Debian" / "Base.Containerfile"
-DEFAULT_AGENT_CONTAINERFILE = PROJECT_ROOT / "Containers" / "Agents" / "Pi.Containerfile"
-DEFAULT_DOCKER_CONTAINERFILE = (
-    PROJECT_ROOT / "Containers" / "Debian" / "fragments" / "Docker.Containerfile"
-)
-DEFAULT_DOCKER_KERNEL_FRAGMENT = PROJECT_ROOT / "kernel" / "docker.config.fragment"
-DEFAULT_KERNEL_BUILDER_DOCKERFILE = PROJECT_ROOT / "Containers" / "Build" / "Kernel.Containerfile"
+RESOURCE_PACKAGE = "sbx.image.resources"
+DEFAULT_BASE_CONTAINERFILE = Path("Containers") / "Debian" / "Base.Containerfile"
+DEFAULT_AGENT_CONTAINERFILE = Path("Containers") / "Agents" / "Pi.Containerfile"
+DEFAULT_DOCKER_CONTAINERFILE = Path("Containers") / "Debian" / "fragments" / "Docker.Containerfile"
+DEFAULT_DOCKER_KERNEL_FRAGMENT = Path("kernel") / "docker.config.fragment"
+DEFAULT_KERNEL_BUILDER_DOCKERFILE = Path("Containers") / "Build" / "Kernel.Containerfile"
 SMOLVM_KERNEL_REF = "20e1fdf72c2139622eb32ab21f288c7290bba7bf"
 SMOLVM_RAW_BASE = f"https://raw.githubusercontent.com/CelestoAI/SmolVM/{SMOLVM_KERNEL_REF}"
 SMOLVM_KERNEL_FILES = (
@@ -38,6 +40,26 @@ SMOLVM_KERNEL_FILES = (
     "linux.sha256",
 )
 DOCKER_KERNEL_NAME = "vmlinux-docker.bin"
+
+
+def _copy_resource_tree(source: Traversable, target: Path) -> None:
+    if source.is_dir():
+        target.mkdir(parents=True, exist_ok=True)
+        for child in source.iterdir():
+            _copy_resource_tree(child, target / child.name)
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(source.read_bytes())
+
+
+@contextmanager
+def _packaged_resources() -> Iterator[Path]:
+    with tempfile.TemporaryDirectory(prefix="sbx-image-build-resources-") as tmp:
+        root = Path(tmp)
+        package_root = files(RESOURCE_PACKAGE)
+        for name in ("Containers", "kernel", "scripts"):
+            _copy_resource_tree(package_root / name, root / name)
+        yield root
 
 
 def _default_public_key() -> Path | None:
@@ -74,8 +96,8 @@ def _compose_containerfiles(
     output.write_text(content, encoding="utf-8")
 
 
-def _docker_builder_class(image_builder_class: type) -> type:
-    class SbxDockerImageBuilder(image_builder_class):  # type: ignore[misc, valid-type]
+def _docker_builder_class(builder_class: type) -> type:
+    class SbxDockerImageBuilder(builder_class):  # type: ignore[misc, valid-type]
         def _default_init_script(self) -> str:
             # ponytail: protected SmolVM hook; replace with public boot hooks when upstream exists.
             return self._base_init_script(
@@ -95,22 +117,20 @@ def _download(url: str, output: Path) -> None:
         output.write_bytes(response.read())
 
 
-def _build_kernel_builder_image() -> str:
-    if not DEFAULT_KERNEL_BUILDER_DOCKERFILE.is_file():
-        raise FileNotFoundError(
-            f"Kernel builder Dockerfile not found: {DEFAULT_KERNEL_BUILDER_DOCKERFILE}"
-        )
-    digest = hashlib.sha256(DEFAULT_KERNEL_BUILDER_DOCKERFILE.read_bytes()).hexdigest()[:12]
+def _build_kernel_builder_image(dockerfile: Path, context_dir: Path) -> str:
+    if not dockerfile.is_file():
+        raise FileNotFoundError(f"Kernel builder Dockerfile not found: {dockerfile}")
+    digest = hashlib.sha256(dockerfile.read_bytes()).hexdigest()[:12]
     tag = f"sbx-kernel-builder:{digest}"
     subprocess.run(
         [
             "docker",
             "build",
             "-f",
-            str(DEFAULT_KERNEL_BUILDER_DOCKERFILE),
+            str(dockerfile),
             "-t",
             tag,
-            str(PROJECT_ROOT),
+            str(context_dir),
         ],
         check=True,
     )
@@ -136,13 +156,17 @@ def _docker_run_kernel_builder(
     )
 
 
-def _build_docker_kernel(*, image_dir: Path, arch: str) -> Path:
-    if not DEFAULT_DOCKER_KERNEL_FRAGMENT.is_file():
-        raise FileNotFoundError(
-            f"Docker kernel fragment not found: {DEFAULT_DOCKER_KERNEL_FRAGMENT}"
-        )
+def _build_docker_kernel(*, image_dir: Path, arch: str, resources_dir: Path | None = None) -> Path:
+    if resources_dir is None:
+        with _packaged_resources() as packaged:
+            return _build_docker_kernel(image_dir=image_dir, arch=arch, resources_dir=packaged)
 
-    builder_tag = _build_kernel_builder_image()
+    docker_fragment = resources_dir / DEFAULT_DOCKER_KERNEL_FRAGMENT
+    builder_dockerfile = resources_dir / DEFAULT_KERNEL_BUILDER_DOCKERFILE
+    if not docker_fragment.is_file():
+        raise FileNotFoundError(f"Docker kernel fragment not found: {docker_fragment}")
+
+    builder_tag = _build_kernel_builder_image(builder_dockerfile, resources_dir)
     with tempfile.TemporaryDirectory(prefix="sbx-docker-kernel-") as tmp:
         work_dir = Path(tmp)
         for name in SMOLVM_KERNEL_FILES:
@@ -151,7 +175,7 @@ def _build_docker_kernel(*, image_dir: Path, arch: str) -> Path:
         config.write_text(
             config.read_text(encoding="utf-8").rstrip()
             + "\n\n# ---- sbx Docker additions ----\n"
-            + DEFAULT_DOCKER_KERNEL_FRAGMENT.read_text(encoding="utf-8").lstrip(),
+            + docker_fragment.read_text(encoding="utf-8").lstrip(),
             encoding="utf-8",
         )
         (work_dir / "build.sh").chmod(0o755)
@@ -288,8 +312,7 @@ def _print_existing_sdk_sketch(image_dir: Path) -> int:
     return 0
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Build a local Debian SSH-ready image for SmolVM.")
+def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--name",
         default="debian-sbx",
@@ -315,14 +338,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--base-containerfile",
         type=Path,
-        default=DEFAULT_BASE_CONTAINERFILE,
-        help=f"Base OS Containerfile (default: {DEFAULT_BASE_CONTAINERFILE}).",
+        default=None,
+        help="Base OS Containerfile (default: packaged Debian base).",
     )
     parser.add_argument(
         "--agent-containerfile",
         type=Path,
-        default=DEFAULT_AGENT_CONTAINERFILE,
-        help=f"Agent/tooling Containerfile (default: {DEFAULT_AGENT_CONTAINERFILE}).",
+        default=None,
+        help="Agent/tooling Containerfile (default: packaged Pi agent).",
     )
     parser.add_argument(
         "--with-docker",
@@ -368,13 +391,15 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="IMAGE_DIR",
         help="Print a SmolVM SDK usage sketch for an existing local image directory and exit.",
     )
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Build a local Debian SSH-ready image for SmolVM.")
+    add_arguments(parser)
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = _build_parser()
-    args = parser.parse_args(argv)
-
+def main_from_args(args: argparse.Namespace) -> int:
     if args.print_sdk_sketch is not None:
         return _print_existing_sdk_sketch(args.print_sdk_sketch)
 
@@ -398,8 +423,8 @@ def main(argv: list[str] | None = None) -> int:
         from smolvm.images.published import BASE_KERNELS
     except ImportError as exc:
         print(
-            "build-debian-image: smolvm is not installed. Run this from the sbx env, "
-            "for example: uv run scripts/build-debian-image.py",
+            "build-debian-image: smolvm is not installed. Install the supported tool, "
+            "for example: uv tool install 'smolvm==0.0.19'",
             file=sys.stderr,
         )
         print(f"Original import error: {exc}", file=sys.stderr)
@@ -413,32 +438,48 @@ def main(argv: list[str] | None = None) -> int:
     if kernel_url is None:
         kernel_url = BASE_KERNELS[arch].image_url
 
-    try:
-        if args.containerfile is not None:
-            base_image = _build_containerfile_base_image(args.base_image, args.containerfile)
-        else:
-            with tempfile.TemporaryDirectory(prefix="sbx-combined-containerfile-") as tmp:
-                combined_containerfile = Path(tmp) / "Containerfile"
-                _compose_containerfiles(
-                    args.base_containerfile,
-                    args.agent_containerfile,
-                    combined_containerfile,
-                    DEFAULT_DOCKER_CONTAINERFILE if args.with_docker else None,
-                )
-                base_image = _build_containerfile_base_image(
-                    args.base_image, combined_containerfile, context_dir=PROJECT_ROOT
-                )
+    selected_base_containerfile: Path | None = None
+    selected_agent_containerfile: Path | None = None
+    selected_docker_containerfile: Path | None = None
 
-        kernel_path, rootfs_path = builder.build_debian_ssh_key(
-            ssh_public_key=args.ssh_public_key.expanduser(),
-            name=args.name,
-            rootfs_size_mb=args.rootfs_size_mb,
-            base_image=base_image,
-            kernel_url=kernel_url,
-        )
-        if args.with_docker:
-            kernel_path = _build_docker_kernel(image_dir=rootfs_path.parent, arch=arch)
-    except Exception as exc:  # noqa: BLE001 - keep this standalone script friendly.
+    try:
+        with _packaged_resources() as resources_dir:
+            if args.containerfile is not None:
+                base_image = _build_containerfile_base_image(args.base_image, args.containerfile)
+            else:
+                with tempfile.TemporaryDirectory(prefix="sbx-combined-containerfile-") as tmp:
+                    combined_containerfile = Path(tmp) / "Containerfile"
+                    selected_base_containerfile = args.base_containerfile or (
+                        resources_dir / DEFAULT_BASE_CONTAINERFILE
+                    )
+                    selected_agent_containerfile = args.agent_containerfile or (
+                        resources_dir / DEFAULT_AGENT_CONTAINERFILE
+                    )
+                    selected_docker_containerfile = (
+                        resources_dir / DEFAULT_DOCKER_CONTAINERFILE if args.with_docker else None
+                    )
+                    _compose_containerfiles(
+                        selected_base_containerfile,
+                        selected_agent_containerfile,
+                        combined_containerfile,
+                        selected_docker_containerfile,
+                    )
+                    base_image = _build_containerfile_base_image(
+                        args.base_image, combined_containerfile, context_dir=resources_dir
+                    )
+
+            kernel_path, rootfs_path = builder.build_debian_ssh_key(
+                ssh_public_key=args.ssh_public_key.expanduser(),
+                name=args.name,
+                rootfs_size_mb=args.rootfs_size_mb,
+                base_image=base_image,
+                kernel_url=kernel_url,
+            )
+            if args.with_docker:
+                kernel_path = _build_docker_kernel(
+                    image_dir=rootfs_path.parent, arch=arch, resources_dir=resources_dir
+                )
+    except Exception as exc:  # noqa: BLE001 - keep the CLI error friendly.
         print(f"build-debian-image: failed to build image: {exc}", file=sys.stderr)
         return 1
 
@@ -464,10 +505,10 @@ def main(argv: list[str] | None = None) -> int:
         "base_image": base_image,
         "source_base_image": args.base_image,
         "containerfile": str(args.containerfile.expanduser()) if uses_custom else None,
-        "base_containerfile": None if uses_custom else str(args.base_containerfile.expanduser()),
-        "agent_containerfile": None if uses_custom else str(args.agent_containerfile.expanduser()),
+        "base_containerfile": None if uses_custom else str(selected_base_containerfile),
+        "agent_containerfile": None if uses_custom else str(selected_agent_containerfile),
         "with_docker": args.with_docker,
-        "docker_containerfile": str(DEFAULT_DOCKER_CONTAINERFILE) if args.with_docker else None,
+        "docker_containerfile": str(selected_docker_containerfile) if args.with_docker else None,
         "kernel_url": kernel_url,
         "kernel_path": str(kernel_path),
         "kernel_source": (
@@ -499,6 +540,11 @@ def main(argv: list[str] | None = None) -> int:
         print()
         _print_sdk_sketch(kernel_path=kernel_path, rootfs_path=rootfs_path, boot_args=boot_args)
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    return main_from_args(parser.parse_args(argv))
 
 
 if __name__ == "__main__":

@@ -20,20 +20,20 @@ The image is not a single self-contained bootable disk. It is a direct-kernel Sm
 The local Debian/Pi image is built with:
 
 ```bash
-python scripts/build-debian-image.py
+sbx image build-debian
 ```
 
 The build recipe is split into a reusable base OS fragment and an agent/tooling fragment:
 
 ```text
-Containers/
+src/sbx/image/resources/Containers/
 ├── Debian/
 │   └── Base.Containerfile
 └── Agents/
     └── Pi.Containerfile
 ```
 
-The build script:
+The build command:
 
 1. combines the base and agent Containerfiles into a temporary Containerfile;
 2. builds that combined Containerfile into a Docker image;
@@ -41,7 +41,7 @@ The build script:
 4. uses SmolVM's published/base QEMU-compatible kernel;
 5. writes `smolvm-image.json` next to the generated kernel and rootfs.
 
-The resulting rootfs already contains Pi and related tooling from `Containers/Agents/Pi.Containerfile`. Therefore, `sbx` does not run SmolVM preset installation for this mode.
+The resulting rootfs already contains Pi and related tooling from the packaged `Containers/Agents/Pi.Containerfile`. Therefore, `sbx` does not run SmolVM preset installation for this mode.
 
 ## Manifest
 

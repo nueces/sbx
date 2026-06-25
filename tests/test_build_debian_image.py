@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import json
 import subprocess
 import sys
@@ -9,16 +9,9 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "build-debian-image.py"
 
-
-def _load_script() -> types.ModuleType:
-    spec = importlib.util.spec_from_file_location("sbx_build_debian_image", SCRIPT_PATH)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def _load_module() -> types.ModuleType:
+    return importlib.reload(importlib.import_module("sbx.image.build_debian"))
 
 
 @pytest.fixture
@@ -80,7 +73,7 @@ def test_build_debian_image_omits_sdk_sketch_by_default(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    module = _load_script()
+    module = _load_module()
     key = tmp_path / "id_ed25519.pub"
     key.write_text("ssh-ed25519 fake", encoding="utf-8")
 
@@ -101,7 +94,7 @@ def test_build_debian_image_prints_sdk_sketch_when_requested(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    module = _load_script()
+    module = _load_module()
     key = tmp_path / "id_ed25519.pub"
     key.write_text("ssh-ed25519 fake", encoding="utf-8")
 
@@ -117,7 +110,7 @@ def test_build_debian_image_prints_sdk_sketch_for_existing_image_without_rebuild
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    module = _load_script()
+    module = _load_module()
     image = tmp_path / "image"
     image.mkdir()
     (image / "smolvm-image.json").write_text(
@@ -139,7 +132,7 @@ def test_print_sdk_sketch_reports_missing_manifest(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    module = _load_script()
+    module = _load_module()
     image = tmp_path / "image"
     image.mkdir()
 
@@ -153,7 +146,7 @@ def test_print_sdk_sketch_reports_invalid_manifest_json(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    module = _load_script()
+    module = _load_module()
     image = tmp_path / "image"
     image.mkdir()
     (image / "smolvm-image.json").write_text("not json", encoding="utf-8")
@@ -168,7 +161,7 @@ def test_print_sdk_sketch_rejects_non_string_manifest_paths(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    module = _load_script()
+    module = _load_module()
     image = tmp_path / "image"
     image.mkdir()
     (image / "smolvm-image.json").write_text(
@@ -186,7 +179,7 @@ def test_print_sdk_sketch_rejects_non_string_boot_args(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    module = _load_script()
+    module = _load_module()
     image = tmp_path / "image"
     image.mkdir()
     (image / "smolvm-image.json").write_text(
@@ -204,7 +197,7 @@ def test_print_sdk_sketch_uses_default_boot_args(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    module = _load_script()
+    module = _load_module()
     image = tmp_path / "image"
     image.mkdir()
     (image / "smolvm-image.json").write_text(
@@ -224,7 +217,7 @@ def test_build_debian_image_missing_ssh_key_returns_2(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
-    module = _load_script()
+    module = _load_module()
 
     rc = module.main([])
 
@@ -236,7 +229,7 @@ def test_build_debian_image_rejects_with_docker_and_custom_containerfile(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    module = _load_script()
+    module = _load_module()
     key = tmp_path / "id_ed25519.pub"
     containerfile = tmp_path / "Containerfile"
     key.write_text("ssh-ed25519 fake", encoding="utf-8")
@@ -261,7 +254,7 @@ def test_build_debian_image_import_error_returns_127(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    module = _load_script()
+    module = _load_module()
     key = tmp_path / "id_ed25519.pub"
     key.write_text("ssh-ed25519 fake", encoding="utf-8")
     monkeypatch.setitem(sys.modules, "smolvm.images.builder", None)
@@ -277,7 +270,7 @@ def test_build_debian_image_json_output(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    module = _load_script()
+    module = _load_module()
     key = tmp_path / "id_ed25519.pub"
     key.write_text("ssh-ed25519 fake", encoding="utf-8")
 
@@ -291,7 +284,7 @@ def test_build_debian_image_json_output(
     assert payload["manifest_path"].endswith("smolvm-image.json")
 
 
-def test_build_debian_image_builder_failure_returns_1(
+def test_build_debian_builder_failure_returns_1(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -323,7 +316,7 @@ def test_build_debian_image_builder_failure_returns_1(
         lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout=""),
     )
 
-    module = _load_script()
+    module = _load_module()
     key = tmp_path / "id_ed25519.pub"
     key.write_text("ssh-ed25519 fake", encoding="utf-8")
 
@@ -334,7 +327,7 @@ def test_build_debian_image_builder_failure_returns_1(
 
 
 def test_compose_containerfiles_combines_base_and_agent(tmp_path: Path) -> None:
-    module = _load_script()
+    module = _load_module()
     base = tmp_path / "Base.Containerfile"
     agent = tmp_path / "Pi.Containerfile"
     output = tmp_path / "Combined.Containerfile"
@@ -352,7 +345,7 @@ def test_compose_containerfiles_combines_base_and_agent(tmp_path: Path) -> None:
 def test_build_debian_image_with_docker_inserts_fragment_and_uses_docker_kernel(
     fake_smolvm_images: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    module = _load_script()
+    module = _load_module()
     key = tmp_path / "id_ed25519.pub"
     base = tmp_path / "Base.Containerfile"
     docker = tmp_path / "Docker.Containerfile"
@@ -372,8 +365,12 @@ def test_build_debian_image_with_docker_inserts_fragment_and_uses_docker_kernel(
         combined = containerfile.read_text(encoding="utf-8")
         return "sbx-debian-base:docker"
 
-    def fake_build_docker_kernel(*, image_dir: Path, arch: str) -> Path:
-        docker_kernel_args.update({"image_dir": image_dir, "arch": arch})
+    def fake_build_docker_kernel(
+        *, image_dir: Path, arch: str, resources_dir: Path | None = None
+    ) -> Path:
+        docker_kernel_args.update(
+            {"image_dir": image_dir, "arch": arch, "resources_dir": resources_dir}
+        )
         kernel = image_dir / "vmlinux-docker.bin"
         kernel.write_text("docker kernel", encoding="utf-8")
         return kernel
@@ -411,7 +408,7 @@ def test_build_debian_image_with_docker_inserts_fragment_and_uses_docker_kernel(
 def test_build_docker_kernel_downloads_inputs_appends_fragment_and_copies_kernel(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    module = _load_script()
+    module = _load_module()
     fragment = tmp_path / "docker.config.fragment"
     builder_file = tmp_path / "Containers" / "Build" / "Kernel.Containerfile"
     fragment.write_text("CONFIG_VETH=y\n", encoding="utf-8")
@@ -466,7 +463,7 @@ def test_build_containerfile_base_image_runs_expected_docker_commands(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    module = _load_script()
+    module = _load_module()
     containerfile = tmp_path / "Containerfile"
     containerfile.write_text("FROM debian:stable-slim\nUSER agent\n", encoding="utf-8")
     commands: list[list[str]] = []
@@ -494,7 +491,7 @@ def test_build_containerfile_base_image_runs_expected_docker_commands(
 
 
 def test_build_containerfile_base_image_missing_file(tmp_path: Path) -> None:
-    module = _load_script()
+    module = _load_module()
 
     with pytest.raises(FileNotFoundError, match="Containerfile not found"):
         module._build_containerfile_base_image("debian:stable-slim", tmp_path / "missing")
