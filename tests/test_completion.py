@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+
 import pytest
 
 from sbx.completion import SUPPORTED_SHELLS, completion_script
@@ -24,6 +26,26 @@ def test_bash_completion_includes_agent_values() -> None:
     assert "pi claude codex" in script
 
 
+def test_bash_completion_completes_redirection_targets(tmp_path) -> None:
+    target = tmp_path / "sbx.sh"
+    target.touch()
+    script = tmp_path / "completion.bash"
+    script.write_text(completion_script("bash"))
+    probe = f"""
+source {str(script)!r}
+COMP_WORDS=(sbx completion bash)
+COMP_CWORD=3
+COMP_LINE={f'sbx completion bash > {str(target)[:-1]}'!r}
+COMP_POINT=${{#COMP_LINE}}
+_sbx_complete
+printf '%s\n' "${{COMPREPLY[@]}}"
+"""
+
+    completed = subprocess.run(["bash", "-lc", probe], check=True, text=True, capture_output=True)
+
+    assert str(target) in completed.stdout
+
+
 def test_completion_command_does_not_load_project_config(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -37,4 +59,4 @@ def test_completion_command_does_not_load_project_config(
     rc = cli.main(["completion", "bash"])
 
     assert rc == 0
-    assert "complete -F _sbx_complete sbx" in capsys.readouterr().out
+    assert "complete -o default -F _sbx_complete sbx" in capsys.readouterr().out
