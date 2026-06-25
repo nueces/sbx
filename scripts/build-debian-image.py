@@ -26,6 +26,7 @@ DEFAULT_DOCKER_CONTAINERFILE = (
     PROJECT_ROOT / "Containers" / "Debian" / "fragments" / "Docker.Containerfile"
 )
 DEFAULT_DOCKER_KERNEL_FRAGMENT = PROJECT_ROOT / "kernel" / "docker.config.fragment"
+DEFAULT_KERNEL_BUILDER_DOCKERFILE = PROJECT_ROOT / "Containers" / "Build" / "Kernel.Containerfile"
 SMOLVM_KERNEL_REF = "20e1fdf72c2139622eb32ab21f288c7290bba7bf"
 SMOLVM_RAW_BASE = f"https://raw.githubusercontent.com/CelestoAI/SmolVM/{SMOLVM_KERNEL_REF}"
 SMOLVM_KERNEL_FILES = (
@@ -94,12 +95,54 @@ def _download(url: str, output: Path) -> None:
         output.write_bytes(response.read())
 
 
+def _build_kernel_builder_image() -> str:
+    if not DEFAULT_KERNEL_BUILDER_DOCKERFILE.is_file():
+        raise FileNotFoundError(
+            f"Kernel builder Dockerfile not found: {DEFAULT_KERNEL_BUILDER_DOCKERFILE}"
+        )
+    digest = hashlib.sha256(DEFAULT_KERNEL_BUILDER_DOCKERFILE.read_bytes()).hexdigest()[:12]
+    tag = f"sbx-kernel-builder:{digest}"
+    subprocess.run(
+        [
+            "docker",
+            "build",
+            "-f",
+            str(DEFAULT_KERNEL_BUILDER_DOCKERFILE),
+            "-t",
+            tag,
+            str(PROJECT_ROOT),
+        ],
+        check=True,
+    )
+    return tag
+
+
+def _docker_run_kernel_builder(
+    tag: str, work_dir: Path, command: list[str], *, check: bool
+) -> None:
+    subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{work_dir}:/work",
+            "-w",
+            "/work",
+            tag,
+            *command,
+        ],
+        check=check,
+    )
+
+
 def _build_docker_kernel(*, image_dir: Path, arch: str) -> Path:
     if not DEFAULT_DOCKER_KERNEL_FRAGMENT.is_file():
         raise FileNotFoundError(
             f"Docker kernel fragment not found: {DEFAULT_DOCKER_KERNEL_FRAGMENT}"
         )
 
+    builder_tag = _build_kernel_builder_image()
     with tempfile.TemporaryDirectory(prefix="sbx-docker-kernel-") as tmp:
         work_dir = Path(tmp)
         for name in SMOLVM_KERNEL_FILES:
@@ -113,21 +156,37 @@ def _build_docker_kernel(*, image_dir: Path, arch: str) -> Path:
         )
         (work_dir / "build.sh").chmod(0o755)
         out_dir = work_dir / "out"
-        subprocess.run(
-            ["bash", str(work_dir / "build.sh")],
-            check=True,
-            env={**os.environ, "OUT_DIR": str(out_dir)},
-        )
         check_config = work_dir / "check-config.sh"
         _download(
             "https://raw.githubusercontent.com/moby/moby/master/contrib/check-config.sh",
             check_config,
         )
-        subprocess.run(
-            ["sh", str(check_config), str(out_dir / f"vmlinux-{arch}.config")],
-            check=True,
-            env={**os.environ, "PATH": os.environ.get("PATH", "") + ":/usr/sbin:/sbin"},
-        )
+        try:
+            _docker_run_kernel_builder(
+                builder_tag,
+                work_dir,
+                ["env", "OUT_DIR=/work/out", "bash", "/work/build.sh"],
+                check=True,
+            )
+            _docker_run_kernel_builder(
+                builder_tag,
+                work_dir,
+                [
+                    "env",
+                    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                    "sh",
+                    "/work/check-config.sh",
+                    f"/work/out/vmlinux-{arch}.config",
+                ],
+                check=True,
+            )
+        finally:
+            _docker_run_kernel_builder(
+                builder_tag,
+                work_dir,
+                ["chown", "-R", f"{os.getuid()}:{os.getgid()}", "/work"],
+                check=False,
+            )
         kernel_path = image_dir / DOCKER_KERNEL_NAME
         shutil.copy2(out_dir / f"vmlinux-{arch}.image", kernel_path)
         return kernel_path

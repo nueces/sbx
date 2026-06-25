@@ -168,14 +168,7 @@ means "run a sandbox named `pi`", not "run the Pi agent".
 
 ### Host
 
-Install host build dependencies, then build the Docker-capable image and point `.sbx.toml` at it. The guest image installs Docker from Docker's official Debian apt repository.
-
-```bash
-sudo apt-get update
-sudo apt-get install -y \
-  build-essential flex bison bc libssl-dev libelf-dev dwarves \
-  curl xz-utils tar coreutils binutils procps apparmor docker.io
-```
+Install Docker on the host, then build the Docker-capable image and point `.sbx.toml` at it. Kernel compile tools run inside `Containers/Build/Kernel.Containerfile`; the guest image installs Docker from Docker's official Debian apt repository.
 
 Ensure Docker works on the host for the image build:
 

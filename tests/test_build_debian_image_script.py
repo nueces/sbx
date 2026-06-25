@@ -413,7 +413,10 @@ def test_build_docker_kernel_downloads_inputs_appends_fragment_and_copies_kernel
 ) -> None:
     module = _load_script()
     fragment = tmp_path / "docker.config.fragment"
+    builder_file = tmp_path / "Containers" / "Build" / "Kernel.Containerfile"
     fragment.write_text("CONFIG_VETH=y\n", encoding="utf-8")
+    builder_file.parent.mkdir(parents=True)
+    builder_file.write_text("FROM debian\n", encoding="utf-8")
     downloads: list[str] = []
     runs: list[list[str]] = []
 
@@ -424,20 +427,21 @@ def test_build_docker_kernel_downloads_inputs_appends_fragment_and_copies_kernel
         else:
             output.write_text("file\n", encoding="utf-8")
 
-    def fake_run(command: list[str], *, check: bool, env: dict[str, str] | None = None) -> None:
-        assert check is True
+    def fake_run(command: list[str], *, check: bool) -> None:
         runs.append(command)
-        if command[0] == "bash":
-            assert env is not None
-            out_dir = Path(env["OUT_DIR"])
+        if command[:3] == ["docker", "run", "--rm"] and "bash" in command:
+            assert check is True
+            work_dir = Path(command[command.index("-v") + 1].split(":", 1)[0])
+            out_dir = work_dir / "out"
             out_dir.mkdir()
             (out_dir / "vmlinux-amd64.image").write_text("kernel", encoding="utf-8")
             (out_dir / "vmlinux-amd64.config").write_text("config", encoding="utf-8")
-            config = Path(command[1]).with_name("config.fragment").read_text(encoding="utf-8")
+            config = (work_dir / "config.fragment").read_text(encoding="utf-8")
             assert "CONFIG_BASE=y" in config
             assert "CONFIG_VETH=y" in config
 
     monkeypatch.setattr(module, "DEFAULT_DOCKER_KERNEL_FRAGMENT", fragment)
+    monkeypatch.setattr(module, "DEFAULT_KERNEL_BUILDER_DOCKERFILE", builder_file)
     monkeypatch.setattr(module, "_download", fake_download)
     monkeypatch.setattr(module.subprocess, "run", fake_run)
 
@@ -447,8 +451,15 @@ def test_build_docker_kernel_downloads_inputs_appends_fragment_and_copies_kernel
     assert kernel.read_text(encoding="utf-8") == "kernel"
     assert any(url.endswith("/kernel/microvm/build.sh") for url in downloads)
     assert any(url.endswith("/contrib/check-config.sh") for url in downloads)
-    assert runs[0][0] == "bash"
-    assert runs[1][0] == "sh"
+    assert runs[0][:3] == ["docker", "build", "-f"]
+    assert any("OUT_DIR=/work/out" in command for command in runs)
+    assert any("/work/check-config.sh" in command for command in runs)
+    assert runs[-1][-4:] == [
+        "chown",
+        "-R",
+        f"{module.os.getuid()}:{module.os.getgid()}",
+        "/work",
+    ]
 
 
 def test_build_containerfile_base_image_runs_expected_docker_commands(
