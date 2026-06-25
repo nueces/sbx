@@ -94,6 +94,9 @@ body:has(#theme-toggle:checked) .dark-label { display: inline; }
   box-shadow: 8px 8px 0 var(--shadow);
   background: var(--paper-2);
 }
+body:has(#theme-toggle:checked) .pixel-frame {
+  border-color: #64748b;
+}
 
 .site-header {
   max-width: 1180px;
@@ -178,6 +181,11 @@ h3 { font-size: 24px; margin-bottom: 10px; }
 }
 .button.secondary { background: var(--cyan); }
 .button:hover { transform: translate(2px, 2px); box-shadow: 3px 3px 0 var(--ink); color: var(--ink); }
+body:has(#theme-toggle:checked) .button {
+  border-color: #64748b;
+  box-shadow: 5px 5px 0 #000;
+}
+body:has(#theme-toggle:checked) .button:hover { box-shadow: 3px 3px 0 #000; }
 
 .hero-art {
   min-height: 430px;
@@ -297,6 +305,13 @@ pre { margin: 0; white-space: pre-wrap; }
   border: 4px solid var(--ink-2);
 }
 .footer a { color: var(--cyan); }
+body:has(#theme-toggle:checked) .nav,
+body:has(#theme-toggle:checked) .footer {
+  background: #0b1020;
+  color: var(--mist);
+  border-color: #263244;
+}
+body:has(#theme-toggle:checked) .nav-links a { color: var(--mist); }
 
 @media (max-width: 900px) {
   .hero, .split { grid-template-columns: 1fr; }
