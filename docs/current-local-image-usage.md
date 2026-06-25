@@ -20,7 +20,7 @@ The image is not a single self-contained bootable disk. It is a direct-kernel Sm
 The local Debian/Pi image is built with:
 
 ```bash
-./scripts/build-debian-image.py
+python scripts/build-debian-image.py
 ```
 
 The build recipe is split into a reusable base OS fragment and an agent/tooling fragment:

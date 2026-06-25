@@ -8,14 +8,17 @@ Agents and authentication run in the VM, not on the host. By default `sbx` does 
 
 ```bash
 pip install -e .
+pip install 'smolvm==0.0.19'
 sbx doctor
 ```
+
+`sbx` currently supports SmolVM `0.0.19`. Newer SmolVM versions changed APIs/behavior that `sbx` still needs to support. Until that compatibility work is done, keep `smolvm==0.0.19` installed.
 
 `sbx` invokes the `smolvm` CLI for the default preset workflow, so the
 `smolvm` executable must also be available on `PATH`. A normal project/venv
 install provides both commands. If you install `sbx` as an isolated tool, for
 example with `uv tool install -e /path/to/sbx`, dependency executables may not
-be exposed on your shell `PATH`; install/expose `smolvm` separately before
+be exposed on your shell `PATH`; install/expose `smolvm==0.0.19` separately before
 running `sbx run`, `sbx create`, or other commands that start or inspect VMs.
 
 ## Usage
