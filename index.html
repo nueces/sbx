@@ -173,6 +173,8 @@
                         <pre><span class="comment"># clone and install the tool</span>
 <span class="prompt">$</span> git clone https://github.com/nueces/sbx.git
 <span class="prompt">$</span> uv tool install --editable sbx
+<span class="prompt">$</span> uv tool install 'smolvm==0.0.19'
+<span class="prompt">$</span> sbx doctor
 
 <span class="comment"># select you quest and jump into it</span>
 <span class="prompt">$</span> cd into/your/project
@@ -215,6 +217,18 @@
                                 <code>sbx network status [NAME]</code> — inspect
                                 tunnels
                             </li>
+                            <li>
+                                <code>sbx completion SHELL</code> — generate
+                                shell completions
+                            </li>
+                            <li>
+                                <code>sbx image ls</code> — list local
+                                ready-to-run images
+                            </li>
+                            <li>
+                                <code>sbx image build-debian</code> — build a
+                                local Debian/Pi image
+                            </li>
                         </ul>
                     </div>
                     <div class="card pixel-frame">
@@ -236,6 +250,16 @@ run_user = "agent"
 copy_host_credentials = false</pre
                             >
                         </div>
+                    </div>
+                    <div class="card pixel-frame">
+                        <h3>Forge reusable images</h3>
+                        <p>
+                            Build a local Debian/Pi image once with
+                            <code>sbx image build-debian</code>, then reuse it
+                            in your dungeon maps. Cast the build spell with
+                            <code>--with-docker</code> when the run needs extra
+                            power, like rootless Docker.
+                        </p>
                     </div>
                 </div>
             </section>
@@ -305,12 +329,12 @@ copy_host_credentials = false</pre
 
             <footer class="footer">
                 <div>
-                    <strong>sbx</strong><br />small boxes for dungeon runs
+                    <strong>sbx</strong> v0.2.0<br />small boxes for dungeon runs
                 </div>
                 <div>
                     <a href="https://github.com/nueces/sbx"
                         >github.com/nueces/sbx</a
-                    >
+                    ><br />License: Apache-2.0
                 </div>
             </footer>
         </main>
