@@ -98,10 +98,18 @@ def bash_completion() -> str:
     shells = _words(COMPLETION_SHELLS)
     return f"""# bash completion for sbx
 _sbx_complete() {{
-    local cur prev cmd subcmd
+    local cur prev cmd subcmd line redir_cur
     COMPREPLY=()
     cur="${{COMP_WORDS[COMP_CWORD]}}"
     prev="${{COMP_WORDS[COMP_CWORD-1]}}"
+    line="${{COMP_LINE:0:COMP_POINT}}"
+
+    if [[ "$line" =~ (^|[[:space:]])([0-9]?>|[0-9]?>>|<|&>)[[:space:]]*([^[:space:]]*)$ ]]; then
+        redir_cur="${{BASH_REMATCH[3]}}"
+        compopt -o filenames 2>/dev/null
+        COMPREPLY=( $(compgen -f -- "$redir_cur") )
+        return 0
+    fi
 
     case "$prev" in
         --agent)
@@ -167,7 +175,7 @@ _sbx_complete() {{
             ;;
     esac
 }}
-complete -F _sbx_complete sbx
+complete -o default -F _sbx_complete sbx
 """
 
 
