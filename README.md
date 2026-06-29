@@ -8,11 +8,8 @@ Agents and authentication run in the VM, not on the host. By default `sbx` does 
 
 ```bash
 uv tool install --editable .
-uv tool install 'smolvm==0.0.19'
 sbx doctor
 ```
-
-`sbx` currently supports SmolVM `0.0.19`. Newer SmolVM versions changed APIs/behavior that `sbx` still needs to support. Until that compatibility work is done, install both `sbx` and `smolvm` with the pinned SmolVM version via `uv tool install`.
 
 ## Usage
 
@@ -59,8 +56,14 @@ Common options:
 
 ```bash
 # Mount a project at the same absolute path in the guest as read-write,
-# and start the attached agent in that mounted directory.
+# place it first in the mount list, and start the attached agent there.
 sbx run my-sbx --project-path .
+
+# Mount extra host directories at their same absolute guest paths.
+sbx run my-sbx --mount /home/me/src/tooling --mount /home/me/src/data
+
+# Or choose an explicit guest path.
+sbx run my-sbx --mount /home/me/src/tooling:/workspace/tooling
 
 # Disable automatic OAuth callback forwarding.
 sbx run my-sbx --no-auth-port
@@ -182,7 +185,13 @@ boot_timeout = 60
 # Optional: use a local ready-to-run image directory with smolvm-image.json.
 # image = "./images/debian-pi"
 
-mount = ["/foo/bar:/workspace"]
+# Bare mounts use the same absolute guest path.
+# Explicit HOST:GUEST mounts keep the configured guest path.
+mount = [
+  "/foo/bar",
+  "/foo/cache:/workspace/cache",
+]
+# project_path is mounted first and used as the attached working directory.
 project_path = "."
 writable_mounts = true
 run_user = "agent"
@@ -217,8 +226,8 @@ git_config = true
 | `[sbx]` | `backend`               | -                                                        | Must be `qemu` for now. Other backends may be supported later.                                                                                             |
 | `[sbx]` | `os`                    | `--os`                                                   | Guest OS value passed to SmolVM. Ignored when `image` is set.                                                                                              |
 | `[sbx]` | `image`                 | `--image`                                                | Local ready-to-run image directory containing `smolvm-image.json`, kernel, and rootfs.                                                                     |
-| `[sbx]` | `mount`                 | `--mount`                                                | Host mount(s), as a string or array of strings.                                                                                                            |
-| `[sbx]` | `project_path`          | `--project-path`                                         | Mount a path at the same absolute guest path, force RW mounts, and start the attached agent there.                                                         |
+| `[sbx]` | `mount`                 | `--mount`                                                | Host mount(s), as a string or array of strings. Bare host paths mount at the same absolute guest path; `HOST:GUEST` keeps the explicit guest path.          |
+| `[sbx]` | `project_path`          | `--project-path`                                         | Mount a path first at the same absolute guest path, force RW mounts, and start the attached agent there.                                                    |
 | `[sbx]` | `writable_mounts`       | `--writable-mounts`                                      | Enable writable mounts.                                                                                                                                    |
 | `[sbx]` | `run_user`              | `--run-user`                                             | Create/use a guest user and run the attached agent/shell as that user.                                                                                     |
 | `[sbx]` | `auth_port`             | `--auth-port` / `--no-auth-port`                         | Automatically expose the OAuth callback port before attaching. Defaults to `true` for `run`.                                                               |
@@ -319,6 +328,12 @@ sbx network auth-port other-sbx --replace
 ```
 
 If the port is owned by an untracked/non-`sbx` process, stop that process first.
+
+## Releases
+
+Maintainers can run the manual GitHub release workflow with a version input like `0.2.1`.
+The workflow updates version files, commits the bump, creates tag `v0.2.1`, and creates
+GitHub release `v0.2.1` with generated notes.
 
 ## Notes
 
