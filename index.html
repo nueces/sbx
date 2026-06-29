@@ -173,10 +173,9 @@
                         <pre><span class="comment"># clone and install the tool</span>
 <span class="prompt">$</span> git clone https://github.com/nueces/sbx.git
 <span class="prompt">$</span> uv tool install --editable sbx
-<span class="prompt">$</span> uv tool install 'smolvm==0.0.19'
 <span class="prompt">$</span> sbx doctor
 
-<span class="comment"># select you quest and jump into it</span>
+<span class="comment"># select your quest and jump into it</span>
 <span class="prompt">$</span> cd into/your/project
 
 <span class="comment"># create if missing, start if stopped, attach to your Agent</span>
@@ -245,6 +244,7 @@
 agent = "pi"
 name = "project-sbx"
 project_path = "."
+mount = ["/home/me/code/tooling"]
 writable_mounts = true
 run_user = "agent"
 copy_host_credentials = false</pre
