@@ -51,10 +51,6 @@ SBX_STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "
 TUNNELS_FILE = SBX_STATE_DIR / "tunnels.json"
 SESSIONS_FILE = SBX_STATE_DIR / "sessions.json"
 DEBUG = False
-SMOLVM_PATH_HINT = (
-    "The Python package dependency may be installed, but sbx also needs the `smolvm` "
-    "executable on PATH."
-)
 
 
 class ConfigError(ValueError):
@@ -84,8 +80,6 @@ def _run(argv: Sequence[str], *, check: bool = False, env: Mapping[str, str] | N
         proc = subprocess.run(list(argv), check=check, env=dict(env) if env is not None else None)
     except FileNotFoundError:
         print(f"sbx: command not found on PATH: {argv[0]}", file=sys.stderr)
-        if argv[0] == "smolvm":
-            print(SMOLVM_PATH_HINT, file=sys.stderr)
         return 127
     except subprocess.CalledProcessError as exc:
         _debug(f"return code: {exc.returncode}")
@@ -114,9 +108,26 @@ def _run_capture(
         return result
     except FileNotFoundError:
         print(f"sbx: command not found on PATH: {argv[0]}", file=sys.stderr)
-        if argv[0] == "smolvm":
-            print(SMOLVM_PATH_HINT, file=sys.stderr)
         return None
+
+
+def _smolvm_argv(args: Sequence[str]) -> list[str]:
+    return [
+        sys.executable,
+        "-c",
+        "from smolvm.cli.main import main; raise SystemExit(main())",
+        *args,
+    ]
+
+
+def _run_smolvm(args: Sequence[str], **kwargs: Any) -> int:
+    return _run(_smolvm_argv(args), **kwargs)
+
+
+def _run_smolvm_capture(
+    args: Sequence[str], **kwargs: Any
+) -> subprocess.CompletedProcess[str] | None:
+    return _run_capture(_smolvm_argv(args), **kwargs)
 
 
 def _require(command: str, install_hint: str | None = None) -> bool:
@@ -303,7 +314,7 @@ def _credential_free_env(temp_home: Path, *, forward_env: list[str]) -> dict[str
 
 
 def _smolvm_info_vm(vm_id: str) -> Mapping[str, Any] | None:
-    completed = _run_capture(["smolvm", "info", vm_id, "--json"])
+    completed = _run_smolvm_capture(["sandbox", "info", vm_id, "--json"])
     if completed is None or completed.returncode != 0:
         return None
     try:
@@ -486,7 +497,7 @@ def _start_existing_vm_if_needed(vm_id: str, status: str, boot_timeout: float) -
             file=sys.stderr,
         )
         return 1
-    rc = _run(["smolvm", "start", vm_id, "--boot-timeout", f"{boot_timeout:g}"])
+    rc = _run_smolvm(["sandbox", "start", vm_id, "--boot-timeout", f"{boot_timeout:g}"])
     if rc != 0:
         _maybe_print_boot_timeout_running_hint(vm_id, boot_timeout)
     return rc
@@ -775,7 +786,7 @@ def _stop_vm_if_last_session(vm_id: str, *, stop_on_exit: bool) -> None:
         _debug(f"not stopping {vm_id}: other sbx sessions still active")
         return
     _debug(f"stopping {vm_id}: no other sbx sessions active")
-    _run(["smolvm", "stop", vm_id])
+    _run_smolvm(["sandbox", "stop", vm_id])
 
 
 def _localhost_port_is_listening(port: int) -> bool:
@@ -1344,9 +1355,7 @@ def _start_local_image(
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    if not _require("smolvm", SMOLVM_PATH_HINT):
-        return 127
-    rc = _run(["smolvm", "doctor", "--backend", DEFAULT_BACKEND])
+    rc = _run_smolvm(["doctor", "--backend", DEFAULT_BACKEND])
     _doctor_config_state(getattr(args, "config_data", {}))
     return rc
 
@@ -1375,14 +1384,11 @@ def cmd_start(args: argparse.Namespace) -> int:
         print(f"sbx: agent must be one of: {', '.join(AGENTS)}", file=sys.stderr)
         return 2
 
-    argv: list[str] = ["smolvm", str(agent), "start"]
+    argv: list[str] = [str(agent), "start"]
     configured_backend = _cfg(config, "sbx", "backend", DEFAULT_BACKEND)
     if configured_backend != DEFAULT_BACKEND:
         print("sbx: other backends are not supported yet", file=sys.stderr)
         return 2
-
-    if not _require("smolvm", SMOLVM_PATH_HINT):
-        return 127
 
     scalar_options = (
         ("name", "--name"),
@@ -1406,17 +1412,19 @@ def cmd_start(args: argparse.Namespace) -> int:
         if args.mount is not None
         else _list_value(sbx_cfg.get("mount"), key="[sbx].mount")
     )
-    effective_mounts = list(mounts or [])
-    for mount in effective_mounts:
-        argv += ["--mount", mount]
+    effective_mounts: list[str] = []
 
     project_path = _arg_or_config(args, "project_path", config, "sbx")
     project_guest_cwd = _project_guest_cwd(project_path)
     if project_path is not None:
-        resolved_project_path = Path(project_guest_cwd or "")
-        project_mount = f"{resolved_project_path}:{resolved_project_path}"
+        project_mount = _same_path_mount(str(project_path))
         effective_mounts.append(project_mount)
         argv += ["--mount", project_mount]
+
+    for mount in mounts or []:
+        mount = mount if ":" in mount else _same_path_mount(mount)
+        effective_mounts.append(mount)
+        argv += ["--mount", mount]
 
     writable_mounts = bool(_arg_or_config(args, "writable_mounts", config, "sbx", default=False))
     if project_path is not None:
@@ -1559,7 +1567,7 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     if not managed_start:
         try:
-            rc = _run(argv, env=smolvm_env)
+            rc = _run_smolvm(argv, env=smolvm_env)
             if rc == 0 and requested_name:
                 _maybe_write_project_config(
                     args, config, vm_name=str(requested_name), agent=str(agent), created=True
@@ -1569,7 +1577,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             if temp_home_ctx is not None:
                 temp_home_ctx.cleanup()
 
-    completed = _run_capture(argv, env=smolvm_env)
+    completed = _run_smolvm_capture(argv, env=smolvm_env)
     if temp_home_ctx is not None:
         temp_home_ctx.cleanup()
     if completed is None:
@@ -1641,7 +1649,7 @@ def _vm_name_from_arg_or_config(
 def cmd_passthrough(args: argparse.Namespace) -> int:
     config = args.config_data
     if args.action == "ls":
-        smolvm_command = ["list"]
+        smolvm_command = ["sandbox", "list"]
         if getattr(args, "all", False):
             smolvm_command.append("--all")
     elif args.action == "shell":
@@ -1654,7 +1662,7 @@ def cmd_passthrough(args: argparse.Namespace) -> int:
         project_guest_cwd = _project_guest_cwd(
             args.project_path or _cfg(config, "sbx", "project_path")
         )
-        smolvm_command = ["ssh", name]
+        smolvm_command = ["sandbox", "ssh", name]
         keep_running = bool(getattr(args, "keep_running", False))
         stop_on_exit = bool(_cfg(config, "sbx", "stop_on_exit", True)) and not keep_running
         git_config = bool(
@@ -1677,7 +1685,7 @@ def cmd_passthrough(args: argparse.Namespace) -> int:
             if project_guest_cwd is not None or git_config_text is not None:
                 _install_git_config(name, None, git_config_text)
                 return _attach_as_root(name, "bash", cwd=project_guest_cwd)
-            return _run(["smolvm", *smolvm_command])
+            return _run_smolvm(smolvm_command)
         finally:
             _unregister_session(name)
             _stop_vm_if_last_session(name, stop_on_exit=stop_on_exit)
@@ -1685,7 +1693,7 @@ def cmd_passthrough(args: argparse.Namespace) -> int:
         name = _vm_name_from_arg_or_config(args, config, "stop")
         if name is None:
             return 2
-        smolvm_command = ["stop", name]
+        smolvm_command = ["sandbox", "stop", name]
     elif args.action == "rm":
         name = _vm_name_from_arg_or_config(args, config, "rm")
         if name is None:
@@ -1698,12 +1706,12 @@ def cmd_passthrough(args: argparse.Namespace) -> int:
         print(f"sbx: unsupported passthrough command: {args.action}", file=sys.stderr)
         return 2
 
-    return _run(["smolvm", *smolvm_command])
+    return _run_smolvm(smolvm_command)
 
 
 def _delete_vm(vm_id: str, extra_args: Sequence[str] | None = None) -> int:
     extra = list(extra_args or [])
-    completed = _run_capture(["smolvm", "delete", vm_id, *extra, "--json"])
+    completed = _run_smolvm_capture(["sandbox", "delete", vm_id, *extra, "--json"])
     if completed is None:
         return 127
     if completed.stderr:
@@ -1758,7 +1766,7 @@ def cmd_network_status(args: argparse.Namespace) -> int:
     )
     if name is None:
         return 2
-    completed = _run_capture(["smolvm", "info", name, "--json"])
+    completed = _run_smolvm_capture(["sandbox", "info", name, "--json"])
     if completed is None:
         return 127
     if completed.returncode != 0:

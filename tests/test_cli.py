@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -27,7 +28,21 @@ def install_fake_smolvm(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path
     smolvm.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\"\n", encoding="utf-8")
     smolvm.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setattr(cli, "_smolvm_argv", lambda args: ["smolvm", *args])
     return smolvm
+
+
+def print_smolvm_args(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "_run_smolvm", lambda args, **kwargs: print(" ".join(args)) or 0)
+
+
+def test_smolvm_runner_does_not_need_console_script_on_path() -> None:
+    assert cli._smolvm_argv(["doctor"]) == [
+        sys.executable,
+        "-c",
+        "from smolvm.cli.main import main; raise SystemExit(main())",
+        "doctor",
+    ]
 
 
 def test_doctor_checks_qemu_by_default(
@@ -60,7 +75,7 @@ def test_doctor_warns_when_config_differs_from_existing_vm(
     smolvm.write_text(
         "#!/bin/sh\n"
         "if [ \"$1\" = doctor ]; then printf '%s\\n' \"$*\"; exit 0; fi\n"
-        "if [ \"$1\" = info ]; then\n"
+        "if [ \"$1\" = sandbox ] && [ \"$2\" = info ]; then\n"
         "  printf '%s\\n' "
         "'{\"data\":{\"vm\":{\"status\":\"stopped\",\"disk_size\":81920,"
         "\"memory\":8192,\"vcpus\":4}}}'\n"
@@ -71,6 +86,7 @@ def test_doctor_warns_when_config_differs_from_existing_vm(
     )
     smolvm.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setattr(cli, "_smolvm_argv", lambda args: ["smolvm", *args])
 
     rc = cli.main(["doctor"])
 
@@ -108,7 +124,7 @@ def test_doctor_warns_when_local_image_is_larger_than_requested_disk(
     smolvm.write_text(
         "#!/bin/sh\n"
         "if [ \"$1\" = doctor ]; then printf '%s\\n' \"$*\"; exit 0; fi\n"
-        "if [ \"$1\" = info ]; then\n"
+        "if [ \"$1\" = sandbox ] && [ \"$2\" = info ]; then\n"
         "  printf '%s\\n' "
         "'{\"data\":{\"vm\":{\"status\":\"stopped\",\"disk_size\":10,"
         "\"memory\":512,\"vcpus\":2}}}'\n"
@@ -119,6 +135,7 @@ def test_doctor_warns_when_local_image_is_larger_than_requested_disk(
     )
     smolvm.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setattr(cli, "_smolvm_argv", lambda args: ["smolvm", *args])
 
     rc = cli.main(["doctor"])
 
@@ -156,38 +173,36 @@ def test_debug_prints_commands_to_stderr(
     captured = capfd.readouterr()
     assert rc == 0
     assert "sbx debug: argv: ['--debug', 'ls']" in captured.err
-    assert "sbx debug: run: smolvm list" in captured.err
+    assert "sbx debug: run: smolvm sandbox list" in captured.err
 
 
 def test_list_passthrough_does_not_require_name(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
     capfd: pytest.CaptureFixture[str],
 ) -> None:
-    install_fake_smolvm(monkeypatch, tmp_path)
+    print_smolvm_args(monkeypatch)
 
     rc = cli.main(["ls"])
 
     assert rc == 0
-    assert capfd.readouterr().out == "list\n"
+    assert capfd.readouterr().out == "sandbox list\n"
 
 
 def test_list_all_includes_stopped_vms(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
     capfd: pytest.CaptureFixture[str],
 ) -> None:
-    install_fake_smolvm(monkeypatch, tmp_path)
+    print_smolvm_args(monkeypatch)
 
     rc = cli.main(["ls", "--all"])
 
     assert rc == 0
-    assert capfd.readouterr().out == "list --all\n"
+    assert capfd.readouterr().out == "sandbox list --all\n"
 
     rc = cli.main(["ls", "-a"])
 
     assert rc == 0
-    assert capfd.readouterr().out == "list --all\n"
+    assert capfd.readouterr().out == "sandbox list --all\n"
 
 
 def test_shell_uses_configured_default_name(
@@ -195,21 +210,20 @@ def test_shell_uses_configured_default_name(
     tmp_path: Path,
     capfd: pytest.CaptureFixture[str],
 ) -> None:
-    install_fake_smolvm(monkeypatch, tmp_path)
+    print_smolvm_args(monkeypatch)
     config = tmp_path / "config.toml"
     config.write_text('[sbx]\nname = "vm1"\n', encoding="utf-8")
 
     rc = cli.main(["--config", str(config), "shell", "--keep-running"])
 
     assert rc == 0
-    assert capfd.readouterr().out == "ssh vm1\n"
+    assert capfd.readouterr().out == "sandbox ssh vm1\n"
 
 
 def test_shell_uses_configured_run_user(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    install_fake_smolvm(monkeypatch, tmp_path)
     config = tmp_path / "config.toml"
     config.write_text('[sbx]\nname = "vm1"\nrun_user = "agent"\n', encoding="utf-8")
     captured: dict[str, object] = {}
@@ -236,7 +250,6 @@ def test_shell_uses_configured_project_path_as_cwd(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    install_fake_smolvm(monkeypatch, tmp_path)
     project = tmp_path / "project"
     project.mkdir()
     config = tmp_path / "config.toml"
@@ -265,7 +278,6 @@ def test_shell_root_uses_configured_project_path_as_cwd(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    install_fake_smolvm(monkeypatch, tmp_path)
     project = tmp_path / "project"
     project.mkdir()
     config = tmp_path / "config.toml"
@@ -293,23 +305,19 @@ def test_shell_root_ignores_configured_run_user(
     tmp_path: Path,
     capfd: pytest.CaptureFixture[str],
 ) -> None:
-    install_fake_smolvm(monkeypatch, tmp_path)
+    print_smolvm_args(monkeypatch)
     config = tmp_path / "config.toml"
     config.write_text('[sbx]\nname = "vm1"\nrun_user = "agent"\n', encoding="utf-8")
 
     rc = cli.main(["--config", str(config), "shell", "--root", "--keep-running"])
 
     assert rc == 0
-    assert capfd.readouterr().out == "ssh vm1\n"
+    assert capfd.readouterr().out == "sandbox ssh vm1\n"
 
 
 def test_shell_without_name_or_config_fails(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    install_fake_smolvm(monkeypatch, tmp_path)
-
     rc = cli.main(["shell"])
 
     assert rc == 2
@@ -350,6 +358,8 @@ def test_run_supports_all_exposed_options_from_config(
     install_fake_smolvm(monkeypatch, tmp_path)
     project = tmp_path / "project"
     project.mkdir()
+    extra_mount = tmp_path / "extra"
+    extra_mount.mkdir()
     config = tmp_path / "config.toml"
     config.write_text(
         f"""
@@ -361,7 +371,7 @@ memory = 8192
 disk_size = 32768
 backend = "qemu"
 os = "ubuntu"
-mount = [".:/workspace"]
+mount = ["{extra_mount}", ".:/workspace"]
 project_path = "{project}"
 writable_mounts = false
 install_timeout = 900
@@ -376,8 +386,9 @@ boot_timeout = 75
     assert capfd.readouterr().out == (
         "codex start --name configured --memory 8192 --disk-size 32768 "
         "--os ubuntu --install-timeout 900 --backend qemu --boot-timeout 75 "
-        "--mount .:/workspace "
-        f"--mount {project}:{project} --writable-mounts --no-attach\n"
+        f"--mount {project}:{project} "
+        f"--mount {extra_mount}:{extra_mount} "
+        "--mount .:/workspace --writable-mounts --no-attach\n"
     )
 
 
@@ -506,7 +517,9 @@ run_user = "agent"
     ]
     assert captured["prepare"] == ("vm1", "agent")
     assert captured["attach"] == ("vm1", "agent", "pi", None)
-    assert capfd.readouterr().out == "Started 'vm1'. Launching pi as user agent...\nstop vm1\n"
+    assert capfd.readouterr().out == (
+        "Started 'vm1'. Launching pi as user agent...\nsandbox stop vm1\n"
+    )
 
 
 def test_host_git_config_copies_only_safe_global_values(
@@ -826,7 +839,7 @@ def test_reusing_existing_vm_writes_config_only_when_requested(
     smolvm = bin_dir / "smolvm"
     smolvm.write_text(
         "#!/bin/sh\n"
-        "if [ \"$1\" = info ]; then\n"
+        "if [ \"$1\" = sandbox ] && [ \"$2\" = info ]; then\n"
         "  printf '%s\\n' '{\"data\":{\"vm\":{\"status\":\"stopped\"}}}'\n"
         "  exit 0\n"
         "fi\n"
@@ -835,6 +848,7 @@ def test_reusing_existing_vm_writes_config_only_when_requested(
     )
     smolvm.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setattr(cli, "_smolvm_argv", lambda args: ["smolvm", *args])
 
     assert cli.main(["run", "vm1", "--no-attach", "--no-auth-port"]) == 0
     assert not (tmp_path / ".sbx.toml").exists()
@@ -868,7 +882,7 @@ def test_lifecycle_commands_default_to_configured_name(
     assert cli.main(["rm", "--force"]) == 0
 
     out = capfd.readouterr().out
-    assert "stop vm1" in out
+    assert "sandbox stop vm1" in out
     assert "Destroyed VM 'vm1'." in out
 
 
@@ -1015,9 +1029,9 @@ def test_run_existing_vm_starts_without_creating(
 
     assert rc == 0
     assert calls == [
-        ["smolvm", "info", "vm1", "--json"],
-        ["smolvm", "start", "vm1", "--boot-timeout", "60"],
-        ["smolvm", "stop", "vm1"],
+        ["smolvm", "sandbox", "info", "vm1", "--json"],
+        ["smolvm", "sandbox", "start", "vm1", "--boot-timeout", "60"],
+        ["smolvm", "sandbox", "stop", "vm1"],
     ]
 
 
@@ -1059,7 +1073,7 @@ def test_failed_managed_run_hides_json_and_prints_hint(
     def fake_run_capture(
         argv: list[str], *, env: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[str]:
-        if argv[:2] == ["smolvm", "info"]:
+        if argv[:2] == ["smolvm", "sandbox", "info"]:
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="not found")
         return subprocess.CompletedProcess(
             argv,
@@ -1092,7 +1106,7 @@ def test_run_positional_name_before_options_does_not_pass_sbx_flags_to_smolvm(
     def fake_run_capture(
         argv: list[str], *, env: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[str]:
-        if argv[:2] == ["smolvm", "info"]:
+        if argv[:2] == ["smolvm", "sandbox", "info"]:
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="not found")
         captured["create"] = argv
         return subprocess.CompletedProcess(
@@ -1139,7 +1153,7 @@ def test_run_positional_name_creates_missing_vm(
     def fake_run_capture(
         argv: list[str], *, env: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[str]:
-        if argv[:2] == ["smolvm", "info"]:
+        if argv[:2] == ["smolvm", "sandbox", "info"]:
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="not found")
         captured["create"] = argv
         return subprocess.CompletedProcess(
@@ -1184,7 +1198,7 @@ def test_run_missing_vm_creates_it(
     def fake_run_capture(
         argv: list[str], *, env: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[str]:
-        if argv[:2] == ["smolvm", "info"]:
+        if argv[:2] == ["smolvm", "sandbox", "info"]:
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="not found")
         captured["create"] = argv
         return subprocess.CompletedProcess(
@@ -1367,7 +1381,7 @@ def test_network_commands_default_to_configured_name(
             ),
         )
 
-    monkeypatch.setattr(cli, "_run_capture", fake_run_capture)
+    monkeypatch.setattr(cli, "_run_smolvm_capture", fake_run_capture)
 
     assert cli.main(["network", "auth-port"]) == 0
     assert cli.main(["network", "close-auth-port"]) == 0
@@ -1375,7 +1389,7 @@ def test_network_commands_default_to_configured_name(
 
     assert captured["expose"] == ("vm1", 1455, 1455, False)
     assert captured["close"] == "vm1"
-    assert captured["status"] == ["smolvm", "info", "vm1", "--json"]
+    assert captured["status"] == ["sandbox", "info", "vm1", "--json"]
     assert "No tracked auth port tunnel for 'vm1'." in capfd.readouterr().out
 
 
