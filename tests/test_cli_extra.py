@@ -55,8 +55,8 @@ def fake_smolvm_sdk(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str
 
     class FakeSmolVM:
         def __init__(self, config: object, **kwargs: object) -> None:
+            del kwargs
             captured["config"] = config
-            captured["kwargs"] = kwargs
             self.vm_id = "local-vm"
 
         def start(self, **kwargs: object) -> None:
@@ -544,12 +544,12 @@ def test_tunnel_and_session_state(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cli._active_sessions("vm1") == [{"pid": 123, "kind": "run"}]
 
     stopped: list[list[str]] = []
-    monkeypatch.setattr(cli, "_run", lambda argv: stopped.append(list(argv)) or 0)
+    monkeypatch.setattr(cli, "_run_smolvm", lambda argv: stopped.append(list(argv)) or 0)
     cli._stop_vm_if_last_session("vm1", stop_on_exit=False)
     assert stopped == []
     cli._save_sessions({})
     cli._stop_vm_if_last_session("vm1", stop_on_exit=True)
-    assert stopped == [["smolvm", "stop", "vm1"]]
+    assert stopped == [["sandbox", "stop", "vm1"]]
 
 
 def test_expose_auth_port_error_paths(
@@ -679,8 +679,8 @@ def test_config_and_validation_error_branches(tmp_path: Path) -> None:
 def test_command_edge_cases(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr(cli, "_require", lambda *args, **kwargs: False)
-    assert cli.cmd_doctor(type("Args", (), {})()) == 127
+    monkeypatch.setattr(cli, "_run_smolvm", lambda *args, **kwargs: 7)
+    assert cli.cmd_doctor(type("Args", (), {})()) == 7
 
     monkeypatch.setattr(cli, "_confirm_destructive_action", lambda *args, **kwargs: False)
     args = type(
@@ -1135,11 +1135,11 @@ def test_recreate_success_deletes_then_starts(monkeypatch: pytest.MonkeyPatch) -
 
 def test_start_existing_vm_if_needed_variants(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[list[str]] = []
-    monkeypatch.setattr(cli, "_run", lambda argv: calls.append(list(argv)) or 0)
+    monkeypatch.setattr(cli, "_run_smolvm", lambda argv: calls.append(list(argv)) or 0)
     assert cli._start_existing_vm_if_needed("vm1", "running", 60) == 0
     assert calls == []
     assert cli._start_existing_vm_if_needed("vm1", "stopped", 60) == 0
-    assert calls == [["smolvm", "start", "vm1", "--boot-timeout", "60"]]
+    assert calls == [["sandbox", "start", "vm1", "--boot-timeout", "60"]]
     assert cli._start_existing_vm_if_needed("vm1", "error", 60) == 1
 
 
