@@ -9,6 +9,7 @@ import shlex
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -30,7 +31,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10
 
 AGENTS = ("pi", "claude", "codex")
 DEFAULT_BACKEND = "qemu"
-DEFAULT_BOOT_TIMEOUT = 60.0
+DEFAULT_BOOT_TIMEOUT = 30.0
 MIB = 1024 * 1024
 LAUNCH_COMMANDS = {"pi": "pi", "claude": "claude", "codex": "codex"}
 USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]*[$]?$", re.IGNORECASE)
@@ -50,6 +51,7 @@ LOCAL_CONFIG_PATHS = (Path.cwd() / ".sbx.toml",)
 SBX_STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "sbx"
 TUNNELS_FILE = SBX_STATE_DIR / "tunnels.json"
 SESSIONS_FILE = SBX_STATE_DIR / "sessions.json"
+SMOLVM_DB_PATH = Path.home() / ".local" / "state" / "smolvm" / "smolvm.db"
 DEBUG = False
 
 
@@ -231,6 +233,54 @@ def _resolve_project_path(path_value: str) -> Path:
 def _same_path_mount(path_value: str) -> str:
     resolved = _resolve_project_path(path_value)
     return f"{resolved}:{resolved}"
+
+
+def _workspace_mounts_from_specs(mounts: Sequence[str], *, writable: bool) -> list[dict[str, Any]]:
+    workspace_mounts: list[dict[str, Any]] = []
+    guest_paths: set[str] = set()
+    for spec in mounts:
+        host_str, guest_path = spec.rsplit(":", 1) if ":" in spec else (spec, spec)
+        host_path = _resolve_project_path(host_str)
+        if not host_path.exists() or not host_path.is_dir():
+            raise ConfigError(f"mount host path must be an existing directory: {host_path}")
+        if not guest_path.startswith("/"):
+            raise ConfigError(f"mount guest path must be absolute: {guest_path}")
+        if guest_path in guest_paths:
+            raise ConfigError(f"duplicate mount guest path: {guest_path}")
+        guest_paths.add(guest_path)
+        workspace_mounts.append(
+            {
+                "host_path": str(host_path),
+                "guest_path": guest_path,
+                "mount_tag": None,
+                "writable": writable,
+            }
+        )
+    return workspace_mounts
+
+
+def _sync_existing_vm_mounts_from_config(
+    vm_name: str, mounts: Sequence[str], *, writable_mounts: bool
+) -> None:
+    db_path = SMOLVM_DB_PATH.expanduser()
+    if not db_path.exists():
+        return
+
+    desired = _workspace_mounts_from_specs(mounts, writable=writable_mounts)
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT status, config FROM vms WHERE id = ?", (vm_name,)).fetchone()
+        if row is None or row["status"] == "running":
+            return
+        config = json.loads(row["config"])
+        if config.get("workspace_mounts") == desired:
+            return
+        config["workspace_mounts"] = desired
+        conn.execute(
+            "UPDATE vms SET config = ? WHERE id = ?",
+            (json.dumps(config, separators=(",", ":")), vm_name),
+        )
+    print(f"sbx: updated mounts for existing VM '{vm_name}'")
 
 
 def _project_guest_cwd(path_value: Any) -> str | None:
@@ -1463,6 +1513,14 @@ def cmd_start(args: argparse.Namespace) -> int:
         existing_status = _get_existing_vm_status(str(requested_name))
         _debug(f"existing VM lookup: name={requested_name!r}, status={existing_status!r}")
         if existing_status is not None:
+            if existing_status != "running":
+                try:
+                    _sync_existing_vm_mounts_from_config(
+                        str(requested_name), effective_mounts, writable_mounts=writable_mounts
+                    )
+                except ConfigError as exc:
+                    print(f"sbx: {exc}", file=sys.stderr)
+                    return 2
             start_rc = _start_existing_vm_if_needed(
                 str(requested_name), existing_status, boot_timeout
             )
@@ -1925,7 +1983,7 @@ def _add_start_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--boot-timeout",
         type=float,
-        help="Seconds to wait for VM boot/SSH readiness (default: [sbx].boot_timeout or 60).",
+        help="Seconds to wait for VM boot/SSH readiness (default: [sbx].boot_timeout or 30).",
     )
     parser.add_argument("--install-timeout", type=float)
     write_config = parser.add_mutually_exclusive_group()
