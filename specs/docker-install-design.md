@@ -47,17 +47,18 @@ docker version
 docker run --rm hello-world
 ```
 
-Keep the image manifest launch command unchanged:
+Keep the image manifest launch command unchanged and mark Docker support explicitly:
 
 ```json
 {
   "sbx": {
-    "launch_command": "pi"
+    "launch_command": "pi",
+    "features": ["docker"]
   }
 }
 ```
 
-Docker startup is an image boot concern, not a Pi wrapper.
+Non-Docker image builds should write `"features": []`. Docker startup is an image boot concern, not a Pi wrapper.
 
 ### Packaged image builder
 
@@ -100,6 +101,8 @@ Containers/Agents/Pi.Containerfile
 ```
 
 The Docker fragment content must be part of the composed Containerfile so the existing build fingerprint changes automatically. Do not add a Docker fragment override flag or a generic fragment pipeline; one opt-in Docker fragment is enough.
+
+The generated `smolvm-image.json` should include `sbx.features = ["docker"]` for Docker-capable images and `sbx.features = []` otherwise, so `sbx image ls` can display features without guessing from file names.
 
 ### Docker-capable kernel
 

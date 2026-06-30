@@ -149,6 +149,7 @@
 - [x] Add a `ponytail:` code comment at the protected SmolVM method override explaining the internal API dependency and upgrade path.
 - [x] Keep `docs/fragile-glue.md` updated with this protected-method dependency.
 - [x] Keep manifest `sbx.launch_command = "pi"`; do not wrap Pi with Docker startup.
+- [x] Add manifest `sbx.features = ["docker"]` for Docker-capable images and `[]` otherwise.
 
 ## 6. Smoke tests
 
