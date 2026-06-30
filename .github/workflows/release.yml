@@ -44,3 +44,14 @@ jobs:
           git push origin "HEAD:$GITHUB_REF_NAME"
           git push origin "$RELEASE_TAG"
           gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --generate-notes
+
+      - name: Update webpage
+        run: |
+          git clone --branch webpage/main --single-branch "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" webpage-release
+          python .github/scripts/bump_webpage_version.py "$RELEASE_VERSION" webpage-release/index.html
+          cd webpage-release
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          git diff --cached --quiet || git commit -m "Update website for $RELEASE_TAG"
+          git push origin HEAD:webpage/main
