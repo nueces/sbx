@@ -1,0 +1,96 @@
+name: Prepare release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, e.g. 1.2.3. Leave blank for next patch."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release version
+        run: |
+          git fetch --tags origin
+          previous_tag="$(git tag --sort=-v:refname | head -n 1)"
+          version="${{ inputs.version }}"
+          version="${version#v}"
+          if [ -z "$version" ]; then
+            if [ -z "$previous_tag" ]; then
+              version="0.1.0"
+            else
+              previous_version="${previous_tag#v}"
+              IFS=. read -r major minor patch <<EOF
+          $previous_version
+          EOF
+              version="$major.$minor.$((patch + 1))"
+            fi
+          fi
+          release_tag="v$version"
+          release_branch="release/$release_tag"
+          webpage_branch="webpage/release-$release_tag"
+
+          if git rev-parse -q --verify "refs/tags/$release_tag" >/dev/null; then
+            echo "tag already exists: $release_tag" >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --heads origin "$release_branch" >/dev/null 2>&1; then
+            echo "branch already exists: $release_branch" >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --heads origin "$webpage_branch" >/dev/null 2>&1; then
+            echo "branch already exists: $webpage_branch" >&2
+            exit 1
+          fi
+
+          echo "Previous release: ${previous_tag:-none}"
+          echo "Current release: $release_tag"
+          echo "Previous release: ${previous_tag:-none}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Current release: $release_tag" >> "$GITHUB_STEP_SUMMARY"
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=$release_tag" >> "$GITHUB_ENV"
+          echo "RELEASE_BRANCH=$release_branch" >> "$GITHUB_ENV"
+          echo "WEBPAGE_BRANCH=$webpage_branch" >> "$GITHUB_ENV"
+
+      - name: Create main release PR
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$RELEASE_BRANCH"
+          python .github/scripts/bump_version.py "$RELEASE_VERSION"
+          git add pyproject.toml src/sbx/__init__.py uv.lock
+          git diff --cached --quiet && { echo "version files already match $RELEASE_VERSION" >&2; exit 1; }
+          git commit -m "Release $RELEASE_TAG"
+          git push origin "$RELEASE_BRANCH"
+          pr_url="$(gh pr create --base main --head "$RELEASE_BRANCH" --title "Release $RELEASE_TAG" --body "Bumps package files for $RELEASE_TAG.")"
+          pr_number="${pr_url##*/}"
+          echo "RELEASE_PR=$pr_number" >> "$GITHUB_ENV"
+          echo "Main release PR: $pr_url" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create webpage release PR
+        run: |
+          git clone --branch webpage/main --single-branch "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" webpage-release
+          cd webpage-release
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$WEBPAGE_BRANCH"
+          python ../.github/scripts/bump_webpage_version.py "$RELEASE_VERSION" index.html
+          git add index.html
+          git diff --cached --quiet && { echo "webpage already matches $RELEASE_VERSION" >&2; exit 1; }
+          git commit -m "Update website for $RELEASE_TAG"
+          git push origin "$WEBPAGE_BRANCH"
+          pr_url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base webpage/main --head "$WEBPAGE_BRANCH" --title "Update website for $RELEASE_TAG" --body "Depends on #${RELEASE_PR}. Merge after $RELEASE_TAG exists.")"
+          echo "Webpage PR: $pr_url" >> "$GITHUB_STEP_SUMMARY"

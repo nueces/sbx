@@ -1,0 +1,70 @@
+name: Publish release
+
+on:
+  pull_request:
+    branches: [main]
+    types: [closed]
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'release/v')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Validate release PR
+        run: |
+          set -euo pipefail
+          version="${HEAD_REF#release/v}"
+          tag="v$version"
+
+          git fetch origin main --tags
+          changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+          bad_files="$(echo "$changed" | grep -Ev '^(pyproject.toml|src/sbx/__init__.py|uv.lock)$' || true)"
+          if [ -n "$bad_files" ]; then
+            echo "release PR contains unexpected files:" >&2
+            echo "$bad_files" >&2
+            exit 1
+          fi
+
+          bad_init="$(git diff --unified=0 "$BASE_SHA" "$HEAD_SHA" -- src/sbx/__init__.py | grep -E '^[+-][^+-]' | grep -Ev '^[+-]__version__ = "[0-9]+\.[0-9]+\.[0-9]+"$' || true)"
+          if [ -n "$bad_init" ]; then
+            echo "src/sbx/__init__.py may only change __version__" >&2
+            echo "$bad_init" >&2
+            exit 1
+          fi
+
+          bad_pyproject="$(git diff --unified=0 "$BASE_SHA" "$HEAD_SHA" -- pyproject.toml | grep -E '^[+-][^+-]' | grep -Ev '^[+-]version = "[0-9]+\.[0-9]+\.[0-9]+"$' || true)"
+          if [ -n "$bad_pyproject" ]; then
+            echo "pyproject.toml may only change version" >&2
+            echo "$bad_pyproject" >&2
+            exit 1
+          fi
+
+          grep -qx "version = \"$version\"" pyproject.toml
+          grep -qx "__version__ = \"$version\"" src/sbx/__init__.py
+          python .github/scripts/bump_version.py "$version"
+          git diff --exit-code
+
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "tag already exists: $tag" >&2
+            exit 1
+          fi
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+
+      - name: Create GitHub release
+        run: |
+          git tag "$RELEASE_TAG"
+          git push origin "$RELEASE_TAG"
+          gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --generate-notes

@@ -1,0 +1,52 @@
+name: Release PR checks
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  release-pr:
+    if: github.base_ref == 'main' && startsWith(github.head_ref, 'release/v')
+    runs-on: ubuntu-latest
+    env:
+      BASE_REF: origin/${{ github.base_ref }}
+      HEAD_REF: ${{ github.head_ref }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+
+      - name: Validate release bump only
+        run: |
+          set -euo pipefail
+          git fetch origin main --tags
+          version="${HEAD_REF#release/v}"
+          changed="$(git diff --name-only "$BASE_REF...HEAD")"
+          bad_files="$(echo "$changed" | grep -Ev '^(pyproject.toml|src/sbx/__init__.py|uv.lock)$' || true)"
+          if [ -n "$bad_files" ]; then
+            echo "release PR contains unexpected files:" >&2
+            echo "$bad_files" >&2
+            exit 1
+          fi
+
+          bad_init="$(git diff --unified=0 "$BASE_REF...HEAD" -- src/sbx/__init__.py | grep -E '^[+-][^+-]' | grep -Ev '^[+-]__version__ = "[0-9]+\.[0-9]+\.[0-9]+"$' || true)"
+          if [ -n "$bad_init" ]; then
+            echo "src/sbx/__init__.py may only change __version__" >&2
+            echo "$bad_init" >&2
+            exit 1
+          fi
+
+          bad_pyproject="$(git diff --unified=0 "$BASE_REF...HEAD" -- pyproject.toml | grep -E '^[+-][^+-]' | grep -Ev '^[+-]version = "[0-9]+\.[0-9]+\.[0-9]+"$' || true)"
+          if [ -n "$bad_pyproject" ]; then
+            echo "pyproject.toml may only change version" >&2
+            echo "$bad_pyproject" >&2
+            exit 1
+          fi
+
+          grep -qx "version = \"$version\"" pyproject.toml
+          grep -qx "__version__ = \"$version\"" src/sbx/__init__.py
+          python .github/scripts/bump_version.py "$version"
+          git diff --exit-code
