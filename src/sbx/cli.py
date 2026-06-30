@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import sbx.image.ls
+from sbx import __version__
 from sbx.completion import SUPPORTED_SHELLS, completion_script
 from sbx.image import build_debian
 
@@ -2014,6 +2015,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--debug", action="store_true", help="Print sbx debug diagnostics to stderr."
     )
+    parser.add_argument("--version", action="version", version=f"sbx {__version__}")
     sub = parser.add_subparsers(dest="action", required=True)
 
     run = sub.add_parser("run", help="Run an agent session in a sandbox.")
