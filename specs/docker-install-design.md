@@ -16,11 +16,10 @@ Docker-capable images start rootless Docker automatically at boot for the `agent
 
 ### User workflow
 
-Install the supported tools with `uv tool install`:
+Install `sbx` with `uv tool install`; `sbx` brings its pinned SmolVM dependency with it:
 
 ```bash
 uv tool install --editable .
-uv tool install 'smolvm==0.0.19'
 ```
 
 Build a Docker-capable image:
