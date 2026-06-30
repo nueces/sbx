@@ -170,9 +170,8 @@
                         class="terminal"
                         aria-label="Example terminal commands"
                     >
-                        <pre><span class="comment"># clone and install the tool</span>
-<span class="prompt">$</span> git clone https://github.com/nueces/sbx.git
-<span class="prompt">$</span> uv tool install --editable sbx
+                        <pre><span class="comment"># install the released tool and check the defaults</span>
+<span class="prompt">$</span> uv tool install git+https://github.com/nueces/sbx.git@v0.2.0
 <span class="prompt">$</span> sbx doctor
 
 <span class="comment"># select your quest and jump into it</span>
@@ -247,8 +246,8 @@ project_path = "."
 mount = ["/home/me/code/tooling"]
 writable_mounts = true
 run_user = "agent"
-copy_host_credentials = false</pre
-                            >
+copy_host_credentials = false
+git_config = true</pre>
                         </div>
                     </div>
                     <div class="card pixel-frame">
@@ -329,7 +328,8 @@ copy_host_credentials = false</pre
 
             <footer class="footer">
                 <div>
-                    <strong>sbx</strong> v0.2.0<br />small boxes for dungeon runs
+                    <strong>sbx</strong> v0.2.0<br />small boxes for dungeon
+                    runs
                 </div>
                 <div>
                     <a href="https://github.com/nueces/sbx"
