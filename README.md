@@ -7,8 +7,15 @@ Agents and authentication run in the VM, not on the host. By default `sbx` does 
 ## Install
 
 ```bash
-uv tool install --editable .
+uv tool install git+https://github.com/nueces/sbx.git@v0.2.0
 sbx doctor
+```
+
+For local development, install from a checkout instead:
+
+```bash
+git clone https://github.com/nueces/sbx.git
+uv tool install --editable ./sbx
 ```
 
 ## Usage
@@ -164,6 +171,8 @@ For details, see [`docs/build-local-debian-pi-image.md`](docs/build-local-debian
 3. `--config PATH` — explicit override file
 
 CLI flags always override config values.
+
+Start with the released defaults; add `.sbx.toml` only when you need a named VM, mounts, image, user, or safety defaults.
 
 Configuration should describe the sandbox, while command choice describes the action. For example, use `sbx run` to attach and `sbx create` to create without attaching, rather than relying on config to change interaction style.
 
