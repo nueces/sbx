@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version, e.g. 1.2.3"
-        required: true
+        description: "Release version, e.g. 1.2.3. Leave blank for next patch."
+        required: false
         type: string
 
 permissions:
@@ -15,21 +15,41 @@ jobs:
   release:
     runs-on: ubuntu-latest
     env:
-      RELEASE_VERSION: ${{ inputs.version }}
-      RELEASE_TAG: v${{ inputs.version }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
 
-      - name: Refuse existing tag
+      - name: Resolve release version
         run: |
           git fetch --tags
-          if git rev-parse -q --verify "refs/tags/$RELEASE_TAG" >/dev/null; then
-            echo "tag already exists: $RELEASE_TAG" >&2
+          latest_tag="$(git tag --sort=-v:refname | head -n 1)"
+          version="${{ inputs.version }}"
+          version="${version#v}"
+          if [ -z "$version" ]; then
+            if [ -z "$latest_tag" ]; then
+              version="0.1.0"
+            else
+              latest_version="${latest_tag#v}"
+              IFS=. read -r major minor patch <<EOF
+          $latest_version
+          EOF
+              version="$major.$minor.$((patch + 1))"
+            fi
+          fi
+          release_tag="v$version"
+
+          echo "Previous release: ${latest_tag:-none}"
+          echo "Current release: $release_tag"
+          echo "Previous release: ${latest_tag:-none}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Current release: $release_tag" >> "$GITHUB_STEP_SUMMARY"
+          if git rev-parse -q --verify "refs/tags/$release_tag" >/dev/null; then
+            echo "tag already exists: $release_tag" >&2
             exit 1
           fi
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=$release_tag" >> "$GITHUB_ENV"
 
       - name: Bump version
         run: python .github/scripts/bump_version.py "$RELEASE_VERSION"
