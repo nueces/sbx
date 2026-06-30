@@ -174,6 +174,7 @@ CLI flags always override config values.
 
 Start with the released defaults; add `.sbx.toml` only when you need a named VM, mounts, image, user, or safety defaults.
 
+When `sbx run` or `sbx create` creates a new named VM and `./.sbx.toml` does not exist, `sbx` writes a minimal project config with the VM name and selected options. Existing VMs do not create or update `.sbx.toml` unless `--write-config` is passed. Use `--no-write-config` to skip this bootstrap.
 Configuration should describe the sandbox, while command choice describes the action. For example, use `sbx run` to attach and `sbx create` to create without attaching, rather than relying on config to change interaction style.
 
 Example `.sbx.toml`:
@@ -189,7 +190,7 @@ disk_size = 20480
 backend = "qemu"
 os = "ubuntu"
 install_timeout = 600
-boot_timeout = 60
+boot_timeout = 30
 
 # Optional: use a local ready-to-run image directory with smolvm-image.json.
 # image = "./images/debian-pi"
@@ -247,7 +248,7 @@ git_config = true
 | `[sbx]` | `env`                   | `--env KEY`                                              | Explicit allowlist of host environment variables to forward into the guest. Defaults to empty.                                                             |
 | `[sbx]` | `git_config`            | `--git-config` / `--no-git-config`                       | Copy safe host Git identity/config into the guest. Defaults to `true`; does not copy credentials, SSH keys, signing keys, includes, or credential helpers. |
 | `[sbx]` | `install_timeout`       | `--install-timeout`                                      | Agent install timeout in seconds. Ignored when `image` is set.                                                                                             |
-| `[sbx]` | `boot_timeout`          | `--boot-timeout`                                         | VM boot/SSH readiness timeout in seconds. Defaults to `60`. Increase this if a cold boot leaves the VM running but SSH is not ready yet.                   |
+| `[sbx]` | `boot_timeout`          | `--boot-timeout`                                         | VM boot/SSH readiness timeout in seconds. Defaults to `30`. Increase this if a cold boot leaves the VM running but SSH is not ready yet.                   |
 
 ### Local ready-to-run image directories
 

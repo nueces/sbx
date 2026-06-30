@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -20,6 +21,7 @@ def isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(cli, "SBX_STATE_DIR", tmp_path / "state")
     monkeypatch.setattr(cli, "TUNNELS_FILE", tmp_path / "state" / "tunnels.json")
     monkeypatch.setattr(cli, "SESSIONS_FILE", tmp_path / "state" / "sessions.json")
+    monkeypatch.setattr(cli, "SMOLVM_DB_PATH", tmp_path / "smolvm.db")
 
 
 @pytest.fixture
@@ -85,6 +87,133 @@ def completed_ok() -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(["cmd"], 0, stdout="ok", stderr="")
 
 
+def _write_vm_row(db_path: Path, vm_id: str, *, status: str, config: dict[str, object]) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE vms (id TEXT PRIMARY KEY, status TEXT, config TEXT)")
+        conn.execute(
+            "INSERT INTO vms (id, status, config) VALUES (?, ?, ?)",
+            (vm_id, status, json.dumps(config)),
+        )
+
+
+def _read_vm_config(db_path: Path, vm_id: str) -> dict[str, object]:
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute("SELECT config FROM vms WHERE id = ?", (vm_id,)).fetchone()
+    assert row is not None
+    config = json.loads(row[0])
+    assert isinstance(config, dict)
+    return config
+
+
+def test_sync_existing_vm_mounts_updates_stale_stopped_vm(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    host = tmp_path / "project"
+    host.mkdir()
+    _write_vm_row(
+        cli.SMOLVM_DB_PATH,
+        "vm1",
+        status="stopped",
+        config={"workspace_mounts": [{"host_path": "/old", "guest_path": "/old"}]},
+    )
+
+    cli._sync_existing_vm_mounts_from_config(
+        "vm1", [f"{host}:/workspace"], writable_mounts=True
+    )
+
+    assert _read_vm_config(cli.SMOLVM_DB_PATH, "vm1")["workspace_mounts"] == [
+        {"host_path": str(host), "guest_path": "/workspace", "mount_tag": None, "writable": True}
+    ]
+    assert capsys.readouterr().out == "sbx: updated mounts for existing VM 'vm1'\n"
+
+
+def test_sync_existing_vm_mounts_skips_matching_config(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    host = tmp_path / "project"
+    host.mkdir()
+    config = {
+        "workspace_mounts": [
+            {
+                "host_path": str(host),
+                "guest_path": "/workspace",
+                "mount_tag": None,
+                "writable": False,
+            }
+        ],
+        "other": "kept",
+    }
+    _write_vm_row(cli.SMOLVM_DB_PATH, "vm1", status="stopped", config=config)
+
+    cli._sync_existing_vm_mounts_from_config(
+        "vm1", [f"{host}:/workspace"], writable_mounts=False
+    )
+
+    assert _read_vm_config(cli.SMOLVM_DB_PATH, "vm1") == config
+    assert capsys.readouterr().out == ""
+
+
+def test_cmd_start_does_not_sync_running_vm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('[sbx]\nname = "vm1"\n', encoding="utf-8")
+    calls: list[str] = []
+
+    monkeypatch.setattr(cli, "_get_existing_vm_status", lambda vm_id: "running")
+    monkeypatch.setattr(cli, "_host_git_config", lambda: None)
+    monkeypatch.setattr(
+        cli,
+        "_sync_existing_vm_mounts_from_config",
+        lambda *args, **kwargs: calls.append("sync"),
+    )
+    monkeypatch.setattr(cli, "_post_start_actions", lambda **kwargs: 0)
+
+    assert cli.main(["--config", str(config), "run"]) == 0
+    assert calls == []
+
+
+def test_workspace_mount_specs_parse_bare_and_explicit(tmp_path: Path) -> None:
+    bare = tmp_path / "bare"
+    explicit = tmp_path / "explicit"
+    bare.mkdir()
+    explicit.mkdir()
+
+    assert cli._workspace_mounts_from_specs(
+        [str(bare), f"{explicit}:/workspace"], writable=True
+    ) == [
+        {"host_path": str(bare), "guest_path": str(bare), "mount_tag": None, "writable": True},
+        {
+            "host_path": str(explicit),
+            "guest_path": "/workspace",
+            "mount_tag": None,
+            "writable": True,
+        },
+    ]
+
+
+def test_workspace_mount_specs_reject_duplicate_guest_paths(tmp_path: Path) -> None:
+    one = tmp_path / "one"
+    two = tmp_path / "two"
+    one.mkdir()
+    two.mkdir()
+
+    with pytest.raises(cli.ConfigError, match="duplicate mount guest path"):
+        cli._workspace_mounts_from_specs([f"{one}:/workspace", f"{two}:/workspace"], writable=True)
+
+
+def test_sync_existing_vm_mounts_missing_db_or_row_does_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cli._sync_existing_vm_mounts_from_config("missing", [], writable_mounts=False)
+    assert capsys.readouterr().out == ""
+
+    with sqlite3.connect(cli.SMOLVM_DB_PATH) as conn:
+        conn.execute("CREATE TABLE vms (id TEXT PRIMARY KEY, status TEXT, config TEXT)")
+    cli._sync_existing_vm_mounts_from_config("missing", [], writable_mounts=False)
+    assert capsys.readouterr().out == ""
+
+
 def test_start_local_image_happy_path(
     monkeypatch: pytest.MonkeyPatch,
     local_image_dir: Path,
@@ -119,8 +248,8 @@ def test_start_local_image_happy_path(
     assert rc == 0
     assert fake_smolvm_sdk["started"] is True
     assert fake_smolvm_sdk["waited"] is True
-    assert fake_smolvm_sdk["start_kwargs"] == {"boot_timeout": 60.0}
-    assert fake_smolvm_sdk["wait_kwargs"] == {"timeout": 60.0}
+    assert fake_smolvm_sdk["start_kwargs"] == {"boot_timeout": 30.0}
+    assert fake_smolvm_sdk["wait_kwargs"] == {"timeout": 30.0}
     vm_config = fake_smolvm_sdk["vm_config"]
     assert isinstance(vm_config, dict)
     assert vm_config["vm_id"] == "vm-from-cli"
