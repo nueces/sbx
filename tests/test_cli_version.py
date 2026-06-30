@@ -1,7 +1,6 @@
 import pytest
 
-from sbx import __version__
-from sbx import cli
+from sbx import __version__, cli
 
 
 def test_version_prints_package_version(capsys: pytest.CaptureFixture[str]) -> None:
