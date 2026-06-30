@@ -1,0 +1,46 @@
+name: Webpage release PR check
+
+on:
+  pull_request:
+    branches: [webpage/main]
+
+permissions:
+  contents: read
+
+jobs:
+  webpage-release-pr:
+    if: startsWith(github.head_ref, 'webpage/release-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Validate webpage release bump only
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          version="${HEAD_REF#webpage/release-v}"
+          tag="v$version"
+          git fetch origin "${{ github.base_ref }}" --tags
+
+          changed="$(git diff --name-only "$BASE_REF...HEAD")"
+          test "$changed" = "index.html" || {
+            echo "webpage release PR may only change index.html" >&2
+            echo "$changed" >&2
+            exit 1
+          }
+
+          count="$(grep -o "<!-- sbx-release-version -->$tag<!-- /sbx-release-version -->" index.html | wc -l)"
+          test "$count" = "2" || {
+            echo "expected exactly two webpage release markers for $tag" >&2
+            exit 1
+          }
+
+          git rev-parse -q --verify "refs/tags/$tag" >/dev/null || {
+            echo "release tag does not exist yet: $tag" >&2
+            exit 1
+          }
