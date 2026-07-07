@@ -50,6 +50,12 @@ codex
 
 The VM backend is QEMU through SmolVM. Other backends are out of scope until explicitly designed.
 
+## Backend integration contract
+
+When SmolVM exposes a stable Python API for an operation, `sbx` should use that API directly instead of shelling out to the SmolVM CLI. This is especially required for operations that pass structured data or secrets, because command-line arguments can leak through shell history or process listings.
+
+SmolVM subprocess calls are allowed only when the Python API is unavailable, when preserving interactive terminal behavior is simpler and safe, or when the command is intentionally a CLI passthrough. Subprocess calls must not place secret values in argv.
+
 ## Command contract
 
 The CLI must expose user-intent commands instead of mirroring every VM backend command.
