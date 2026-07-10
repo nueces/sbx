@@ -159,6 +159,8 @@ must be removed unless the user includes them through `--env KEY` or `[sbx].env`
 
 Environment variable names must be validated before use.
 
+When `sbx run` reuses an existing VM or `sbx shell` attaches to a VM, configured forwarded environment variables should be synchronized into the guest before attach. The implementation should use SmolVM's Python API for this sync, not `smolvm sandbox env set KEY=value`, so secret values are not exposed in command history or process listings.
+
 ## Git config contract
 
 By default, attached agent/shell sessions should receive only safe Git identity/config from the host. The allowed keys are:
