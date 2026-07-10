@@ -339,6 +339,25 @@ def test_shell_syncs_env_from_config_before_attach(
     assert calls == ["sync", "attach"]
 
 
+def test_shell_starts_stopped_vm_before_env_sync(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('[sbx]\nname = "vm1"\nenv = ["SBX_TOKEN"]\n', encoding="utf-8")
+    calls: list[str] = []
+
+    monkeypatch.setattr(cli, "_get_existing_vm_status", lambda name: "stopped")
+    monkeypatch.setattr(
+        cli, "_start_existing_vm_if_needed", lambda *args: calls.append("start") or 0
+    )
+    monkeypatch.setattr(cli, "_sync_forwarded_env", lambda *args: calls.append("sync"))
+    monkeypatch.setattr(cli, "_run_smolvm", lambda *args, **kwargs: calls.append("attach") or 0)
+
+    assert cli.main(["--config", str(config), "shell", "--keep-running"]) == 0
+    assert calls == ["start", "sync", "attach"]
+
+
 def test_shell_invalid_env_fails_before_attach(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
