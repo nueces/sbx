@@ -311,6 +311,33 @@ def _sanitize_forwarded_env(env: dict[str, str], allowed: list[str]) -> dict[str
     return env
 
 
+def _sync_forwarded_env(vm_id: str, names: list[str]) -> None:
+    if not names:
+        return
+    values = {name: os.environ[name] for name in names if name in os.environ}
+    missing = [name for name in names if name not in os.environ]
+
+    from smolvm.facade import SmolVM
+
+    vm = SmolVM.from_id(vm_id)
+    try:
+        if values:
+            vm.set_env_vars(values)
+        if missing:
+            vm.unset_env_vars(missing)
+    finally:
+        vm.close()
+
+
+def _sync_forwarded_env_or_error(vm_id: str, names: list[str]) -> bool:
+    try:
+        _sync_forwarded_env(vm_id, names)
+    except Exception as exc:  # noqa: BLE001 - keep CLI errors user-friendly.
+        print(f"sbx: failed to sync environment for VM {vm_id!r}: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
 @contextmanager
 def _patched_environ(env: Mapping[str, str]) -> Iterator[None]:
     original = dict(os.environ)
@@ -1303,6 +1330,7 @@ def _start_local_image(
     stop_on_exit: bool,
     cwd: str | None,
     git_config_text: str | None,
+    forward_env: list[str] | None = None,
 ) -> int:
     from smolvm import SmolVM, VMConfig
     from smolvm.utils import ensure_ssh_key
@@ -1388,6 +1416,8 @@ def _start_local_image(
 
     if attach:
         print(f"Started '{vm_name}'. Launching {agent}...")
+        if not _sync_forwarded_env_or_error(str(vm_name), forward_env or []):
+            return 1
     else:
         print(f"Started '{vm_name}'.")
     return _post_start_actions(
@@ -1527,6 +1557,8 @@ def cmd_start(args: argparse.Namespace) -> int:
             )
             if start_rc != 0:
                 return start_rc
+            if attach and not _sync_forwarded_env_or_error(str(requested_name), forward_env):
+                return 1
             _maybe_write_project_config(
                 args, config, vm_name=str(requested_name), agent=str(agent), created=False
             )
@@ -1563,6 +1595,7 @@ def cmd_start(args: argparse.Namespace) -> int:
                 stop_on_exit=stop_on_exit,
                 cwd=project_guest_cwd,
                 git_config_text=git_config_text,
+                forward_env=forward_env,
             )
         except ConfigError as exc:
             print(f"sbx: {exc}", file=sys.stderr)
@@ -1715,6 +1748,13 @@ def cmd_passthrough(args: argparse.Namespace) -> int:
         name = _vm_name_from_arg_or_config(args, config, "shell")
         if name is None:
             return 2
+        try:
+            forward_env = _validate_env_names(
+                _list_value(_sbx_config(config).get("env"), key="[sbx].env")
+            )
+        except ConfigError as exc:
+            print(f"sbx: {exc}", file=sys.stderr)
+            return 2
         run_user = None if args.root else args.run_user or _cfg(config, "sbx", "run_user")
         if run_user is not None:
             run_user = _validate_run_user(str(run_user))
@@ -1734,6 +1774,8 @@ def cmd_passthrough(args: argparse.Namespace) -> int:
             run_user is not None or project_guest_cwd is not None or git_config_text is not None
         ) and _get_existing_vm_status(name) is None:
             print(f"sbx: {_missing_vm_message(name)}", file=sys.stderr)
+            return 1
+        if not _sync_forwarded_env_or_error(name, forward_env):
             return 1
         _register_session(name, "shell")
         try:
