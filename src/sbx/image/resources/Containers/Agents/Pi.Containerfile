@@ -5,7 +5,6 @@ WORKDIR /home/agent
 
 ENV PATH="/home/agent/.local/bin:/home/agent/.nodejs/bin:${PATH}"
 
-
 # uv, python tooling
 RUN mkdir ~/.local/bin -p && \
     curl -LsSf https://astral.sh/uv/install.sh | sh && \
@@ -13,5 +12,5 @@ RUN mkdir ~/.local/bin -p && \
 
 # npm packages
 RUN npm config set prefix ~/.nodejs && \
-    npm install --prefix ~/.nodejs --ignore-scripts @earendil-works/pi-coding-agent && \
-    ln -s ~/.nodejs/node_modules/.bin/pi ~/.local/bin/pi
+    npm install --global --ignore-scripts @earendil-works/pi-coding-agent && \
+    printf '\nexport PATH="$HOME/.local/bin:$HOME/.nodejs/bin:$PATH"\n' >> ~/.profile

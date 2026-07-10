@@ -29,8 +29,7 @@ src/sbx/image/resources/Containers/
 
 `src/sbx/image/resources/Containers/Agents/Pi.Containerfile` defines the agent/tooling layer. It currently:
 
-- installs `@earendil-works/pi-coding-agent` for the `agent` user
-- links `pi` into `/home/agent/.local/bin/pi`
+- installs `@earendil-works/pi-coding-agent` globally under the `agent` user's npm prefix
 - installs `uv`
 - installs spec-kit CLI with `uv tool install specify-cli --from git+https://github.com/github/spec-kit.git`
 
@@ -298,7 +297,7 @@ boot_timeout = 90
 
 ### `bash: exec: pi: not found`
 
-Pi is installed under `/home/agent/.local/bin/pi` by the packaged `Containers/Agents/Pi.Containerfile`. Ensure `.sbx.toml` includes:
+Pi is installed under `/home/agent/.nodejs/bin/pi` by the packaged `Containers/Agents/Pi.Containerfile`. Ensure `.sbx.toml` includes:
 
 ```toml
 run_user = "agent"
