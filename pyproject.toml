@@ -29,11 +29,6 @@ sbx = "sbx.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/sbx"]
 
-[tool.hatch.build.targets.wheel.force-include]
-"src/sbx/image/resources/Containers" = "sbx/image/resources/Containers"
-"src/sbx/image/resources/kernel" = "sbx/image/resources/kernel"
-"src/sbx/image/resources/scripts" = "sbx/image/resources/scripts"
-
 [tool.ruff]
 line-length = 100
 target-version = "py310"
