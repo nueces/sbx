@@ -68,6 +68,17 @@ def fake_smolvm_images(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     )
 
 
+def test_packaged_pi_containerfile_uses_npm_global_install() -> None:
+    module = _load_module()
+
+    with module._packaged_resources() as resources:
+        content = (resources / module.DEFAULT_AGENT_CONTAINERFILE).read_text(encoding="utf-8")
+
+    assert 'ENV PATH="/home/agent/.local/bin:/home/agent/.nodejs/bin:${PATH}"' in content
+    assert "npm install --global --ignore-scripts @earendil-works/pi-coding-agent" in content
+    assert 'export PATH="$HOME/.local/bin:$HOME/.nodejs/bin:$PATH"' in content
+
+
 def test_build_debian_image_omits_sdk_sketch_by_default(
     fake_smolvm_images: None,
     tmp_path: Path,
