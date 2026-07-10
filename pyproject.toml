@@ -11,16 +11,16 @@ requires-python = ">=3.10"
 license = "Apache-2.0"
 authors = [{ name = "sbx contributors" }]
 dependencies = [
-  "smolvm==0.0.24.post2",
-  "tomli>=2.0; python_version < '3.11'",
+  "smolvm==0.0.26",
+  "tomli>=2.4.1; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
 dev = [
-  "pytest>=8.0",
-  "pytest-cov>=5.0",
-  "pre-commit>=4.0",
-  "ruff>=0.11.0",
+  "pytest>=9.1.1",
+  "pytest-cov>=7.1.0",
+  "pre-commit>=4.6.0",
+  "ruff>=0.15.21",
 ]
 
 [project.scripts]
@@ -28,11 +28,6 @@ sbx = "sbx.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sbx"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"src/sbx/image/resources/Containers" = "sbx/image/resources/Containers"
-"src/sbx/image/resources/kernel" = "sbx/image/resources/kernel"
-"src/sbx/image/resources/scripts" = "sbx/image/resources/scripts"
 
 [tool.ruff]
 line-length = 100

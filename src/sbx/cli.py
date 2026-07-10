@@ -15,7 +15,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -311,6 +311,50 @@ def _sanitize_forwarded_env(env: dict[str, str], allowed: list[str]) -> dict[str
     return env
 
 
+def _parse_managed_env_script(text: str) -> dict[str, str]:
+    env: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("export ") and "=" in line:
+            key, raw_value = line[len("export ") :].split("=", 1)
+            with suppress(ValueError):
+                env[key] = (shlex.split(raw_value) or [""])[0]
+    return env
+
+
+def _sync_forwarded_env_direct_ssh(vm_id: str, values: dict[str, str], missing: list[str]) -> None:
+    from smolvm.env import ENV_FILE, build_env_script
+
+    ssh_cmd = _ssh_command(vm_id)
+    completed = _run_capture([*ssh_cmd, f"cat {shlex.quote(ENV_FILE)} 2>/dev/null || true"])
+    if completed is None:
+        raise ConfigError("failed to sync environment: ssh command not found")
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip() or completed.stdout.strip()
+        raise ConfigError(f"failed to read environment: {stderr}")
+
+    env = _parse_managed_env_script(completed.stdout)
+    env.update(values)
+    for name in missing:
+        env.pop(name, None)
+
+    encoded = base64.b64encode(build_env_script(env).encode("utf-8")).decode("ascii")
+    write_script = f"""
+set -eu
+_t=$(mktemp /tmp/.smolvm_env.XXXXXXXXXX)
+trap 'rm -f "$_t"' EXIT
+printf %s {shlex.quote(encoded)} | base64 -d > "$_t"
+chmod 0644 "$_t"
+mv "$_t" {shlex.quote(ENV_FILE)}
+"""
+    completed = _run_capture([*ssh_cmd, "bash -lc " + shlex.quote(write_script)])
+    if completed is None:
+        raise ConfigError("failed to sync environment: ssh command not found")
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip() or completed.stdout.strip()
+        raise ConfigError(f"failed to write environment: {stderr}")
+
+
 def _sync_forwarded_env(vm_id: str, names: list[str]) -> None:
     if not names:
         return
@@ -318,6 +362,17 @@ def _sync_forwarded_env(vm_id: str, names: list[str]) -> None:
     missing = [name for name in names if name not in os.environ]
 
     from smolvm.facade import SmolVM
+
+    probe = SmolVM.from_id(vm_id)
+    try:
+        info = getattr(probe, "_info", None)
+        comm_channel = getattr(getattr(info, "config", None), "comm_channel", None)
+    finally:
+        probe.close()
+
+    if comm_channel is None:
+        _sync_forwarded_env_direct_ssh(vm_id, values, missing)
+        return
 
     vm = SmolVM.from_id(vm_id)
     try:
@@ -1770,11 +1825,16 @@ def cmd_passthrough(args: argparse.Namespace) -> int:
             else _cfg(config, "sbx", "git_config", True)
         )
         git_config_text = _host_git_config() if git_config else None
+        existing_status = _get_existing_vm_status(name)
         if (
             run_user is not None or project_guest_cwd is not None or git_config_text is not None
-        ) and _get_existing_vm_status(name) is None:
+        ) and existing_status is None:
             print(f"sbx: {_missing_vm_message(name)}", file=sys.stderr)
             return 1
+        if existing_status is not None:
+            start_rc = _start_existing_vm_if_needed(name, existing_status, DEFAULT_BOOT_TIMEOUT)
+            if start_rc != 0:
+                return start_rc
         if not _sync_forwarded_env_or_error(name, forward_env):
             return 1
         _register_session(name, "shell")

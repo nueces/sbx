@@ -4,6 +4,7 @@ import json
 import sqlite3
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import smolvm
@@ -811,9 +812,11 @@ def test_sync_forwarded_env_sets_present_and_unsets_missing(
     calls: list[tuple[str, object]] = []
 
     class FakeSmolVM:
+        _info = SimpleNamespace(config=SimpleNamespace(comm_channel="ssh"))
+
         @classmethod
-        def from_id(cls, vm_id: str) -> FakeSmolVM:
-            calls.append(("from_id", vm_id))
+        def from_id(cls, vm_id: str, **kwargs: object) -> FakeSmolVM:
+            calls.append(("from_id", kwargs))
             return cls()
 
         def set_env_vars(self, values: dict[str, str]) -> None:
@@ -832,11 +835,46 @@ def test_sync_forwarded_env_sets_present_and_unsets_missing(
     cli._sync_forwarded_env("vm1", ["SBX_PRESENT", "SBX_MISSING"])
 
     assert calls == [
-        ("from_id", "vm1"),
+        ("from_id", {}),
+        ("close", None),
+        ("from_id", {}),
         ("set", {"SBX_PRESENT": "value"}),
         ("unset", ["SBX_MISSING"]),
         ("close", None),
     ]
+
+
+def test_sync_forwarded_env_uses_direct_ssh_for_legacy_vm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, object]] = []
+
+    class FakeSmolVM:
+        _info = SimpleNamespace(config=SimpleNamespace(comm_channel=None))
+
+        @classmethod
+        def from_id(cls, vm_id: str, **kwargs: object) -> FakeSmolVM:
+            calls.append(("from_id", kwargs))
+            return cls()
+
+        def close(self) -> None:
+            calls.append(("close", None))
+
+    def fake_run_capture(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(("ssh", argv[-1]))
+        return subprocess.CompletedProcess(argv, 0, "export OLD=kept\nexport SBX_TOKEN=old\n", "")
+
+    monkeypatch.setattr(smolvm.facade, "SmolVM", FakeSmolVM, raising=False)
+    monkeypatch.setattr(cli, "_ssh_command", lambda vm_id: ["ssh", vm_id])
+    monkeypatch.setattr(cli, "_run_capture", fake_run_capture)
+    monkeypatch.setenv("SBX_TOKEN", "value")
+
+    cli._sync_forwarded_env("vm1", ["SBX_TOKEN", "MISSING"])
+
+    assert calls[0:2] == [("from_id", {}), ("close", None)]
+    assert calls[2] == ("ssh", "cat /etc/profile.d/smolvm_env.sh 2>/dev/null || true")
+    assert calls[3][0] == "ssh"
+    assert "base64 -d" in str(calls[3][1])
 
 
 def test_sync_forwarded_env_empty_allowlist_skips_smolvm(
