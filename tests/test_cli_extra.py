@@ -153,7 +153,26 @@ def test_sync_existing_vm_mounts_skips_matching_config(
     assert capsys.readouterr().out == ""
 
 
-def test_cmd_start_does_not_sync_running_vm(
+def test_cmd_start_syncs_env_before_existing_vm_attach(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('[sbx]\nname = "vm1"\nenv = ["SBX_TOKEN"]\n', encoding="utf-8")
+    calls: list[str] = []
+
+    monkeypatch.setattr(cli, "_get_existing_vm_status", lambda vm_id: "running")
+    monkeypatch.setattr(
+        cli, "_start_existing_vm_if_needed", lambda *args: calls.append("start") or 0
+    )
+    monkeypatch.setattr(cli, "_host_git_config", lambda: None)
+    monkeypatch.setattr(cli, "_sync_forwarded_env", lambda *args: calls.append("sync"))
+    monkeypatch.setattr(cli, "_post_start_actions", lambda **kwargs: calls.append("attach") or 0)
+
+    assert cli.main(["--config", str(config), "run"]) == 0
+    assert calls == ["start", "sync", "attach"]
+
+
+def test_cmd_start_does_not_sync_running_vm_mounts(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     config = tmp_path / "config.toml"
@@ -220,10 +239,12 @@ def test_start_local_image_happy_path(
     fake_smolvm_sdk: dict[str, object],
 ) -> None:
     captured: dict[str, object] = {}
+    calls: list[str] = []
+    monkeypatch.setattr(cli, "_sync_forwarded_env", lambda *args: calls.append("sync"))
     monkeypatch.setattr(
         cli,
         "_post_start_actions",
-        lambda **kwargs: captured.update(kwargs) or 0,
+        lambda **kwargs: calls.append("attach") or captured.update(kwargs) or 0,
     )
     args = type("Args", (), {"name": "vm-from-cli", "memory": None})()
 
@@ -243,9 +264,11 @@ def test_start_local_image_happy_path(
         stop_on_exit=False,
         cwd="/workspace",
         git_config_text="[user]\n",
+        forward_env=["SBX_TOKEN"],
     )
 
     assert rc == 0
+    assert calls == ["sync", "attach"]
     assert fake_smolvm_sdk["started"] is True
     assert fake_smolvm_sdk["waited"] is True
     assert fake_smolvm_sdk["start_kwargs"] == {"boot_timeout": 30.0}
@@ -780,6 +803,53 @@ def test_network_status_variants(
     monkeypatch.setattr(cli, "_localhost_port_is_listening", lambda port: True)
     assert cli.cmd_network_status(type("Args", (), {"name": "vm1", "host_port": 1455})()) == 0
     assert "busy/untracked" in capsys.readouterr().out
+
+
+def test_sync_forwarded_env_sets_present_and_unsets_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, object]] = []
+
+    class FakeSmolVM:
+        @classmethod
+        def from_id(cls, vm_id: str) -> FakeSmolVM:
+            calls.append(("from_id", vm_id))
+            return cls()
+
+        def set_env_vars(self, values: dict[str, str]) -> None:
+            calls.append(("set", values))
+
+        def unset_env_vars(self, names: list[str]) -> None:
+            calls.append(("unset", names))
+
+        def close(self) -> None:
+            calls.append(("close", None))
+
+    monkeypatch.setattr(smolvm.facade, "SmolVM", FakeSmolVM, raising=False)
+    monkeypatch.setenv("SBX_PRESENT", "value")
+    monkeypatch.delenv("SBX_MISSING", raising=False)
+
+    cli._sync_forwarded_env("vm1", ["SBX_PRESENT", "SBX_MISSING"])
+
+    assert calls == [
+        ("from_id", "vm1"),
+        ("set", {"SBX_PRESENT": "value"}),
+        ("unset", ["SBX_MISSING"]),
+        ("close", None),
+    ]
+
+
+def test_sync_forwarded_env_empty_allowlist_skips_smolvm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeSmolVM:
+        @classmethod
+        def from_id(cls, vm_id: str) -> FakeSmolVM:
+            raise AssertionError("SmolVM should not be opened")
+
+    monkeypatch.setattr(smolvm.facade, "SmolVM", FakeSmolVM, raising=False)
+
+    cli._sync_forwarded_env("vm1", [])
 
 
 def test_config_and_validation_error_branches(tmp_path: Path) -> None:

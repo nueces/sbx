@@ -245,10 +245,18 @@ git_config = true
 | `[sbx]` | `auth_guest_port`       | `--auth-guest-port`                                      | Guest port for OAuth callback forwarding. Defaults to `1455`.                                                                                              |
 | `[sbx]` | `stop_on_exit`          | `--stop-on-exit` / `--keep-running`                      | Stop the VM after run/shell exits if no other sbx sessions remain. Defaults to `true`.                                                                     |
 | `[sbx]` | `copy_host_credentials` | `--copy-host-credentials` / `--no-copy-host-credentials` | Allow/deny copying host credential files/configs. Defaults to `false`.                                                                                     |
-| `[sbx]` | `env`                   | `--env KEY`                                              | Explicit allowlist of host environment variables to forward into the guest. Defaults to empty.                                                             |
+| `[sbx]` | `env`                   | `--env KEY`                                              | Explicit allowlist of host environment variables to forward into the guest. Defaults to empty. See [environment forwarding](docs/environment-forwarding.md). |
 | `[sbx]` | `git_config`            | `--git-config` / `--no-git-config`                       | Copy safe host Git identity/config into the guest. Defaults to `true`; does not copy credentials, SSH keys, signing keys, includes, or credential helpers. |
 | `[sbx]` | `install_timeout`       | `--install-timeout`                                      | Agent install timeout in seconds. Ignored when `image` is set.                                                                                             |
 | `[sbx]` | `boot_timeout`          | `--boot-timeout`                                         | VM boot/SSH readiness timeout in seconds. Defaults to `30`. Increase this if a cold boot leaves the VM running but SSH is not ready yet.                   |
+
+### Environment forwarding
+
+Host environment variables are not forwarded by default. Add selected names to `[sbx].env` or pass `--env KEY` to `sbx run`.
+
+Before `sbx run` or `sbx shell` attaches, `sbx` syncs those names from the current host environment into the VM. Missing host variables are unset in the guest to avoid stale secrets. This affects only new attached processes; already-running agents or shells keep their old environment.
+
+See [`docs/environment-forwarding.md`](docs/environment-forwarding.md) for details and limitations.
 
 ### Local ready-to-run image directories
 

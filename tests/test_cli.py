@@ -324,6 +324,35 @@ def test_shell_without_name_or_config_fails(
     assert "shell requires a VM name argument or [sbx].name" in capsys.readouterr().err
 
 
+def test_shell_syncs_env_from_config_before_attach(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('[sbx]\nname = "vm1"\nenv = ["SBX_TOKEN"]\n', encoding="utf-8")
+    calls: list[str] = []
+
+    monkeypatch.setattr(cli, "_sync_forwarded_env", lambda *args: calls.append("sync"))
+    monkeypatch.setattr(cli, "_run_smolvm", lambda *args, **kwargs: calls.append("attach") or 0)
+
+    assert cli.main(["--config", str(config), "shell", "--keep-running"]) == 0
+    assert calls == ["sync", "attach"]
+
+
+def test_shell_invalid_env_fails_before_attach(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('[sbx]\nname = "vm1"\nenv = ["BAD-NAME"]\n', encoding="utf-8")
+
+    monkeypatch.setattr(
+        cli, "_run_smolvm", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError)
+    )
+
+    assert cli.main(["--config", str(config), "shell", "--keep-running"]) == 2
+
+
 def test_run_uses_local_toml_defaults(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
