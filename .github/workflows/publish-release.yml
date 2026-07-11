@@ -1,8 +1,8 @@
 name: Publish release
 
-# Publishes merged release/v* PRs by creating the git tag and GitHub release.
+# Publishes merged release/v* PRs by creating the git tag, GitHub release, and next dev-bump PR.
 # Previous: release-pr-checks.yml validates the release PR.
-# Next: post-release-dev-bump.yml runs when the release is published.
+# Next: merge the dev-bump PR manually.
 
 on:
   pull_request:
@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   publish:
@@ -18,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
+      RELEASE_PR_TOKEN: ${{ secrets.RELEASE_PR_TOKEN }}
       BASE_SHA: ${{ github.event.pull_request.base.sha }}
       HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       HEAD_REF: ${{ github.event.pull_request.head.ref }}
@@ -72,3 +74,34 @@ jobs:
           git tag "$RELEASE_TAG"
           git push origin "$RELEASE_TAG"
           gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --generate-notes
+
+      - name: Open next dev version PR
+        run: |
+          set -euo pipefail
+          token="${RELEASE_PR_TOKEN:-$GH_TOKEN}"
+          export GH_TOKEN="$token"
+          git remote set-url origin "https://x-access-token:${token}@github.com/${GITHUB_REPOSITORY}.git"
+
+          version="${RELEASE_TAG#v}"
+          IFS=. read -r major minor patch <<EOF
+          $version
+          EOF
+          dev_version="$major.$minor.$((patch + 1)).dev0"
+          dev_branch="post-release/$RELEASE_TAG-dev"
+
+          if git ls-remote --exit-code --heads origin "$dev_branch" >/dev/null 2>&1; then
+            echo "branch already exists: $dev_branch"
+            exit 0
+          fi
+
+          git fetch origin main
+          git switch -c "$dev_branch" origin/main
+          python .github/scripts/bump_version.py "$dev_version"
+          git diff --quiet && { echo "main already at $dev_version"; exit 0; }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml src/sbx/__init__.py uv.lock
+          git commit -m "Start $dev_version development"
+          git push origin "$dev_branch"
+          gh pr create --base main --head "$dev_branch" --title "Start $dev_version development" --body "Bumps main to the next development version after $RELEASE_TAG."
