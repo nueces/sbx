@@ -1,6 +1,6 @@
 name: Start release
 
-# Manual release entry point: opens the package release PR and matching website PR.
+# Manual release entry point: opens the package release PR.
 # Previous: none.
 # Next: release-pr-checks.yml runs on the opened release PR.
 
@@ -44,7 +44,6 @@ jobs:
           fi
           release_tag="v$version"
           release_branch="release/$release_tag"
-          webpage_branch="webpage/release-$release_tag"
 
           if git rev-parse -q --verify "refs/tags/$release_tag" >/dev/null; then
             echo "tag already exists: $release_tag" >&2
@@ -54,11 +53,6 @@ jobs:
             echo "branch already exists: $release_branch" >&2
             exit 1
           fi
-          if git ls-remote --exit-code --heads origin "$webpage_branch" >/dev/null 2>&1; then
-            echo "branch already exists: $webpage_branch" >&2
-            exit 1
-          fi
-
           echo "Previous release: ${previous_tag:-none}"
           echo "Current release: $release_tag"
           echo "Previous release: ${previous_tag:-none}" >> "$GITHUB_STEP_SUMMARY"
@@ -66,7 +60,6 @@ jobs:
           echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
           echo "RELEASE_TAG=$release_tag" >> "$GITHUB_ENV"
           echo "RELEASE_BRANCH=$release_branch" >> "$GITHUB_ENV"
-          echo "WEBPAGE_BRANCH=$webpage_branch" >> "$GITHUB_ENV"
 
       - name: Create main release PR
         run: |
@@ -82,18 +75,3 @@ jobs:
           pr_number="${pr_url##*/}"
           echo "RELEASE_PR=$pr_number" >> "$GITHUB_ENV"
           echo "Main release PR: $pr_url" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Create webpage release PR
-        run: |
-          git clone --branch webpage/main --single-branch "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" webpage-release
-          cd webpage-release
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git switch -c "$WEBPAGE_BRANCH"
-          python ../.github/scripts/bump_webpage_version.py "$RELEASE_VERSION" index.html
-          git add index.html
-          git diff --cached --quiet && { echo "webpage already matches $RELEASE_VERSION" >&2; exit 1; }
-          git commit -m "Update website for $RELEASE_TAG"
-          git push origin "$WEBPAGE_BRANCH"
-          pr_url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base webpage/main --head "$WEBPAGE_BRANCH" --title "Update website for $RELEASE_TAG" --body "Depends on #${RELEASE_PR}. Merge after $RELEASE_TAG exists.")"
-          echo "Webpage PR: $pr_url" >> "$GITHUB_STEP_SUMMARY"
