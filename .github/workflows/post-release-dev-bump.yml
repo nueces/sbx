@@ -1,0 +1,43 @@
+name: Post-release dev bump
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    if: startsWith(github.event.release.tag_name, 'v') && github.event.release.prerelease == false
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Open next dev version PR
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          IFS=. read -r major minor patch <<EOF
+          $version
+          EOF
+          dev_version="$major.$minor.$((patch + 1)).dev0"
+          dev_branch="post-release/$RELEASE_TAG-dev"
+
+          git switch -c "$dev_branch"
+          python .github/scripts/bump_version.py "$dev_version"
+          git diff --quiet && { echo "main already at $dev_version"; exit 0; }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml src/sbx/__init__.py uv.lock
+          git commit -m "Start $dev_version development"
+          git push origin "$dev_branch"
+          gh pr create --base main --head "$dev_branch" --title "Start $dev_version development" --body "Bumps main to the next development version after $RELEASE_TAG."
