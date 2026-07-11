@@ -26,6 +26,10 @@ def test_bump_version_updates_project_files(
         'name = "other"\nversion = "9.9.9"\n\nname = "sbx"\nversion = "0.1.0"\n',
         encoding="utf-8",
     )
+    (tmp_path / "README.md").write_text(
+        "uv tool install git+https://github.com/nueces/sbx.git@v0.1.0\n",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(bump_version, "ROOT", tmp_path)
 
     bump_version.bump(version)
@@ -39,6 +43,9 @@ def test_bump_version_updates_project_files(
     lock = (tmp_path / "uv.lock").read_text(encoding="utf-8")
     assert 'name = "other"\nversion = "9.9.9"' in lock
     assert f'name = "sbx"\nversion = "{version}"' in lock
+    readme = (tmp_path / "README.md").read_text(encoding="utf-8")
+    readme_version = "0.1.0" if ".dev" in version else version
+    assert f"git+https://github.com/nueces/sbx.git@v{readme_version}" in readme
 
 
 @pytest.mark.parametrize("version", ["1.2", "v1.2.3", "1.2.3-rc1"])

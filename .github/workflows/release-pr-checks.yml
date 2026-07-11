@@ -29,10 +29,15 @@ jobs:
           git fetch origin main --tags
           version="${HEAD_REF#release/v}"
           changed="$(git diff --name-only "$BASE_REF...HEAD")"
-          bad_files="$(echo "$changed" | grep -Ev '^(pyproject.toml|src/sbx/__init__.py|uv.lock)$' || true)"
+          bad_files="$(echo "$changed" | grep -Ev '^(README.md|pyproject.toml|src/sbx/__init__.py|uv.lock)$' || true)"
           if [ -n "$bad_files" ]; then
             echo "release PR contains unexpected files:" >&2
             echo "$bad_files" >&2
+            exit 1
+          fi
+          counts="$(git diff --numstat "$BASE_REF...HEAD" | awk '{ added += $1; deleted += $2 } END { print added+0 " " deleted+0 }')"
+          if [ "$counts" != "4 4" ]; then
+            echo "release PR should be exactly 4 insertions and 4 deletions; got $counts" >&2
             exit 1
           fi
 
@@ -47,6 +52,13 @@ jobs:
           if [ -n "$bad_pyproject" ]; then
             echo "pyproject.toml may only change version" >&2
             echo "$bad_pyproject" >&2
+            exit 1
+          fi
+
+          bad_readme="$(git diff --unified=0 "$BASE_REF...HEAD" -- README.md | grep -E '^[+-][^+-]' | grep -Ev '^[+-]uv tool install git\+https://github\.com/nueces/sbx\.git@v[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+          if [ -n "$bad_readme" ]; then
+            echo "README.md may only change the install tag" >&2
+            echo "$bad_readme" >&2
             exit 1
           fi
 

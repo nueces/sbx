@@ -67,8 +67,13 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$RELEASE_BRANCH"
           python .github/scripts/bump_version.py "$RELEASE_VERSION"
-          git add pyproject.toml src/sbx/__init__.py uv.lock
+          git add pyproject.toml src/sbx/__init__.py uv.lock README.md
           git diff --cached --quiet && { echo "version files already match $RELEASE_VERSION" >&2; exit 1; }
+          counts="$(git diff --cached --numstat | awk '{ added += $1; deleted += $2 } END { print added+0 " " deleted+0 }')"
+          if [ "$counts" != "4 4" ]; then
+            echo "release PR should be exactly 4 insertions and 4 deletions; got $counts" >&2
+            exit 1
+          fi
           git commit -m "Release $RELEASE_TAG"
           git push origin "$RELEASE_BRANCH"
           pr_url="$(gh pr create --base main --head "$RELEASE_BRANCH" --title "Release $RELEASE_TAG" --body "Bumps package files for $RELEASE_TAG.")"
