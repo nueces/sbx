@@ -359,9 +359,9 @@ Leave `version` blank to use the next patch version.
 
 Release workflows:
 
-- `.github/workflows/start-release.yml` (`Start release`): manual entry point; opens the package release PR and matching website PR.
+- `.github/workflows/start-release.yml` (`Start release`): manual entry point; opens the package release PR, including the README install tag.
 - `.github/workflows/release-pr-checks.yml` (`Release PR checks`): validates `release/v*` PRs only change version files.
-- `.github/workflows/publish-release.yml` (`Publish release`): after the release PR is merged, creates the `v0.2.1` tag, GitHub release, and a PR bumping `main` to the next dev version, for example `0.2.2.dev0`.
+- `.github/workflows/publish-release.yml` (`Publish release`): after the release PR is merged, creates the `v0.2.1` tag, GitHub release, website PR, and a PR bumping `main` to the next dev version, for example `0.2.2.dev0`.
 
 ## Notes
 

@@ -31,6 +31,12 @@ def bump(version: str) -> None:
         r'(?m)(^name = "sbx"\nversion = ")[^"]+("$)',
         rf"\g<1>{version}\2",
     )
+    if ".dev" not in version:
+        replace_once(
+            ROOT / "README.md",
+            r"git\+https://github\.com/nueces/sbx\.git@v[^\s]+",
+            f"git+https://github.com/nueces/sbx.git@v{version}",
+        )
 
 
 if __name__ == "__main__":

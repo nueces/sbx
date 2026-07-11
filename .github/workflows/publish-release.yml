@@ -1,8 +1,8 @@
 name: Publish release
 
-# Publishes merged release/v* PRs by creating the git tag, GitHub release, and next dev-bump PR.
+# Publishes merged release/v* PRs by creating the git tag, GitHub release, website PR, and next dev-bump PR.
 # Previous: release-pr-checks.yml validates the release PR.
-# Next: merge the dev-bump PR manually.
+# Next: merge the website and dev-bump PRs manually.
 
 on:
   pull_request:
@@ -37,10 +37,15 @@ jobs:
 
           git fetch origin main --tags
           changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
-          bad_files="$(echo "$changed" | grep -Ev '^(pyproject.toml|src/sbx/__init__.py|uv.lock)$' || true)"
+          bad_files="$(echo "$changed" | grep -Ev '^(README.md|pyproject.toml|src/sbx/__init__.py|uv.lock)$' || true)"
           if [ -n "$bad_files" ]; then
             echo "release PR contains unexpected files:" >&2
             echo "$bad_files" >&2
+            exit 1
+          fi
+          counts="$(git diff --numstat "$BASE_SHA" "$HEAD_SHA" | awk '{ added += $1; deleted += $2 } END { print added+0 " " deleted+0 }')"
+          if [ "$counts" != "4 4" ]; then
+            echo "release PR should be exactly 4 insertions and 4 deletions; got $counts" >&2
             exit 1
           fi
 
@@ -58,6 +63,13 @@ jobs:
             exit 1
           fi
 
+          bad_readme="$(git diff --unified=0 "$BASE_SHA" "$HEAD_SHA" -- README.md | grep -E '^[+-][^+-]' | grep -Ev '^[+-]uv tool install git\+https://github\.com/nueces/sbx\.git@v[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+          if [ -n "$bad_readme" ]; then
+            echo "README.md may only change the install tag" >&2
+            echo "$bad_readme" >&2
+            exit 1
+          fi
+
           grep -qx "version = \"$version\"" pyproject.toml
           grep -qx "__version__ = \"$version\"" src/sbx/__init__.py
           python .github/scripts/bump_version.py "$version"
@@ -67,6 +79,7 @@ jobs:
             echo "tag already exists: $tag" >&2
             exit 1
           fi
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
           echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
 
       - name: Create GitHub release
@@ -74,6 +87,30 @@ jobs:
           git tag "$RELEASE_TAG"
           git push origin "$RELEASE_TAG"
           gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --generate-notes
+
+      - name: Open website release PR
+        run: |
+          set -euo pipefail
+          token="${RELEASE_PR_TOKEN:-$GH_TOKEN}"
+          export GH_TOKEN="$token"
+          webpage_branch="webpage/release-$RELEASE_TAG"
+
+          if git ls-remote --exit-code --heads origin "$webpage_branch" >/dev/null 2>&1; then
+            echo "branch already exists: $webpage_branch"
+            exit 0
+          fi
+
+          git clone --branch webpage/main --single-branch "https://x-access-token:${token}@github.com/${GITHUB_REPOSITORY}.git" webpage-release
+          cd webpage-release
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$webpage_branch"
+          python ../.github/scripts/bump_webpage_version.py "$RELEASE_VERSION" index.html
+          git add index.html
+          git diff --cached --quiet && { echo "webpage already matches $RELEASE_VERSION"; exit 0; }
+          git commit -m "Update website for $RELEASE_TAG"
+          git push origin "$webpage_branch"
+          gh pr create --repo "$GITHUB_REPOSITORY" --base webpage/main --head "$webpage_branch" --title "Update website for $RELEASE_TAG" --body "Updates the website after $RELEASE_TAG was published."
 
       - name: Open next dev version PR
         run: |
@@ -98,6 +135,11 @@ jobs:
           git switch -c "$dev_branch" origin/main
           python .github/scripts/bump_version.py "$dev_version"
           git diff --quiet && { echo "main already at $dev_version"; exit 0; }
+          counts="$(git diff --numstat | awk '{ added += $1; deleted += $2 } END { print added+0 " " deleted+0 }')"
+          if [ "$counts" != "3 3" ]; then
+            echo "dev-bump PR should be exactly 3 insertions and 3 deletions; got $counts" >&2
+            exit 1
+          fi
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
