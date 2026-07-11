@@ -349,9 +349,20 @@ If the port is owned by an untracked/non-`sbx` process, stop that process first.
 
 ## Releases
 
-Maintainers can run the manual GitHub release workflow with a version input like `0.2.1`.
-The workflow updates version files, commits the bump, creates tag `v0.2.1`, and creates
-GitHub release `v0.2.1` with generated notes.
+Maintainers start a release with the manual `Start release` workflow:
+
+```bash
+gh workflow run start-release.yml --ref main -f version=0.2.1
+```
+
+Leave `version` blank to use the next patch version.
+
+Release workflows:
+
+- `.github/workflows/start-release.yml` (`Start release`): manual entry point; opens the package release PR and matching website PR.
+- `.github/workflows/release-pr-checks.yml` (`Release PR checks`): validates `release/v*` PRs only change version files.
+- `.github/workflows/publish-release.yml` (`Publish release`): after the release PR is merged, creates the `v0.2.1` tag and GitHub release.
+- `.github/workflows/post-release-dev-bump.yml` (`Post-release dev bump`): after the GitHub release is published, opens a PR bumping `main` to the next dev version, for example `0.2.2.dev0`.
 
 ## Notes
 

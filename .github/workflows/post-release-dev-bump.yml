@@ -1,5 +1,9 @@
 name: Post-release dev bump
 
+# After a final GitHub release is published, opens a PR for the next .dev0 version.
+# Previous: publish-release.yml creates the GitHub release.
+# Next: merge the dev-bump PR manually.
+
 on:
   release:
     types: [published]

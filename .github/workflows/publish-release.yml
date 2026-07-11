@@ -1,5 +1,9 @@
 name: Publish release
 
+# Publishes merged release/v* PRs by creating the git tag and GitHub release.
+# Previous: release-pr-checks.yml validates the release PR.
+# Next: post-release-dev-bump.yml runs when the release is published.
+
 on:
   pull_request:
     branches: [main]

@@ -1,5 +1,9 @@
 name: Start release
 
+# Manual release entry point: opens the package release PR and matching website PR.
+# Previous: none.
+# Next: release-pr-checks.yml runs on the opened release PR.
+
 on:
   workflow_dispatch:
     inputs:
