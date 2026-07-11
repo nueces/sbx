@@ -1,5 +1,9 @@
 name: Release PR checks
 
+# Validates release/v* PRs only change version files and match the branch version.
+# Previous: start-release.yml opens the release PR.
+# Next: publish-release.yml runs after merge.
+
 on:
   pull_request:
     branches: [main]

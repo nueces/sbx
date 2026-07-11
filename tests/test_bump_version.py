@@ -11,8 +11,9 @@ bump_version = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bump_version)
 
 
+@pytest.mark.parametrize("version", ["1.2.3", "1.2.4.dev0"])
 def test_bump_version_updates_project_files(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
 ) -> None:
     (tmp_path / "src/sbx").mkdir(parents=True)
     (tmp_path / "pyproject.toml").write_text(
@@ -27,18 +28,20 @@ def test_bump_version_updates_project_files(
     )
     monkeypatch.setattr(bump_version, "ROOT", tmp_path)
 
-    bump_version.bump("1.2.3")
+    bump_version.bump(version)
 
-    assert 'version = "1.2.3"' in (tmp_path / "pyproject.toml").read_text(encoding="utf-8")
-    assert '__version__ = "1.2.3"' in (tmp_path / "src/sbx/__init__.py").read_text(
+    assert f'version = "{version}"' in (tmp_path / "pyproject.toml").read_text(
+        encoding="utf-8"
+    )
+    assert f'__version__ = "{version}"' in (tmp_path / "src/sbx/__init__.py").read_text(
         encoding="utf-8"
     )
     lock = (tmp_path / "uv.lock").read_text(encoding="utf-8")
     assert 'name = "other"\nversion = "9.9.9"' in lock
-    assert 'name = "sbx"\nversion = "1.2.3"' in lock
+    assert f'name = "sbx"\nversion = "{version}"' in lock
 
 
 @pytest.mark.parametrize("version", ["1.2", "v1.2.3", "1.2.3-rc1"])
-def test_bump_version_rejects_non_x_y_z(version: str) -> None:
+def test_bump_version_rejects_bad_versions(version: str) -> None:
     with pytest.raises(SystemExit):
         bump_version.bump(version)

@@ -4,7 +4,7 @@ import re
 import sys
 from pathlib import Path
 
-VERSION_RE = re.compile(r"\d+\.\d+\.\d+\Z")
+VERSION_RE = re.compile(r"\d+\.\d+\.\d+(?:\.dev\d+)?\Z")
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -18,7 +18,7 @@ def replace_once(path: Path, pattern: str, repl: str) -> None:
 
 def bump(version: str) -> None:
     if not VERSION_RE.fullmatch(version):
-        raise SystemExit("version must match x.y.z")
+        raise SystemExit("version must match x.y.z or x.y.z.devN")
 
     replace_once(ROOT / "pyproject.toml", r'^version = "[^"]+"$', f'version = "{version}"')
     replace_once(
@@ -35,5 +35,5 @@ def bump(version: str) -> None:
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        raise SystemExit("usage: bump_version.py x.y.z")
+        raise SystemExit("usage: bump_version.py x.y.z[.devN]")
     bump(sys.argv[1])
