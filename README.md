@@ -361,8 +361,7 @@ Release workflows:
 
 - `.github/workflows/start-release.yml` (`Start release`): manual entry point; opens the package release PR and matching website PR.
 - `.github/workflows/release-pr-checks.yml` (`Release PR checks`): validates `release/v*` PRs only change version files.
-- `.github/workflows/publish-release.yml` (`Publish release`): after the release PR is merged, creates the `v0.2.1` tag and GitHub release.
-- `.github/workflows/post-release-dev-bump.yml` (`Post-release dev bump`): after the GitHub release is published, opens a PR bumping `main` to the next dev version, for example `0.2.2.dev0`.
+- `.github/workflows/publish-release.yml` (`Publish release`): after the release PR is merged, creates the `v0.2.1` tag, GitHub release, and a PR bumping `main` to the next dev version, for example `0.2.2.dev0`.
 
 ## Notes
 
