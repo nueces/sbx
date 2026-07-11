@@ -36,6 +36,7 @@ DEFAULT_BOOT_TIMEOUT = 30.0
 MIB = 1024 * 1024
 LAUNCH_COMMANDS = {"pi": "pi", "claude": "claude", "codex": "codex"}
 USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]*[$]?$", re.IGNORECASE)
+VM_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 FORWARDABLE_ENV_VARS = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
 SAFE_GIT_CONFIG_KEYS = (
@@ -294,6 +295,15 @@ def _validate_run_user(user: str) -> str:
     if not USERNAME_RE.match(user):
         raise ConfigError("[sbx].run_user must be a valid Linux user name")
     return user
+
+
+def _validate_vm_name(name: str) -> str:
+    if not VM_NAME_RE.match(name):
+        raise ConfigError(
+            "[sbx].name must be a valid hostname: lowercase letters, digits, hyphens, "
+            "1-63 chars, no leading/trailing hyphen"
+        )
+    return name
 
 
 def _validate_env_names(names: list[str]) -> list[str]:
@@ -702,6 +712,30 @@ def _host_git_config() -> str | None:
             lines.append(f'\t{option} = "{escaped}"')
         lines.append("")
     return "\n".join(lines)
+
+
+def _set_vm_hostname(vm_id: str) -> None:
+    hostname = _validate_vm_name(vm_id)
+    script = r"""
+set -eu
+hostname "$1"
+printf '%s\n' "$1" > /etc/hostname
+if grep -q '^127\.0\.1\.1[[:space:]]' /etc/hosts; then
+  sed -i "s/^127\\.0\\.1\\.1.*/127.0.1.1 $1/" /etc/hosts
+else
+  printf '127.0.1.1 %s\n' "$1" >> /etc/hosts
+fi
+"""
+    cmd = _ssh_command(vm_id)
+    cmd.append(
+        "bash -s -- " + shlex.quote(hostname) + " <<'SBX_HOSTNAME'\n" + script + "SBX_HOSTNAME"
+    )
+    completed = _run_capture(cmd)
+    if completed is None:
+        raise ConfigError("failed to set VM hostname: ssh command not found")
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip() or completed.stdout.strip()
+        raise ConfigError(f"failed to set VM hostname: {stderr}")
 
 
 def _install_git_config(vm_id: str, user: str | None, git_config_text: str | None) -> None:
@@ -1323,6 +1357,7 @@ def _start_preset_with_sdk(
             )
             vm.start(boot_timeout=boot_timeout)
             vm.wait_for_ssh(timeout=boot_timeout)
+            _set_vm_hostname(str(vm.vm_id))
             ssh = vm._ensure_ssh_for_env()
             apply_preset(ssh, preset, install_timeout=install_timeout)
             return str(vm.vm_id)
@@ -1462,6 +1497,7 @@ def _start_local_image(
         vm.start(boot_timeout=boot_timeout)
         vm.wait_for_ssh(timeout=boot_timeout)
         vm_name = vm.vm_id
+        _set_vm_hostname(str(vm_name))
     except Exception:
         vm.close()
         raise
@@ -1596,6 +1632,7 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     requested_name = _arg_or_config(args, "name", config, "sbx")
     if requested_name:
+        requested_name = _validate_vm_name(str(requested_name))
         existing_status = _get_existing_vm_status(str(requested_name))
         _debug(f"existing VM lookup: name={requested_name!r}, status={existing_status!r}")
         if existing_status is not None:
@@ -1716,6 +1753,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         try:
             rc = _run_smolvm(argv, env=smolvm_env)
             if rc == 0 and requested_name:
+                _set_vm_hostname(str(requested_name))
                 _maybe_write_project_config(
                     args, config, vm_name=str(requested_name), agent=str(agent), created=True
                 )
@@ -1742,6 +1780,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         return completed.returncode
 
     vm_name = _extract_started_vm_name(completed.stdout)
+    _set_vm_hostname(vm_name)
     _maybe_write_project_config(args, config, vm_name=vm_name, agent=str(agent), created=True)
     if auth_port:
         port_rc = _expose_auth_port(vm_name, auth_host_port, auth_guest_port)

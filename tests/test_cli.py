@@ -19,6 +19,7 @@ def isolated_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATHS", (tmp_path / "home-config.toml",))
     monkeypatch.setattr(cli, "LOCAL_CONFIG_PATHS", (tmp_path / ".sbx.toml",))
     monkeypatch.setattr(cli, "_host_git_config", lambda: None)
+    monkeypatch.setattr(cli, "_set_vm_hostname", lambda name: None)
 
 
 def install_fake_smolvm(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
@@ -1675,3 +1676,47 @@ def test_image_ls_json(
             "rootfs": "rootfs.ext4",
         }
     ]
+
+
+def test_invalid_configured_vm_name_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    install_fake_smolvm(monkeypatch, tmp_path)
+    config = tmp_path / "config.toml"
+    config.write_text('[sbx]\nname = "Bad_Name"\n', encoding="utf-8")
+
+    rc = cli.main(["--config", str(config), "create"])
+
+    assert rc == 2
+    assert "must be a valid hostname" in capsys.readouterr().err
+
+
+def test_create_sets_hostname_once(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    install_fake_smolvm(monkeypatch, tmp_path)
+    hostnames: list[str] = []
+
+    monkeypatch.setattr(cli, "_set_vm_hostname", hostnames.append)
+    monkeypatch.setattr(
+        cli,
+        "_run_smolvm_capture",
+        lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout='{"ok": true, "data": {"vm": {"name": "vm1"}}}\n',
+            stderr="",
+        ),
+    )
+
+    assert cli.main(["create", "vm1"]) == 0
+    assert hostnames == ["vm1"]
+
+
+def test_existing_vm_start_does_not_reset_hostname(monkeypatch: pytest.MonkeyPatch) -> None:
+    hostnames: list[str] = []
+    monkeypatch.setattr(cli, "_set_vm_hostname", hostnames.append)
+    monkeypatch.setattr(cli, "_get_existing_vm_status", lambda name: "stopped")
+    monkeypatch.setattr(cli, "_start_existing_vm_if_needed", lambda name, status, timeout: 0)
+    monkeypatch.setattr(cli, "_post_start_actions", lambda **kwargs: 0)
+
+    assert cli.main(["run", "vm1", "--no-attach", "--no-auth-port"]) == 0
+    assert hostnames == []

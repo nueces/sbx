@@ -23,6 +23,7 @@ def isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(cli, "TUNNELS_FILE", tmp_path / "state" / "tunnels.json")
     monkeypatch.setattr(cli, "SESSIONS_FILE", tmp_path / "state" / "sessions.json")
     monkeypatch.setattr(cli, "SMOLVM_DB_PATH", tmp_path / "smolvm.db")
+    monkeypatch.setattr(cli, "_set_vm_hostname", lambda name: None)
 
 
 @pytest.fixture
