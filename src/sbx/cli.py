@@ -630,16 +630,32 @@ def _maybe_print_boot_timeout_running_hint(vm_id: str | None, boot_timeout: floa
     return True
 
 
-def _start_existing_vm_if_needed(vm_id: str, status: str, boot_timeout: float) -> int:
+def _mark_error_vm_stopped_for_restart(vm_id: str) -> None:
+    db_path = SMOLVM_DB_PATH.expanduser()
+    if not db_path.exists():
+        return
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE vms SET status = 'stopped', pid = NULL, socket_path = NULL WHERE id = ?",
+            (vm_id,),
+        )
+
+
+def _start_existing_vm_if_needed(
+    vm_id: str, status: str, boot_timeout: float, *, force_start: bool = False
+) -> int:
     if status == "running":
         return 0
     if status == "error":
-        print(
-            f"sbx: VM '{vm_id}' is in error state; run `sbx recreate {vm_id} --force` "
-            "to delete it and create a fresh VM.",
-            file=sys.stderr,
-        )
-        return 1
+        if not force_start:
+            print(
+                f"sbx: VM '{vm_id}' is in error state; retry with `--force-start` or run "
+                f"`sbx recreate {vm_id} --force` to delete it and create a fresh VM.",
+                file=sys.stderr,
+            )
+            return 1
+        _mark_error_vm_stopped_for_restart(vm_id)
     rc = _run_smolvm(["sandbox", "start", vm_id, "--boot-timeout", f"{boot_timeout:g}"])
     if rc != 0:
         _maybe_print_boot_timeout_running_hint(vm_id, boot_timeout)
@@ -1645,7 +1661,10 @@ def cmd_start(args: argparse.Namespace) -> int:
                     print(f"sbx: {exc}", file=sys.stderr)
                     return 2
             start_rc = _start_existing_vm_if_needed(
-                str(requested_name), existing_status, boot_timeout
+                str(requested_name),
+                existing_status,
+                boot_timeout,
+                force_start=bool(getattr(args, "force_start", False)),
             )
             if start_rc != 0:
                 return start_rc
@@ -1871,7 +1890,12 @@ def cmd_passthrough(args: argparse.Namespace) -> int:
             print(f"sbx: {_missing_vm_message(name)}", file=sys.stderr)
             return 1
         if existing_status is not None:
-            start_rc = _start_existing_vm_if_needed(name, existing_status, DEFAULT_BOOT_TIMEOUT)
+            start_rc = _start_existing_vm_if_needed(
+                name,
+                existing_status,
+                DEFAULT_BOOT_TIMEOUT,
+                force_start=bool(getattr(args, "force_start", False)),
+            )
             if start_rc != 0:
                 return start_rc
         if not _sync_forwarded_env_or_error(name, forward_env):
@@ -2159,7 +2183,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"sbx {__version__}")
     sub = parser.add_subparsers(dest="action", required=True)
 
-    run = sub.add_parser("run", help="Run an agent session in a sandbox.")
+    force_start_parent = argparse.ArgumentParser(add_help=False)
+    force_start_parent.add_argument(
+        "--force-start",
+        action="store_true",
+        help="Retry starting an existing VM even when its status is error.",
+    )
+
+    run = sub.add_parser(
+        "run", help="Run an agent session in a sandbox.", parents=[force_start_parent]
+    )
     _add_start_options(run)
     run.set_defaults(func=cmd_start)
 
@@ -2183,7 +2216,9 @@ def build_parser() -> argparse.ArgumentParser:
     stop.add_argument("name", nargs="?", help="Sandbox name. Defaults to [sbx].name.")
     stop.set_defaults(func=cmd_passthrough)
 
-    shell = sub.add_parser("shell", help="Open a shell in a sandbox.")
+    shell = sub.add_parser(
+        "shell", help="Open a shell in a sandbox.", parents=[force_start_parent]
+    )
     shell.add_argument(
         "--keep-running",
         action="store_true",

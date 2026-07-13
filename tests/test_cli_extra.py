@@ -164,7 +164,7 @@ def test_cmd_start_syncs_env_before_existing_vm_attach(
 
     monkeypatch.setattr(cli, "_get_existing_vm_status", lambda vm_id: "running")
     monkeypatch.setattr(
-        cli, "_start_existing_vm_if_needed", lambda *args: calls.append("start") or 0
+        cli, "_start_existing_vm_if_needed", lambda *args, **kwargs: calls.append("start") or 0
     )
     monkeypatch.setattr(cli, "_host_git_config", lambda: None)
     monkeypatch.setattr(cli, "_sync_forwarded_env", lambda *args: calls.append("sync"))
@@ -1373,12 +1373,68 @@ def test_recreate_success_deletes_then_starts(monkeypatch: pytest.MonkeyPatch) -
 
 def test_start_existing_vm_if_needed_variants(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[list[str]] = []
+    marked: list[str] = []
     monkeypatch.setattr(cli, "_run_smolvm", lambda argv: calls.append(list(argv)) or 0)
+    monkeypatch.setattr(
+        cli, "_mark_error_vm_stopped_for_restart", lambda vm_id: marked.append(vm_id)
+    )
+
     assert cli._start_existing_vm_if_needed("vm1", "running", 60) == 0
     assert calls == []
     assert cli._start_existing_vm_if_needed("vm1", "stopped", 60) == 0
     assert calls == [["sandbox", "start", "vm1", "--boot-timeout", "60"]]
     assert cli._start_existing_vm_if_needed("vm1", "error", 60) == 1
+    assert marked == []
+    assert cli._start_existing_vm_if_needed("vm1", "error", 60, force_start=True) == 0
+    assert marked == ["vm1"]
+    assert calls[-1] == ["sandbox", "start", "vm1", "--boot-timeout", "60"]
+
+
+def test_mark_error_vm_stopped_for_restart_clears_stale_runtime_fields() -> None:
+    with sqlite3.connect(cli.SMOLVM_DB_PATH) as conn:
+        conn.execute(
+            "CREATE TABLE vms (id TEXT PRIMARY KEY, status TEXT, pid INTEGER, socket_path TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO vms (id, status, pid, socket_path) VALUES (?, ?, ?, ?)",
+            ("vm1", "error", 123, "/tmp/stale.sock"),
+        )
+
+    cli._mark_error_vm_stopped_for_restart("vm1")
+
+    with sqlite3.connect(cli.SMOLVM_DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT status, pid, socket_path FROM vms WHERE id = ?", ("vm1",)
+        ).fetchone()
+    assert row == ("stopped", None, None)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["run", "vm1", "--force-start", "--no-attach"],
+        ["shell", "--force-start", "--keep-running", "--no-git-config", "vm1"],
+    ],
+)
+def test_force_start_is_passed_to_existing_vm_start(
+    monkeypatch: pytest.MonkeyPatch, argv: list[str]
+) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(cli, "_get_existing_vm_status", lambda vm_id: "error")
+    monkeypatch.setattr(
+        cli,
+        "_start_existing_vm_if_needed",
+        lambda vm_id, status, timeout, *, force_start=False: captured.update(
+            {"vm_id": vm_id, "status": status, "force_start": force_start}
+        )
+        or 0,
+    )
+    monkeypatch.setattr(cli, "_post_start_actions", lambda **kwargs: 0)
+    monkeypatch.setattr(cli, "_sync_forwarded_env_or_error", lambda vm_id, names: True)
+    monkeypatch.setattr(cli, "_run_smolvm", lambda argv: 0)
+
+    assert cli.main(argv) == 0
+    assert captured == {"vm_id": "vm1", "status": "error", "force_start": True}
 
 
 def test_start_existing_vm_timeout_hint_when_vm_is_running(

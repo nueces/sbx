@@ -350,7 +350,7 @@ def test_shell_starts_stopped_vm_before_env_sync(
 
     monkeypatch.setattr(cli, "_get_existing_vm_status", lambda name: "stopped")
     monkeypatch.setattr(
-        cli, "_start_existing_vm_if_needed", lambda *args: calls.append("start") or 0
+        cli, "_start_existing_vm_if_needed", lambda *args, **kwargs: calls.append("start") or 0
     )
     monkeypatch.setattr(cli, "_sync_forwarded_env", lambda *args: calls.append("sync"))
     monkeypatch.setattr(cli, "_run_smolvm", lambda *args, **kwargs: calls.append("attach") or 0)
@@ -1715,7 +1715,7 @@ def test_existing_vm_start_does_not_reset_hostname(monkeypatch: pytest.MonkeyPat
     hostnames: list[str] = []
     monkeypatch.setattr(cli, "_set_vm_hostname", hostnames.append)
     monkeypatch.setattr(cli, "_get_existing_vm_status", lambda name: "stopped")
-    monkeypatch.setattr(cli, "_start_existing_vm_if_needed", lambda name, status, timeout: 0)
+    monkeypatch.setattr(cli, "_start_existing_vm_if_needed", lambda *args, **kwargs: 0)
     monkeypatch.setattr(cli, "_post_start_actions", lambda **kwargs: 0)
 
     assert cli.main(["run", "vm1", "--no-attach", "--no-auth-port"]) == 0
