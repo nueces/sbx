@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import argparse
 import base64
 import json
@@ -7,32 +5,31 @@ import os
 import re
 import shlex
 import shutil
-import signal
-import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
-import time
+import tomllib
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
 import sbx.image.ls
+import sbx.network as network
 from sbx import __version__
 from sbx.completion import SUPPORTED_SHELLS, completion_script
+from sbx.constants import (
+    DEFAULT_BACKEND,
+    DEFAULT_BOOT_TIMEOUT,
+    SBX_STATE_DIR,
+    SESSIONS_FILE,
+    SMOLVM_DB_PATH,
+)
 from sbx.image import build_debian
-
-try:  # Python 3.11+
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10
-    import tomli as tomllib  # type: ignore[no-redef]
-
+from sbx.runtime import ConfigError as RuntimeConfigError
 
 AGENTS = ("pi", "claude", "codex")
-DEFAULT_BACKEND = "qemu"
-DEFAULT_BOOT_TIMEOUT = 30.0
 MIB = 1024 * 1024
 LAUNCH_COMMANDS = {"pi": "pi", "claude": "claude", "codex": "codex"}
 USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]*[$]?$", re.IGNORECASE)
@@ -50,15 +47,10 @@ SAFE_GIT_CONFIG_KEYS = (
 )
 DEFAULT_CONFIG_PATHS = (Path.home() / ".config" / "sbx" / "config.toml",)
 LOCAL_CONFIG_PATHS = (Path.cwd() / ".sbx.toml",)
-SBX_STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "sbx"
-TUNNELS_FILE = SBX_STATE_DIR / "tunnels.json"
-SESSIONS_FILE = SBX_STATE_DIR / "sessions.json"
-SMOLVM_DB_PATH = Path.home() / ".local" / "state" / "smolvm" / "smolvm.db"
 DEBUG = False
 
 
-class ConfigError(ValueError):
-    pass
+ConfigError = RuntimeConfigError
 
 
 def _debug(message: str) -> None:
@@ -261,28 +253,51 @@ def _workspace_mounts_from_specs(mounts: Sequence[str], *, writable: bool) -> li
     return workspace_mounts
 
 
-def _sync_existing_vm_mounts_from_config(
-    vm_name: str, mounts: Sequence[str], *, writable_mounts: bool
+def _sync_existing_vm_start_config(
+    vm_name: str,
+    mounts: Sequence[str] | None,
+    *,
+    writable_mounts: bool,
+    port_forwards: Sequence[str],
 ) -> None:
     db_path = SMOLVM_DB_PATH.expanduser()
     if not db_path.exists():
         return
 
-    desired = _workspace_mounts_from_specs(mounts, writable=writable_mounts)
+    desired_mounts = (
+        _workspace_mounts_from_specs(mounts, writable=writable_mounts)
+        if mounts is not None
+        else None
+    )
+    desired_forwards = network.port_forwards_from_specs(port_forwards)
+    updated: list[str] = []
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT status, config FROM vms WHERE id = ?", (vm_name,)).fetchone()
         if row is None or row["status"] == "running":
             return
         config = json.loads(row["config"])
-        if config.get("workspace_mounts") == desired:
+        if desired_mounts is not None and config.get("workspace_mounts") != desired_mounts:
+            config["workspace_mounts"] = desired_mounts
+            updated.append("mounts")
+        if config.get("port_forwards", []) != desired_forwards:
+            config["port_forwards"] = desired_forwards
+            updated.append("port forwards")
+        if not updated:
             return
-        config["workspace_mounts"] = desired
         conn.execute(
             "UPDATE vms SET config = ? WHERE id = ?",
             (json.dumps(config, separators=(",", ":")), vm_name),
         )
-    print(f"sbx: updated mounts for existing VM '{vm_name}'")
+    print(f"sbx: updated {', '.join(updated)} for existing VM '{vm_name}'")
+
+
+def _sync_existing_vm_mounts_from_config(
+    vm_name: str, mounts: Sequence[str], *, writable_mounts: bool
+) -> None:
+    _sync_existing_vm_start_config(
+        vm_name, mounts, writable_mounts=writable_mounts, port_forwards=[]
+    )
 
 
 def _project_guest_cwd(path_value: Any) -> str | None:
@@ -848,15 +863,9 @@ def _write_json_object(path: Path, data: Mapping[str, Any]) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def _load_tunnels() -> dict[str, Any]:
-    return _read_json_object(TUNNELS_FILE)
-
-
-def _save_tunnels(data: Mapping[str, Any]) -> None:
-    _write_json_object(TUNNELS_FILE, data)
-
-
 def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -864,46 +873,6 @@ def _pid_is_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
-
-
-def _tracked_auth_tunnel(vm_id: str) -> dict[str, Any] | None:
-    tunnel = _load_tunnels().get(vm_id, {}).get("auth_port")
-    if not isinstance(tunnel, dict):
-        return None
-    pid = tunnel.get("pid")
-    if not isinstance(pid, int) or not _pid_is_alive(pid):
-        return None
-    return tunnel
-
-
-def _tracked_auth_tunnel_for_host_port(host_port: int) -> tuple[str, dict[str, Any]] | None:
-    for vm_id, vm_data in _load_tunnels().items():
-        if not isinstance(vm_data, dict):
-            continue
-        tunnel = vm_data.get("auth_port")
-        if not isinstance(tunnel, dict) or tunnel.get("host_port") != host_port:
-            continue
-        pid = tunnel.get("pid")
-        if isinstance(pid, int) and _pid_is_alive(pid):
-            return str(vm_id), tunnel
-    return None
-
-
-def _record_auth_tunnel(vm_id: str, *, pid: int, host_port: int, guest_port: int) -> None:
-    data = _load_tunnels()
-    vm_data = data.setdefault(vm_id, {})
-    vm_data["auth_port"] = {"pid": pid, "host_port": host_port, "guest_port": guest_port}
-    _save_tunnels(data)
-
-
-def _remove_auth_tunnel_record(vm_id: str) -> None:
-    data = _load_tunnels()
-    vm_data = data.get(vm_id)
-    if isinstance(vm_data, dict):
-        vm_data.pop("auth_port", None)
-        if not vm_data:
-            data.pop(vm_id, None)
-    _save_tunnels(data)
 
 
 def _load_sessions() -> dict[str, Any]:
@@ -972,121 +941,6 @@ def _stop_vm_if_last_session(vm_id: str, *, stop_on_exit: bool) -> None:
     _run_smolvm(["sandbox", "stop", vm_id])
 
 
-def _localhost_port_is_listening(port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.settimeout(0.2)
-        return sock.connect_ex(("127.0.0.1", port)) == 0
-
-
-def _close_tracked_auth_tunnel(vm_id: str) -> bool:
-    tracked = _tracked_auth_tunnel(vm_id)
-    if tracked is None:
-        _remove_auth_tunnel_record(vm_id)
-        return False
-
-    pid = int(tracked["pid"])
-    with suppress_process_errors():
-        os.killpg(pid, signal.SIGTERM)
-    deadline = time.monotonic() + 3
-    while time.monotonic() < deadline and _pid_is_alive(pid):
-        time.sleep(0.1)
-    if _pid_is_alive(pid):
-        with suppress_process_errors():
-            os.killpg(pid, signal.SIGKILL)
-    _remove_auth_tunnel_record(vm_id)
-    return True
-
-
-def _expose_auth_port(vm_id: str, host_port: int, guest_port: int, *, replace: bool = False) -> int:
-    _debug(f"expose auth port: vm={vm_id}, host_port={host_port}, guest_port={guest_port}")
-    tracked = _tracked_auth_tunnel(vm_id)
-    if (
-        tracked
-        and tracked.get("host_port") == host_port
-        and tracked.get("guest_port") == guest_port
-    ):
-        _debug(f"auth host port {host_port} already tracked with pid {tracked['pid']}")
-        return 0
-    if _localhost_port_is_listening(host_port):
-        owner = _tracked_auth_tunnel_for_host_port(host_port)
-        if owner is not None:
-            owner_vm, _owner_tunnel = owner
-            if replace:
-                print(
-                    f"sbx: replacing auth tunnel on localhost:{host_port}: "
-                    f"VM '{owner_vm}' -> VM '{vm_id}'.",
-                    file=sys.stderr,
-                )
-                _close_tracked_auth_tunnel(owner_vm)
-            else:
-                print(
-                    f"sbx: warning: localhost:{host_port} is already used by the auth "
-                    f"tunnel for VM '{owner_vm}'. `/login` in VM '{vm_id}' may not work; "
-                    f"run `sbx network auth-port {vm_id} --replace` to switch it.",
-                    file=sys.stderr,
-                )
-                return 0
-        else:
-            print(
-                f"sbx: warning: localhost:{host_port} is already in use and is not tracked "
-                "by sbx. `/login` may not work until that port is free.",
-                file=sys.stderr,
-            )
-            return 0
-
-    cmd = _ssh_command(vm_id)
-    forward_args = [
-        "-N",
-        "-L",
-        f"127.0.0.1:{host_port}:127.0.0.1:{guest_port}",
-        "-o",
-        "ExitOnForwardFailure=yes",
-        "-o",
-        "BatchMode=yes",
-    ]
-    cmd[-1:-1] = forward_args
-    _debug_command(cmd, None)
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
-    except FileNotFoundError:
-        print("sbx: command not found: ssh", file=sys.stderr)
-        return 127
-    except OSError as exc:
-        print(f"sbx: failed to start auth port tunnel: {exc}", file=sys.stderr)
-        return 1
-
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            stderr = proc.stderr.read().strip() if proc.stderr is not None else ""
-            print(f"sbx: auth port tunnel exited before becoming ready: {stderr}", file=sys.stderr)
-            return proc.returncode or 1
-        if _localhost_port_is_listening(host_port):
-            _record_auth_tunnel(vm_id, pid=proc.pid, host_port=host_port, guest_port=guest_port)
-            _debug(f"auth port tunnel ready with pid {proc.pid}")
-            return 0
-        time.sleep(0.1)
-
-    with suppress_process_errors():
-        os.killpg(proc.pid, signal.SIGTERM)
-    print(f"sbx: auth port tunnel did not become ready on localhost:{host_port}", file=sys.stderr)
-    return 1
-
-
-class suppress_process_errors:
-    def __enter__(self) -> None:
-        return None
-
-    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
-        return isinstance(exc, (ProcessLookupError, PermissionError, OSError))
-
-
 def _attach_as_root(vm_id: str, launch_command: str, cwd: str | None = None) -> int:
     from smolvm.env import ENV_FILE
 
@@ -1135,7 +989,7 @@ def _post_start_actions(
     git_config_text: str | None = None,
 ) -> int:
     if auth_port:
-        port_rc = _expose_auth_port(vm_name, auth_host_port, auth_guest_port)
+        port_rc = network.expose_auth_port(vm_name, auth_host_port, auth_guest_port)
         if port_rc != 0:
             return port_rc
     if not attach:
@@ -1322,7 +1176,7 @@ def _start_preset_with_sdk(
     args: argparse.Namespace,
     config: Mapping[str, Any],
     agent: str,
-    cpus: int,
+    cpus: int | None,
     mounts: Sequence[str],
     writable_mounts: bool,
     attach: bool,
@@ -1336,10 +1190,12 @@ def _start_preset_with_sdk(
     copy_host_credentials: bool,
     forward_env: list[str],
     json_output: bool,
+    port_forwards: Sequence[str],
 ) -> int:
     from smolvm import SmolVM
     from smolvm.facade import _build_auto_config
     from smolvm.presets import apply_preset, get_preset
+    from smolvm.types import PortForwardConfig
 
     preset_name = "claude-code" if agent == "claude" else agent
     preset = get_preset(preset_name)
@@ -1363,7 +1219,15 @@ def _start_preset_with_sdk(
             disk_size_mib=int(disk_size),
             ssh_key_path=None,
         )
-        config_obj = config_obj.model_copy(update={"vcpu_count": cpus})
+        updates: dict[str, Any] = {
+            "port_forwards": [
+                PortForwardConfig(**item)
+                for item in network.port_forwards_from_specs(port_forwards)
+            ]
+        }
+        if cpus is not None:
+            updates["vcpu_count"] = cpus
+        config_obj = config_obj.model_copy(update=updates)
         try:
             vm = SmolVM(
                 config_obj,
@@ -1437,6 +1301,7 @@ def _start_local_image(
     cwd: str | None,
     git_config_text: str | None,
     forward_env: list[str] | None = None,
+    port_forwards: Sequence[str] = (),
 ) -> int:
     from smolvm import SmolVM, VMConfig
     from smolvm.utils import ensure_ssh_key
@@ -1489,6 +1354,7 @@ def _start_local_image(
         "backend": DEFAULT_BACKEND,
         "ssh_capable": True,
         "ssh_public_key": public_key.read_text(encoding="utf-8").strip(),
+        "port_forwards": network.port_forwards_from_specs(port_forwards),
     }
     if cpus_value is not None:
         vm_config["vcpu_count"] = _validate_cpus(cpus_value)
@@ -1645,6 +1511,12 @@ def cmd_start(args: argparse.Namespace) -> int:
     git_config_text = _host_git_config() if git_config else None
     cpus_value = _arg_or_config(args, "cpus", config, "sbx")
     cpus = _validate_cpus(cpus_value) if cpus_value is not None else None
+    try:
+        port_forwards = _list_value(sbx_cfg.get("port_forwards"), key="[sbx].port_forwards")
+        network.port_forwards_from_specs(port_forwards)
+    except ConfigError as exc:
+        print(f"sbx: {exc}", file=sys.stderr)
+        return 2
 
     requested_name = _arg_or_config(args, "name", config, "sbx")
     if requested_name:
@@ -1654,8 +1526,11 @@ def cmd_start(args: argparse.Namespace) -> int:
         if existing_status is not None:
             if existing_status != "running":
                 try:
-                    _sync_existing_vm_mounts_from_config(
-                        str(requested_name), effective_mounts, writable_mounts=writable_mounts
+                    _sync_existing_vm_start_config(
+                        str(requested_name),
+                        effective_mounts,
+                        writable_mounts=writable_mounts,
+                        port_forwards=port_forwards,
                     )
                 except ConfigError as exc:
                     print(f"sbx: {exc}", file=sys.stderr)
@@ -1707,6 +1582,7 @@ def cmd_start(args: argparse.Namespace) -> int:
                 cwd=project_guest_cwd,
                 git_config_text=git_config_text,
                 forward_env=forward_env,
+                port_forwards=port_forwards,
             )
         except ConfigError as exc:
             print(f"sbx: {exc}", file=sys.stderr)
@@ -1719,7 +1595,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             print(f"sbx: failed to start image: {exc}", file=sys.stderr)
             return 1
 
-    if cpus is not None:
+    if cpus is not None or port_forwards:
         try:
             return _start_preset_with_sdk(
                 args=args,
@@ -1739,6 +1615,7 @@ def cmd_start(args: argparse.Namespace) -> int:
                 copy_host_credentials=copy_host_credentials,
                 forward_env=forward_env,
                 json_output=bool(args.json),
+                port_forwards=port_forwards,
             )
         except ConfigError as exc:
             print(f"sbx: {exc}", file=sys.stderr)
@@ -1802,7 +1679,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     _set_vm_hostname(vm_name)
     _maybe_write_project_config(args, config, vm_name=vm_name, agent=str(agent), created=True)
     if auth_port:
-        port_rc = _expose_auth_port(vm_name, auth_host_port, auth_guest_port)
+        port_rc = network.expose_auth_port(vm_name, auth_host_port, auth_guest_port)
         if port_rc != 0:
             return port_rc
 
@@ -1883,6 +1760,14 @@ def cmd_passthrough(args: argparse.Namespace) -> int:
             else _cfg(config, "sbx", "git_config", True)
         )
         git_config_text = _host_git_config() if git_config else None
+        try:
+            port_forwards = _list_value(
+                _sbx_config(config).get("port_forwards"), key="[sbx].port_forwards"
+            )
+            network.port_forwards_from_specs(port_forwards)
+        except ConfigError as exc:
+            print(f"sbx: {exc}", file=sys.stderr)
+            return 2
         existing_status = _get_existing_vm_status(name)
         if (
             run_user is not None or project_guest_cwd is not None or git_config_text is not None
@@ -1890,6 +1775,14 @@ def cmd_passthrough(args: argparse.Namespace) -> int:
             print(f"sbx: {_missing_vm_message(name)}", file=sys.stderr)
             return 1
         if existing_status is not None:
+            if existing_status != "running":
+                try:
+                    _sync_existing_vm_start_config(
+                        name, None, writable_mounts=False, port_forwards=port_forwards
+                    )
+                except ConfigError as exc:
+                    print(f"sbx: {exc}", file=sys.stderr)
+                    return 2
             start_rc = _start_existing_vm_if_needed(
                 name,
                 existing_status,
@@ -1958,71 +1851,6 @@ def _delete_vm(vm_id: str, extra_args: Sequence[str] | None = None) -> int:
     if completed.stdout:
         print(completed.stdout, end="")
     return completed.returncode
-
-
-def cmd_auth_port(args: argparse.Namespace) -> int:
-    name = _vm_name_from_arg_or_config(
-        args, getattr(args, "config_data", None), "network auth-port"
-    )
-    if name is None:
-        return 2
-    return _expose_auth_port(
-        name, args.host_port, args.guest_port, replace=bool(getattr(args, "replace", False))
-    )
-
-
-def cmd_close_auth_port(args: argparse.Namespace) -> int:
-    name = _vm_name_from_arg_or_config(
-        args, getattr(args, "config_data", None), "network close-auth-port"
-    )
-    if name is None:
-        return 2
-    if not _close_tracked_auth_tunnel(name):
-        print(f"No tracked auth port tunnel for '{name}'.")
-        return 0
-    print(f"Closed auth port tunnel for '{name}'.")
-    return 0
-
-
-def cmd_network_status(args: argparse.Namespace) -> int:
-    name = _vm_name_from_arg_or_config(
-        args, getattr(args, "config_data", None), "network status"
-    )
-    if name is None:
-        return 2
-    completed = _run_smolvm_capture(["sandbox", "info", name, "--json"])
-    if completed is None:
-        return 127
-    if completed.returncode != 0:
-        if completed.stdout:
-            print(completed.stdout, end="")
-        if completed.stderr:
-            print(completed.stderr, end="", file=sys.stderr)
-        return completed.returncode
-
-    payload = json.loads(completed.stdout)
-    vm = payload["data"]["vm"]
-    tracked = _tracked_auth_tunnel(name)
-    auth_status = "inactive"
-    auth_detail = "-"
-    if tracked is not None:
-        auth_status = "active"
-        auth_detail = (
-            f"pid {tracked['pid']}, localhost:{tracked['host_port']} -> "
-            f"guest:{tracked['guest_port']}"
-        )
-    elif _localhost_port_is_listening(args.host_port):
-        auth_status = "busy/untracked"
-        auth_detail = f"localhost:{args.host_port} is listening but is not tracked by sbx"
-
-    print(f"Sandbox: {vm['name']}")
-    print(f"Status: {vm['status']}")
-    print(f"Backend: {vm['backend']}")
-    print(f"Guest IP: {vm['ip_address']}")
-    print(f"SSH Port: {vm['ssh_port']}")
-    print(f"Auth callback: {auth_status}")
-    print(f"Auth detail: {auth_detail}")
-    return 0
 
 
 def cmd_create(args: argparse.Namespace) -> int:
@@ -2263,8 +2091,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ls_p.set_defaults(func=cmd_passthrough)
 
-    network = sub.add_parser("network", help="Expert networking helpers.")
-    network_sub = network.add_subparsers(dest="network_action", required=True)
+    network_parser = sub.add_parser("network", help="Expert networking helpers.")
+    network_sub = network_parser.add_subparsers(dest="network_action", required=True)
+    forward = network_sub.add_parser(
+        "forward",
+        help="Forward a host TCP port to a running sandbox until Ctrl-C.",
+    )
+    forward.add_argument(
+        "forward_args",
+        nargs="+",
+        metavar="[NAME] SPEC",
+        help="Forward spec: GUEST_PORT, HOST_PORT:GUEST_PORT, or BIND_HOST:HOST_PORT:GUEST_PORT.",
+    )
+    forward.set_defaults(func=network.cmd_forward)
+
     auth_port = network_sub.add_parser(
         "auth-port",
         help="Expose the Pi OAuth callback port from a sandbox to host localhost.",
@@ -2287,7 +2127,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Close an existing sbx-tracked auth tunnel on this host port before exposing it.",
     )
-    auth_port.set_defaults(func=cmd_auth_port)
+    auth_port.set_defaults(func=network.cmd_auth_port)
 
     close_auth_port = network_sub.add_parser(
         "close-auth-port",
@@ -2296,7 +2136,7 @@ def build_parser() -> argparse.ArgumentParser:
     close_auth_port.add_argument(
         "name", nargs="?", help="Sandbox name or ID. Defaults to [sbx].name."
     )
-    close_auth_port.set_defaults(func=cmd_close_auth_port)
+    close_auth_port.set_defaults(func=network.cmd_close_auth_port)
 
     network_status = network_sub.add_parser(
         "status",
@@ -2311,7 +2151,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=1455,
         help="Host auth callback port to inspect (default: 1455).",
     )
-    network_status.set_defaults(func=cmd_network_status)
+    network_status.set_defaults(func=network.cmd_status)
 
     image = sub.add_parser("image", help="Advanced local image helpers.")
     image_sub = image.add_subparsers(dest="image_action", required=True)

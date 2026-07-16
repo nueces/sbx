@@ -17,3 +17,6 @@ stop_on_exit = false
 copy_host_credentials = false
 env = []
 git_config = true
+
+# Optional host-to-guest TCP forwards, applied when the VM starts.
+# port_forwards = ["3000", "8080:3000", "0.0.0.0:3000:3000"]

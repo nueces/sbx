@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import subprocess
 
 import pytest
@@ -24,6 +22,25 @@ def test_bash_completion_includes_agent_values() -> None:
     script = completion_script("bash")
     assert "--agent" in script
     assert "pi claude codex" in script
+
+
+def test_completion_scripts_include_all_command_option_groups() -> None:
+    for shell in SUPPORTED_SHELLS:
+        script = completion_script(shell)
+        for value in (
+            "forward",
+            "auth-port",
+            "close-auth-port",
+            "status",
+            "build-debian",
+            "force-start",
+            "force",
+            "host-port",
+            "guest-port",
+            "replace",
+            "rootfs-size-mb",
+        ):
+            assert value in script
 
 
 def test_bash_completion_completes_redirection_targets(tmp_path) -> None:

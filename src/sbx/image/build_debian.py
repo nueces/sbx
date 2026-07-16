@@ -6,8 +6,6 @@ to build a Debian userspace from a Containerfile, packs it into rootfs.ext4,
 downloads/resolves a SmolVM-compatible kernel, and prints the resulting paths.
 """
 
-from __future__ import annotations
-
 import argparse
 import hashlib
 import json
