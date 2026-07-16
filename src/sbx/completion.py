@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 SUPPORTED_SHELLS = ("bash", "zsh", "fish")
 
 COMMANDS = (
@@ -15,7 +13,7 @@ COMMANDS = (
     "doctor",
     "completion",
 )
-NETWORK_COMMANDS = ("auth-port", "close-auth-port", "status")
+NETWORK_COMMANDS = ("forward", "auth-port", "close-auth-port", "status")
 IMAGE_COMMANDS = ("build-debian", "ls")
 AGENTS = ("pi", "claude", "codex")
 
@@ -53,6 +51,7 @@ START_OPTIONS = (
     "--help",
 )
 SHELL_OPTIONS = (
+    "--force-start",
     "--keep-running",
     "--run-user",
     "--project-path",
@@ -64,7 +63,7 @@ SHELL_OPTIONS = (
 LS_OPTIONS = ("--all", "-a", "--help")
 RM_OPTIONS = ("--force", "--help")
 STOP_OPTIONS = ("--help",)
-RECREATE_EXTRA_OPTIONS = ("--force",)
+RUN_OPTIONS = ("--force-start", *START_OPTIONS)
 AUTH_PORT_OPTIONS = ("--guest-port", "--host-port", "--replace", "--help")
 NETWORK_STATUS_OPTIONS = ("--host-port", "--help")
 IMAGE_BUILD_DEBIAN_OPTIONS = (
@@ -92,6 +91,10 @@ def _words(values: tuple[str, ...]) -> str:
     return " ".join(values)
 
 
+def _zsh_words(values: tuple[str, ...]) -> str:
+    return " ".join(f"'{value}'" for value in values)
+
+
 def completion_script(shell: str) -> str:
     if shell == "bash":
         return bash_completion()
@@ -105,8 +108,9 @@ def completion_script(shell: str) -> str:
 def bash_completion() -> str:
     commands = _words(COMMANDS)
     global_options = _words(GLOBAL_OPTIONS)
-    start_options = _words(START_OPTIONS)
-    recreate_options = _words((*RECREATE_EXTRA_OPTIONS, *START_OPTIONS))
+    run_options = _words(RUN_OPTIONS)
+    create_options = _words(START_OPTIONS)
+    recreate_options = _words(("--force", *START_OPTIONS))
     shell_options = _words(SHELL_OPTIONS)
     ls_options = _words(LS_OPTIONS)
     rm_options = _words(RM_OPTIONS)
@@ -159,8 +163,11 @@ _sbx_complete() {{
     fi
 
     case "$cmd" in
-        run|create)
-            COMPREPLY=( $(compgen -W "{start_options}" -- "$cur") )
+        run)
+            COMPREPLY=( $(compgen -W "{run_options}" -- "$cur") )
+            ;;
+        create)
+            COMPREPLY=( $(compgen -W "{create_options}" -- "$cur") )
             ;;
         recreate)
             COMPREPLY=( $(compgen -W "{recreate_options}" -- "$cur") )
@@ -187,8 +194,12 @@ _sbx_complete() {{
             done
             if [[ -z "$subcmd" ]]; then
                 COMPREPLY=( $(compgen -W "{network_commands}" -- "$cur") )
+            elif [[ "$subcmd" == "forward" ]]; then
+                COMPREPLY=( $(compgen -W "--help" -- "$cur") )
             elif [[ "$subcmd" == "auth-port" ]]; then
                 COMPREPLY=( $(compgen -W "{auth_port_options}" -- "$cur") )
+            elif [[ "$subcmd" == "close-auth-port" ]]; then
+                COMPREPLY=( $(compgen -W "--help" -- "$cur") )
             elif [[ "$subcmd" == "status" ]]; then
                 COMPREPLY=( $(compgen -W "{network_status_options}" -- "$cur") )
             fi
@@ -219,23 +230,39 @@ complete -o default -F _sbx_complete sbx
 
 
 def zsh_completion() -> str:
-    commands = " ".join(f"'{command}'" for command in COMMANDS)
-    start_options = " ".join(f"'{option}'" for option in START_OPTIONS)
-    shell_options = " ".join(f"'{option}'" for option in SHELL_OPTIONS)
-    network_commands = " ".join(f"'{command}'" for command in NETWORK_COMMANDS)
-    image_commands = " ".join(f"'{command}'" for command in IMAGE_COMMANDS)
-    image_build_debian_options = " ".join(f"'{option}'" for option in IMAGE_BUILD_DEBIAN_OPTIONS)
-    image_ls_options = " ".join(f"'{option}'" for option in IMAGE_LS_OPTIONS)
-    shells = " ".join(f"'{shell}'" for shell in COMPLETION_SHELLS)
+    commands = _zsh_words(COMMANDS)
+    run_options = _zsh_words(RUN_OPTIONS)
+    create_options = _zsh_words(START_OPTIONS)
+    recreate_options = _zsh_words(("--force", *START_OPTIONS))
+    shell_options = _zsh_words(SHELL_OPTIONS)
+    ls_options = _zsh_words(LS_OPTIONS)
+    rm_options = _zsh_words(RM_OPTIONS)
+    stop_options = _zsh_words(STOP_OPTIONS)
+    network_commands = _zsh_words(NETWORK_COMMANDS)
+    auth_port_options = _zsh_words(AUTH_PORT_OPTIONS)
+    network_status_options = _zsh_words(NETWORK_STATUS_OPTIONS)
+    image_commands = _zsh_words(IMAGE_COMMANDS)
+    image_build_debian_options = _zsh_words(IMAGE_BUILD_DEBIAN_OPTIONS)
+    image_ls_options = _zsh_words(IMAGE_LS_OPTIONS)
+    shells = _zsh_words(COMPLETION_SHELLS)
     return f"""#compdef sbx
 # zsh completion for sbx
 _sbx() {{
-  local -a commands start_options shell_options network_commands
+  local -a commands run_options create_options recreate_options shell_options
+  local -a ls_options rm_options stop_options network_commands
+  local -a auth_port_options network_status_options
   local -a image_commands image_build_debian_options image_ls_options shells
   commands=({commands})
-  start_options=({start_options})
+  run_options=({run_options})
+  create_options=({create_options})
+  recreate_options=({recreate_options})
   shell_options=({shell_options})
+  ls_options=({ls_options})
+  rm_options=({rm_options})
+  stop_options=({stop_options})
   network_commands=({network_commands})
+  auth_port_options=({auth_port_options})
+  network_status_options=({network_status_options})
   image_commands=({image_commands})
   image_build_debian_options=({image_build_debian_options})
   image_ls_options=({image_ls_options})
@@ -247,15 +274,38 @@ _sbx() {{
       ;;
     *)
       case $words[2] in
-        run|create|recreate)
-          _describe 'option' start_options
+        run)
+          _describe 'option' run_options
+          ;;
+        create)
+          _describe 'option' create_options
+          ;;
+        recreate)
+          _describe 'option' recreate_options
           ;;
         shell)
           _describe 'option' shell_options
           ;;
+        ls)
+          _describe 'option' ls_options
+          ;;
+        rm)
+          _describe 'option' rm_options
+          ;;
+        stop)
+          _describe 'option' stop_options
+          ;;
         network)
           if (( CURRENT == 3 )); then
             _describe 'network command' network_commands
+          elif [[ $words[3] == "forward" ]]; then
+            _describe 'option' '(--help)'
+          elif [[ $words[3] == "auth-port" ]]; then
+            _describe 'option' auth_port_options
+          elif [[ $words[3] == "close-auth-port" ]]; then
+            _describe 'option' '(--help)'
+          elif [[ $words[3] == "status" ]]; then
+            _describe 'option' network_status_options
           else
             _arguments '*: :->args'
           fi
@@ -300,11 +350,16 @@ def fish_completion() -> str:
             "complete -c sbx -f -n '__fish_use_subcommand' "
             f"-a {command}"
         )
-    for option in START_OPTIONS:
-        lines.append(
-            "complete -c sbx -f -n '__fish_seen_subcommand_from run create recreate' "
-            f"{_fish_flag(option)}"
-        )
+    for command, options in (
+        ("run", RUN_OPTIONS),
+        ("create", START_OPTIONS),
+        ("recreate", ("--force", *START_OPTIONS)),
+    ):
+        for option in options:
+            lines.append(
+                f"complete -c sbx -f -n '__fish_seen_subcommand_from {command}' "
+                f"{_fish_flag(option)}"
+            )
     for agent in AGENTS:
         lines.append(
             "complete -c sbx -f -n '__fish_seen_argument -l agent' "
@@ -330,6 +385,17 @@ def fish_completion() -> str:
             "complete -c sbx -f -n '__fish_seen_subcommand_from network; "
             f"and not __fish_seen_subcommand_from {network_subcommands}' -a {command}"
         )
+    for command, options in (
+        ("forward", ("--help",)),
+        ("auth-port", AUTH_PORT_OPTIONS),
+        ("close-auth-port", ("--help",)),
+        ("status", NETWORK_STATUS_OPTIONS),
+    ):
+        for option in options:
+            lines.append(
+                f"complete -c sbx -f -n '__fish_seen_subcommand_from {command}' "
+                f"{_fish_flag(option)}"
+            )
     image_subcommands = _words(IMAGE_COMMANDS)
     for command in IMAGE_COMMANDS:
         lines.append(
