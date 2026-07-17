@@ -1402,9 +1402,9 @@ def test_network_forward_defaults_to_configured_name(
     config.write_text('[sbx]\nname = "vm1"\n', encoding="utf-8")
     captured: dict[str, object] = {}
 
-    def fake_forward(vm_id: str, forward: tuple[str, int, int]) -> int:
+    def fake_forward(vm_id: str, forwards: list[tuple[str, int, int]]) -> int:
         captured["vm_id"] = vm_id
-        captured["forward"] = forward
+        captured["forwards"] = forwards
         return 0
 
     monkeypatch.setattr(cli.network, "_foreground_port_forward", fake_forward)
@@ -1412,7 +1412,7 @@ def test_network_forward_defaults_to_configured_name(
     assert cli.main(["--config", str(config), "network", "forward", "8080:3000"]) == 0
     assert captured == {
         "vm_id": "vm1",
-        "forward": ("127.0.0.1", 8080, 3000),
+        "forwards": [("127.0.0.1", 8080, 3000)],
     }
 
 
@@ -1421,18 +1421,55 @@ def test_network_forward_accepts_explicit_name(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(
         cli.network,
         "_foreground_port_forward",
-        lambda vm_id, forward: captured.update({"vm_id": vm_id, "forward": forward}) or 0,
+        lambda vm_id, forwards: captured.update({"vm_id": vm_id, "forwards": forwards}) or 0,
     )
 
     assert cli.main(["network", "forward", "vm2", "0.0.0.0:3000:3000"]) == 0
     assert captured == {
         "vm_id": "vm2",
-        "forward": ("0.0.0.0", 3000, 3000),
+        "forwards": [("0.0.0.0", 3000, 3000)],
+    }
+
+
+def test_network_forward_accepts_multiple_specs_from_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('[sbx]\nname = "vm1"\n', encoding="utf-8")
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        cli.network,
+        "_foreground_port_forward",
+        lambda vm_id, forwards: captured.update({"vm_id": vm_id, "forwards": forwards}) or 0,
+    )
+
+    assert cli.main(["--config", str(config), "network", "forward", "3000", "8080:80"]) == 0
+    assert captured == {
+        "vm_id": "vm1",
+        "forwards": [("127.0.0.1", 3000, 3000), ("127.0.0.1", 8080, 80)],
+    }
+
+
+def test_network_forward_accepts_explicit_name_with_multiple_specs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        cli.network,
+        "_foreground_port_forward",
+        lambda vm_id, forwards: captured.update({"vm_id": vm_id, "forwards": forwards}) or 0,
+    )
+
+    assert cli.main(["network", "forward", "vm2", "3000", "8080:80"]) == 0
+    assert captured == {
+        "vm_id": "vm2",
+        "forwards": [("127.0.0.1", 3000, 3000), ("127.0.0.1", 8080, 80)],
     }
 
 
 def test_network_forward_ctrl_c_returns_130(monkeypatch: pytest.MonkeyPatch) -> None:
-    def interrupted(vm_id: str, forward: tuple[str, int, int]) -> int:
+    def interrupted(vm_id: str, forwards: list[tuple[str, int, int]]) -> int:
         raise KeyboardInterrupt
 
     monkeypatch.setattr(cli.network, "_foreground_port_forward", interrupted)

@@ -780,6 +780,33 @@ def test_expose_auth_port_error_paths(
     assert cli.network.expose_auth_port("vm1", 1, 2) == 1
 
 
+def test_foreground_port_forward_uses_one_ssh_for_multiple_ports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, list[str]] = {}
+    def fake_run(argv: list[str]) -> int:
+        captured["argv"] = list(argv)
+        return 0
+
+    monkeypatch.setattr(cli.network, "ssh_command", lambda vm_id: ["ssh", "root@host"])
+    monkeypatch.setattr(cli.network, "run", fake_run)
+
+    assert cli.network._foreground_port_forward(
+        "vm1", [("127.0.0.1", 3000, 3000), ("127.0.0.1", 8080, 80)]
+    ) == 0
+    assert captured["argv"] == [
+        "ssh",
+        "-N",
+        "-L",
+        "127.0.0.1:3000:127.0.0.1:3000",
+        "-L",
+        "127.0.0.1:8080:127.0.0.1:80",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "root@host",
+    ]
+
+
 def test_delete_vm_error_paths(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

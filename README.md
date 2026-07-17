@@ -74,12 +74,37 @@ sbx run my-sbx --mount /home/me/src/tooling:/workspace/tooling
 
 # Disable automatic OAuth callback forwarding.
 sbx run my-sbx --no-auth-port
+```
 
-# Temporarily forward a running guest web server until Ctrl-C.
+Port forwarding lets your host connect to a TCP service running inside the sandbox, such as a dev server or web app. `sbx network forward` runs in the foreground; Ctrl-C stops the forwarding.
+
+A forward `SPEC` maps a host address/port to a guest port:
+
+```text
+GUEST_PORT                 host 127.0.0.1:GUEST_PORT -> guest 127.0.0.1:GUEST_PORT
+HOST_PORT:GUEST_PORT       host 127.0.0.1:HOST_PORT  -> guest 127.0.0.1:GUEST_PORT
+BIND_HOST:HOST_PORT:GUEST_PORT
+                           host BIND_HOST:HOST_PORT  -> guest 127.0.0.1:GUEST_PORT
+```
+
+Examples:
+
+```text
+3000              host 127.0.0.1:3000 -> guest 127.0.0.1:3000
+8080:80           host 127.0.0.1:8080 -> guest 127.0.0.1:80
+0.0.0.0:8080:80   host 0.0.0.0:8080 -> guest 127.0.0.1:80
+```
+
+You can pass multiple specs in one command; one Ctrl-C stops all of them:
+
+```bash
 sbx network forward my-sbx 3000
 sbx network forward 8080:3000
 sbx network forward 0.0.0.0:3000:3000
+sbx network forward my-sbx 3000 8080:80
+```
 
+```bash
 # Keep the VM running after the agent/shell exits.
 sbx run my-sbx --keep-running
 sbx shell my-sbx --keep-running
@@ -116,7 +141,7 @@ sbx run my-sbx --agent claude
 | `shell [NAME]`                   | Open a shell in a sandbox.                                                               |
 | `ls`                             | List running sandboxes. Use `ls -a` / `ls --all` to include stopped ones.                |
 | `network status [NAME]`          | Expert helper: show sandbox networking and auth callback tunnel status.                  |
-| `network forward [NAME] SPEC`    | Temporarily forward a host TCP port to a running sandbox until Ctrl-C.                   |
+| `network forward [NAME] SPEC...` | Temporarily forward host TCP ports to a running sandbox until Ctrl-C.                    |
 | `network auth-port [NAME]`       | Expert helper: manually expose the OAuth callback port for an already-running sandbox.   |
 | `network close-auth-port [NAME]` | Expert helper: close the tracked OAuth callback tunnel.                                  |
 | `image build-debian`             | Advanced helper: build a local Debian/Pi image, optionally with `--with-docker`.         |
