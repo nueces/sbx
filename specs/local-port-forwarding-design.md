@@ -37,6 +37,8 @@ Examples:
 sbx network forward 3000
 sbx network forward 8080:3000
 sbx network forward 0.0.0.0:3000:3000
+sbx network forward 3000 8080:80
+sbx network forward my-sbx 3000 8080:80
 ```
 
 Meanings:
@@ -58,7 +60,9 @@ Forwarding 127.0.0.1:3000 -> guest 127.0.0.1:3000
 Press Ctrl-C to stop.
 ```
 
-Stopping the `sbx network forward` process closes the tunnel. There is no `stop-forward`, no PID tracking, and no background mode in the first version. Users who really need background behavior can use their shell:
+One foreground command may include multiple specs; it opens one SSH process with multiple `-L` forwards.
+
+Stopping the `sbx network forward` process closes the tunnel and exits cleanly without a traceback. There is no `stop-forward`, no PID tracking, and no background mode in the first version. Users who really need background behavior can use their shell:
 
 ```bash
 sbx network forward 3000 &
@@ -67,7 +71,7 @@ sbx network forward 3000 &
 Implementation: run an SSH local forward in the foreground:
 
 ```bash
-ssh -N -L 127.0.0.1:3000:127.0.0.1:3000 ...
+ssh -N -L 127.0.0.1:3000:127.0.0.1:3000 -L 127.0.0.1:8080:127.0.0.1:80 ...
 ```
 
 ## Configured forwarding behavior
