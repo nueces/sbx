@@ -216,36 +216,36 @@ def expose_auth_port(vm_id: str, host_port: int, guest_port: int, *, replace: bo
     return 1
 
 
-def _foreground_port_forward(vm_id: str, forward: tuple[str, int, int]) -> int:
-    host, host_port, guest_port = forward
+def _foreground_port_forward(vm_id: str, forwards: Sequence[tuple[str, int, int]]) -> int:
     cmd = ssh_command(vm_id)
-    cmd[-1:-1] = [
-        "-N",
-        "-L",
-        f"{host}:{host_port}:127.0.0.1:{guest_port}",
-        "-o",
-        "ExitOnForwardFailure=yes",
-    ]
-    print(f"Forwarding {host}:{host_port} -> guest 127.0.0.1:{guest_port}")
+    forward_args = ["-N"]
+    for host, host_port, guest_port in forwards:
+        forward_args.extend(["-L", f"{host}:{host_port}:127.0.0.1:{guest_port}"])
+    forward_args.extend(["-o", "ExitOnForwardFailure=yes"])
+    cmd[-1:-1] = forward_args
+    for host, host_port, guest_port in forwards:
+        print(f"Forwarding {host}:{host_port} -> guest 127.0.0.1:{guest_port}")
     print("Press Ctrl-C to stop.")
     return run(cmd)
 
 
 def cmd_forward(args: argparse.Namespace) -> int:
-    if len(args.forward_args) == 1:
-        spec = args.forward_args[0]
+    name = None
+    specs = args.forward_args
+    if len(specs) > 1:
+        try:
+            parse_port_forward(specs[0])
+        except ConfigError:
+            name = specs[0]
+            specs = specs[1:]
+    if name is None:
         name = vm_name_from_arg_or_config(
             args, getattr(args, "config_data", None), "network forward"
         )
-    elif len(args.forward_args) == 2:
-        name, spec = args.forward_args
-    else:
-        print("sbx: network forward expects [NAME] SPEC", file=sys.stderr)
-        return 2
     if name is None:
         return 2
     try:
-        return _foreground_port_forward(str(name), parse_port_forward(spec))
+        return _foreground_port_forward(str(name), [parse_port_forward(spec) for spec in specs])
     except ConfigError as exc:
         print(f"sbx: {exc}", file=sys.stderr)
         return 2

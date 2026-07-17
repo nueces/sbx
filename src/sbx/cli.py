@@ -2101,8 +2101,8 @@ def build_parser() -> argparse.ArgumentParser:
     forward.add_argument(
         "forward_args",
         nargs="+",
-        metavar="[NAME] SPEC",
-        help="Forward spec: GUEST_PORT, HOST_PORT:GUEST_PORT, or BIND_HOST:HOST_PORT:GUEST_PORT.",
+        metavar="[NAME] SPEC...",
+        help="Forward specs: GUEST_PORT, HOST_PORT:GUEST_PORT, or BIND_HOST:HOST_PORT:GUEST_PORT.",
     )
     forward.set_defaults(func=network.cmd_forward)
 

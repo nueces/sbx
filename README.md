@@ -75,10 +75,11 @@ sbx run my-sbx --mount /home/me/src/tooling:/workspace/tooling
 # Disable automatic OAuth callback forwarding.
 sbx run my-sbx --no-auth-port
 
-# Temporarily forward a running guest web server until Ctrl-C.
+# Temporarily forward running guest services until Ctrl-C.
 sbx network forward my-sbx 3000
 sbx network forward 8080:3000
 sbx network forward 0.0.0.0:3000:3000
+sbx network forward my-sbx 3000 8080:80
 
 # Keep the VM running after the agent/shell exits.
 sbx run my-sbx --keep-running
@@ -116,7 +117,7 @@ sbx run my-sbx --agent claude
 | `shell [NAME]`                   | Open a shell in a sandbox.                                                               |
 | `ls`                             | List running sandboxes. Use `ls -a` / `ls --all` to include stopped ones.                |
 | `network status [NAME]`          | Expert helper: show sandbox networking and auth callback tunnel status.                  |
-| `network forward [NAME] SPEC`    | Temporarily forward a host TCP port to a running sandbox until Ctrl-C.                   |
+| `network forward [NAME] SPEC...` | Temporarily forward host TCP ports to a running sandbox until Ctrl-C.                    |
 | `network auth-port [NAME]`       | Expert helper: manually expose the OAuth callback port for an already-running sandbox.   |
 | `network close-auth-port [NAME]` | Expert helper: close the tracked OAuth callback tunnel.                                  |
 | `image build-debian`             | Advanced helper: build a local Debian/Pi image, optionally with `--with-docker`.         |

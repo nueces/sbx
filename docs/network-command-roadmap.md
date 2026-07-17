@@ -10,14 +10,16 @@ sbx network ...
 
 ## Current commands
 
-### `sbx network forward [NAME] SPEC`
+### `sbx network forward [NAME] SPEC...`
 
-Forwards a host TCP port to a running sandbox in the foreground. Press Ctrl-C to stop.
+Forwards host TCP ports to a running sandbox in the foreground. Press Ctrl-C to stop all forwards.
 
 ```bash
 sbx network forward 3000
 sbx network forward 8080:3000
 sbx network forward 0.0.0.0:3000:3000
+sbx network forward 3000 8080:80
+sbx network forward my-sbx 3000 8080:80
 ```
 
 Configured forwards live in `.sbx.toml` and are applied when the VM starts:
