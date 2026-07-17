@@ -5,6 +5,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -2214,6 +2215,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
     try:
         return args.func(args)
+    except KeyboardInterrupt:
+        # Shell convention: signal exits are 128 + signal number.
+        return 128 + signal.SIGINT
     except ConfigError as exc:
         print(f"sbx: {exc}", file=sys.stderr)
         return 2
