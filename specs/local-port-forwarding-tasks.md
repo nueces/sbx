@@ -7,8 +7,10 @@
 - [x] Add tests for valid and invalid forward specs.
 - [x] Add `port_forwards` to `.sbx.toml` loading and generated/example config docs.
 - [x] Apply configured `port_forwards` during `sbx run` and `sbx shell` VM startup using QEMU `hostfwd`/SmolVM `port_forwards`.
-- [x] Add `sbx network forward [NAME] SPEC` as a foreground SSH tunnel.
+- [x] Add `sbx network forward [NAME] SPEC...` as a foreground SSH tunnel.
+- [x] Support multiple ad-hoc specs in one foreground SSH process.
 - [x] Print the selected host/guest mapping and `Press Ctrl-C to stop.` before blocking.
+- [x] Handle Ctrl-C cleanly without a traceback.
 - [x] Keep ad-hoc forwarding untracked: no `stop-forward`, no daemon, no tunnel state file.
 - [x] Update README/network docs with the minimal UX.
 - [x] Run focused tests and ruff.
