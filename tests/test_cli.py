@@ -1431,6 +1431,15 @@ def test_network_forward_accepts_explicit_name(monkeypatch: pytest.MonkeyPatch) 
     }
 
 
+def test_network_forward_ctrl_c_returns_130(monkeypatch: pytest.MonkeyPatch) -> None:
+    def interrupted(vm_id: str, forward: tuple[str, int, int]) -> int:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.network, "_foreground_port_forward", interrupted)
+
+    assert cli.main(["network", "forward", "vm2", "3005"]) == 130
+
+
 def test_network_commands_default_to_configured_name(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
