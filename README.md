@@ -76,6 +76,7 @@ sbx run my-sbx --mount /home/me/src/tooling:/workspace/tooling
 sbx run my-sbx --no-auth-port
 
 # Temporarily forward running guest services until Ctrl-C.
+# SPEC: GUEST_PORT, HOST_PORT:GUEST_PORT, or BIND_HOST:HOST_PORT:GUEST_PORT.
 sbx network forward my-sbx 3000
 sbx network forward 8080:3000
 sbx network forward 0.0.0.0:3000:3000

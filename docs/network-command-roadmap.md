@@ -22,6 +22,14 @@ sbx network forward 3000 8080:80
 sbx network forward my-sbx 3000 8080:80
 ```
 
+`SPEC` is one of:
+
+```text
+3000              host 127.0.0.1:3000 -> guest 127.0.0.1:3000
+8080:80           host 127.0.0.1:8080 -> guest 127.0.0.1:80
+0.0.0.0:8080:80   host 0.0.0.0:8080 -> guest 127.0.0.1:80
+```
+
 Configured forwards live in `.sbx.toml` and are applied when the VM starts:
 
 ```toml
