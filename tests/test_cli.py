@@ -430,7 +430,7 @@ mount = [".:/workspace"]
 
     assert rc == 0
     assert capfd.readouterr().out == (
-        "codex start --name demo --backend qemu --boot-timeout 30 --mount .:/workspace --attach\n"
+        "codex start --name demo --backend qemu --boot-timeout 60 --mount .:/workspace --attach\n"
     )
 
 
@@ -595,7 +595,7 @@ run_user = "agent"
         "--backend",
         "qemu",
         "--boot-timeout",
-        "30",
+        "60",
         "--no-attach",
         "--json",
     ]
@@ -744,7 +744,7 @@ def test_run_does_not_copy_host_credentials_by_default(
         "--backend",
         "qemu",
         "--boot-timeout",
-        "30",
+        "60",
         "--no-attach",
     ]
     assert captured["env"] == {
@@ -832,7 +832,7 @@ def test_copy_host_credentials_flag_uses_current_environment(
         "--backend",
         "qemu",
         "--boot-timeout",
-        "30",
+        "60",
         "--no-attach",
     ]
     assert captured["env"] is not None
@@ -1023,7 +1023,7 @@ def test_run_with_project_path_attaches_from_mounted_project_cwd(
         "--backend",
         "qemu",
         "--boot-timeout",
-        "30",
+        "60",
         "--mount",
         f"{project}:{project}",
         "--writable-mounts",
@@ -1076,7 +1076,7 @@ def test_run_exposes_auth_port_by_default_before_attach(
         "--backend",
         "qemu",
         "--boot-timeout",
-        "30",
+        "60",
         "--no-attach",
         "--json",
     ]
@@ -1120,7 +1120,7 @@ def test_run_existing_vm_starts_without_creating(
     assert rc == 0
     assert calls == [
         ["smolvm", "sandbox", "info", "vm1", "--json"],
-        ["smolvm", "sandbox", "start", "vm1", "--boot-timeout", "30"],
+        ["smolvm", "sandbox", "start", "vm1", "--boot-timeout", "60"],
         ["smolvm", "sandbox", "stop", "vm1"],
     ]
 
@@ -1228,7 +1228,7 @@ def test_run_positional_name_before_options_does_not_pass_sbx_flags_to_smolvm(
         "--backend",
         "qemu",
         "--boot-timeout",
-        "30",
+        "60",
         "--no-attach",
     ]
 
@@ -1272,7 +1272,7 @@ def test_run_positional_name_creates_missing_vm(
         "--backend",
         "qemu",
         "--boot-timeout",
-        "30",
+        "60",
         "--no-attach",
         "--json",
     ]
@@ -1317,7 +1317,7 @@ def test_run_missing_vm_creates_it(
         "--backend",
         "qemu",
         "--boot-timeout",
-        "30",
+        "60",
         "--no-attach",
         "--json",
     ]
@@ -1348,7 +1348,7 @@ def test_create_is_run_no_attach_alias(
         "--backend",
         "qemu",
         "--boot-timeout",
-        "30",
+        "60",
         "--no-attach",
     ]
 
@@ -1635,7 +1635,7 @@ def test_recreate_deletes_then_starts_vm(
             "--backend",
             "qemu",
             "--boot-timeout",
-            "30",
+            "60",
             "--no-attach",
         ],
     ]
@@ -1674,7 +1674,7 @@ project_path = "{config_project}"
 
     assert rc == 0
     assert capfd.readouterr().out == (
-        "pi start --backend qemu --boot-timeout 30 "
+        "pi start --backend qemu --boot-timeout 60 "
         f"--mount {cli_project}:{cli_project} "
         "--writable-mounts --no-attach\n"
     )
@@ -1711,7 +1711,7 @@ name = "from-config"
 
     assert rc == 0
     assert capfd.readouterr().out == (
-        "claude start --name from-cli --backend qemu --boot-timeout 30 --attach\n"
+        "claude start --name from-cli --backend qemu --boot-timeout 60 --attach\n"
     )
 
 

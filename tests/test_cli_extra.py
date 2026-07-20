@@ -303,8 +303,8 @@ def test_start_local_image_happy_path(
     assert calls == ["sync", "attach"]
     assert fake_smolvm_sdk["started"] is True
     assert fake_smolvm_sdk["waited"] is True
-    assert fake_smolvm_sdk["start_kwargs"] == {"boot_timeout": 30.0}
-    assert fake_smolvm_sdk["wait_kwargs"] == {"timeout": 30.0}
+    assert fake_smolvm_sdk["start_kwargs"] == {"boot_timeout": 60.0}
+    assert fake_smolvm_sdk["wait_kwargs"] == {"timeout": 60.0}
     vm_config = fake_smolvm_sdk["vm_config"]
     assert isinstance(vm_config, dict)
     assert vm_config["vm_id"] == "vm-from-cli"

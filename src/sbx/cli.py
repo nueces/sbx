@@ -2019,7 +2019,7 @@ def _add_start_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--boot-timeout",
         type=float,
-        help="Seconds to wait for VM boot/SSH readiness (default: [sbx].boot_timeout or 30).",
+        help="Seconds to wait for VM boot/SSH readiness (default: [sbx].boot_timeout or 60).",
     )
     parser.add_argument("--install-timeout", type=float)
     write_config = parser.add_mutually_exclusive_group()
