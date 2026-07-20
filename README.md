@@ -27,7 +27,7 @@ This document is the product/behavior contract. It should be usable to reimpleme
 - a package publisher,
 - a CI/release orchestration product.
 
-Project release automation is documented separately in `project-release-infrastructure.md`.
+Project release automation is documented separately in [`specs/project-release-design.md`](specs/project-release-design.md).
 
 ## Core model
 

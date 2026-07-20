@@ -65,6 +65,14 @@ Use:
    UV_PROJECT_ENVIRONMENT=/home/agent/venv/release-action uv run --python 3.12 --extra dev ruff check .
    ```
 
+## Corrective tasks
+
+9. [x] Accept development versions as release PR source values
+   - Update `.github/workflows/release-pr-checks.yml` and `.github/workflows/publish-release.yml`.
+   - Permit deleted package version lines matching `X.Y.Z.devN` as well as `X.Y.Z`.
+   - Continue requiring the resulting package version to be final `X.Y.Z` and to match `release/vX.Y.Z`.
+   - Verify valid `.devN` to final-version diffs pass and malformed versions remain rejected.
+
 ## Done when
 
 - Manual prepare action creates release and webpage PRs.
