@@ -7,7 +7,7 @@ Agents and authentication run in the VM, not on the host. By default `sbx` does 
 ## Install
 
 ```bash
-uv tool install git+https://github.com/nueces/sbx.git@v0.2.0
+uv tool install git+https://github.com/nueces/sbx.git@v0.2.4
 sbx doctor
 ```
 
