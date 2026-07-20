@@ -41,14 +41,14 @@ jobs:
             exit 1
           fi
 
-          bad_init="$(git diff --unified=0 "$BASE_REF...HEAD" -- src/sbx/__init__.py | grep -E '^[+-][^+-]' | grep -Ev '^[+-]__version__ = "[0-9]+\.[0-9]+\.[0-9]+"$' || true)"
+          bad_init="$(git diff --unified=0 "$BASE_REF...HEAD" -- src/sbx/__init__.py | grep -E '^[+-][^+-]' | grep -Ev '^[+-]__version__ = "[0-9]+\.[0-9]+\.[0-9]+(\.dev[0-9]+)?"$' || true)"
           if [ -n "$bad_init" ]; then
             echo "src/sbx/__init__.py may only change __version__" >&2
             echo "$bad_init" >&2
             exit 1
           fi
 
-          bad_pyproject="$(git diff --unified=0 "$BASE_REF...HEAD" -- pyproject.toml | grep -E '^[+-][^+-]' | grep -Ev '^[+-]version = "[0-9]+\.[0-9]+\.[0-9]+"$' || true)"
+          bad_pyproject="$(git diff --unified=0 "$BASE_REF...HEAD" -- pyproject.toml | grep -E '^[+-][^+-]' | grep -Ev '^[+-]version = "[0-9]+\.[0-9]+\.[0-9]+(\.dev[0-9]+)?"$' || true)"
           if [ -n "$bad_pyproject" ]; then
             echo "pyproject.toml may only change version" >&2
             echo "$bad_pyproject" >&2
