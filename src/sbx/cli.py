@@ -29,6 +29,7 @@ from sbx.constants import (
 )
 from sbx.image import build_debian
 from sbx.runtime import ConfigError as RuntimeConfigError
+from sbx.runtime import smolvm_env
 
 AGENTS = ("pi", "claude", "codex")
 MIB = 1024 * 1024
@@ -118,12 +119,14 @@ def _smolvm_argv(args: Sequence[str]) -> list[str]:
 
 
 def _run_smolvm(args: Sequence[str], **kwargs: Any) -> int:
+    kwargs["env"] = smolvm_env(kwargs.get("env"))
     return _run(_smolvm_argv(args), **kwargs)
 
 
 def _run_smolvm_capture(
     args: Sequence[str], **kwargs: Any
 ) -> subprocess.CompletedProcess[str] | None:
+    kwargs["env"] = smolvm_env(kwargs.get("env"))
     return _run_capture(_smolvm_argv(args), **kwargs)
 
 

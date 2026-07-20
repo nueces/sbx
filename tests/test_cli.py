@@ -44,6 +44,43 @@ def test_smolvm_runner_does_not_need_console_script_on_path() -> None:
     ]
 
 
+def test_smolvm_runner_suppresses_upstream_version_notice(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(argv: list[str], **kwargs: object) -> int:
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.delenv("SBX_SMOLVM_VERSION_NOTICES", raising=False)
+    monkeypatch.setattr(cli, "_run", fake_run)
+
+    assert cli._run_smolvm(["doctor"]) == 0
+
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["SMOLVM_DISABLE_VERSION_CHECK"] == "1"
+
+
+def test_smolvm_runner_allows_upstream_version_notice_when_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(argv: list[str], **kwargs: object) -> int:
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setenv("SBX_SMOLVM_VERSION_NOTICES", "true")
+    monkeypatch.delenv("SMOLVM_DISABLE_VERSION_CHECK", raising=False)
+    monkeypatch.setattr(cli, "_run", fake_run)
+
+    assert cli._run_smolvm(["doctor"]) == 0
+
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert "SMOLVM_DISABLE_VERSION_CHECK" not in env
+
+
 def test_doctor_checks_qemu_by_default(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
