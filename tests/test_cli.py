@@ -747,7 +747,11 @@ def test_run_does_not_copy_host_credentials_by_default(
         "30",
         "--no-attach",
     ]
-    assert captured["env"] == {"HOME": str(captured["temp_home"]), "SBX_TEST": "credential-free"}
+    assert captured["env"] == {
+        "HOME": str(captured["temp_home"]),
+        "SBX_TEST": "credential-free",
+        "SMOLVM_DISABLE_VERSION_CHECK": "1",
+    }
 
 
 def test_env_vars_are_not_forwarded_by_default_with_host_credentials(
@@ -933,6 +937,7 @@ def test_reusing_existing_vm_writes_config_only_when_requested(
     smolvm.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setattr(cli, "_smolvm_argv", lambda args: ["smolvm", *args])
+    monkeypatch.setattr(cli, "_sync_guest_clock", lambda vm_id: None)
 
     assert cli.main(["run", "vm1", "--no-attach", "--no-auth-port"]) == 0
     assert not (tmp_path / ".sbx.toml").exists()
@@ -1106,6 +1111,7 @@ def test_run_existing_vm_starts_without_creating(
 
     monkeypatch.setattr(cli, "_run_capture", fake_run_capture)
     monkeypatch.setattr(cli, "_run", fake_run)
+    monkeypatch.setattr(cli, "_sync_guest_clock", lambda vm_id: None)
     monkeypatch.setattr(cli.network, "expose_auth_port", lambda vm_id, host_port, guest_port: 0)
     monkeypatch.setattr(cli, "_attach_as_root", lambda vm_id, launch_command, cwd=None: 0)
 

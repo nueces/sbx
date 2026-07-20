@@ -652,6 +652,25 @@ def test_attach_commands(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "sudo -iu agent" in commands[1][-1]
 
 
+def test_sync_guest_clock_sets_host_time_and_timezone(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[str] = []
+
+    def fake_run_capture(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        captured.extend(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(cli, "_ssh_command", lambda vm_id: ["ssh", vm_id])
+    monkeypatch.setattr(cli, "_host_timezone", lambda: "America/Chicago")
+    monkeypatch.setattr(cli, "_run_capture", fake_run_capture)
+
+    cli._sync_guest_clock("vm1")
+
+    assert captured[:2] == ["ssh", "vm1"]
+    assert "America/Chicago" in captured[2]
+    assert "ln -sf" in captured[2]
+    assert "date -u -s" in captured[2]
+
+
 def test_post_start_actions_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[str, object]] = []
     monkeypatch.setattr(
@@ -664,6 +683,7 @@ def test_post_start_actions_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         cli, "_stop_vm_if_last_session", lambda *args, **kwargs: calls.append(("stop", kwargs))
     )
+    monkeypatch.setattr(cli, "_sync_guest_clock", lambda *args: calls.append(("clock", args)))
     monkeypatch.setattr(cli, "_prepare_run_user", lambda *args: calls.append(("prepare", args)))
     monkeypatch.setattr(cli, "_install_git_config", lambda *args: calls.append(("git", args)))
     monkeypatch.setattr(
@@ -686,7 +706,7 @@ def test_post_start_actions_paths(monkeypatch: pytest.MonkeyPatch) -> None:
         )
         == 0
     )
-    assert calls == [("port", ("vm1", 1, 2))]
+    assert calls == [("clock", ("vm1",)), ("port", ("vm1", 1, 2))]
 
     calls.clear()
     assert (
@@ -704,6 +724,7 @@ def test_post_start_actions_paths(monkeypatch: pytest.MonkeyPatch) -> None:
         == 0
     )
     assert [name for name, _ in calls] == [
+        "clock",
         "register",
         "prepare",
         "git",
@@ -1161,6 +1182,7 @@ def test_read_toml_oserror_and_create_alias(
 
 def test_post_start_actions_auth_port_failure_skips_attach(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
+    monkeypatch.setattr(cli, "_sync_guest_clock", lambda vm_id: calls.append("clock"))
     monkeypatch.setattr(cli.network, "expose_auth_port", lambda *args: calls.append("port") or 9)
     monkeypatch.setattr(cli, "_attach_as_root", lambda *args, **kwargs: calls.append("attach") or 0)
 
@@ -1177,7 +1199,7 @@ def test_post_start_actions_auth_port_failure_skips_attach(monkeypatch: pytest.M
         )
         == 9
     )
-    assert calls == ["port"]
+    assert calls == ["clock", "port"]
 
 
 def test_close_auth_port_escalates_to_sigkill(monkeypatch: pytest.MonkeyPatch) -> None:

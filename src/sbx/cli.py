@@ -13,6 +13,7 @@ import tempfile
 import tomllib
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -802,6 +803,42 @@ chmod 600 {shlex.quote(home)}/.gitconfig
         raise ConfigError(f"failed to install git config: {stderr}")
 
 
+def _host_timezone() -> str:
+    zoneinfo = Path("/usr/share/zoneinfo")
+    try:
+        target = Path("/etc/localtime").resolve()
+        return target.relative_to(zoneinfo).as_posix()
+    except (OSError, ValueError):
+        pass
+    try:
+        timezone = Path("/etc/timezone").read_text(encoding="utf-8").strip()
+    except OSError:
+        return "UTC"
+    return timezone or "UTC"
+
+
+def _sync_guest_clock(vm_id: str) -> None:
+    timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+    timezone = _host_timezone()
+    script = f"""
+set -eu
+zone={shlex.quote(timezone)}
+if [ -f "/usr/share/zoneinfo/$zone" ]; then
+  ln -sf "/usr/share/zoneinfo/$zone" /etc/localtime
+  printf '%s\n' "$zone" > /etc/timezone
+fi
+date -u -s {shlex.quote(timestamp)}
+"""
+    cmd = _ssh_command(vm_id)
+    cmd.append("bash -lc " + shlex.quote(script))
+    completed = _run_capture(cmd)
+    if completed is None:
+        raise ConfigError("failed to sync VM clock: ssh command not found")
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip() or completed.stdout.strip()
+        raise ConfigError(f"failed to sync VM clock: {stderr}")
+
+
 def _prepare_run_user(vm_id: str, user: str) -> None:
     quoted_user = shlex.quote(user)
     home = f"/home/{quoted_user}"
@@ -992,6 +1029,7 @@ def _post_start_actions(
     cwd: str | None = None,
     git_config_text: str | None = None,
 ) -> int:
+    _sync_guest_clock(vm_name)
     if auth_port:
         port_rc = network.expose_auth_port(vm_name, auth_host_port, auth_guest_port)
         if port_rc != 0:
