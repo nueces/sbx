@@ -11,7 +11,7 @@ requires-python = ">=3.12"
 license = "Apache-2.0"
 authors = [{ name = "sbx contributors" }]
 dependencies = [
-  "smolvm==0.0.26",
+  "smolvm==0.0.28",
 ]
 
 [project.optional-dependencies]
