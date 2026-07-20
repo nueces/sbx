@@ -44,6 +44,43 @@ def test_smolvm_runner_does_not_need_console_script_on_path() -> None:
     ]
 
 
+def test_smolvm_runner_suppresses_upstream_version_notice(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(argv: list[str], **kwargs: object) -> int:
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.delenv("SBX_SMOLVM_VERSION_NOTICES", raising=False)
+    monkeypatch.setattr(cli, "_run", fake_run)
+
+    assert cli._run_smolvm(["doctor"]) == 0
+
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["SMOLVM_DISABLE_VERSION_CHECK"] == "1"
+
+
+def test_smolvm_runner_allows_upstream_version_notice_when_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(argv: list[str], **kwargs: object) -> int:
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setenv("SBX_SMOLVM_VERSION_NOTICES", "true")
+    monkeypatch.delenv("SMOLVM_DISABLE_VERSION_CHECK", raising=False)
+    monkeypatch.setattr(cli, "_run", fake_run)
+
+    assert cli._run_smolvm(["doctor"]) == 0
+
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert "SMOLVM_DISABLE_VERSION_CHECK" not in env
+
+
 def test_doctor_checks_qemu_by_default(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -393,7 +430,7 @@ mount = [".:/workspace"]
 
     assert rc == 0
     assert capfd.readouterr().out == (
-        "codex start --name demo --backend qemu --boot-timeout 30 --mount .:/workspace --attach\n"
+        "codex start --name demo --backend qemu --boot-timeout 60 --mount .:/workspace --attach\n"
     )
 
 
@@ -558,7 +595,7 @@ run_user = "agent"
         "--backend",
         "qemu",
         "--boot-timeout",
-        "30",
+        "60",
         "--no-attach",
         "--json",
     ]
@@ -707,10 +744,14 @@ def test_run_does_not_copy_host_credentials_by_default(
         "--backend",
         "qemu",
         "--boot-timeout",
-        "30",
+        "60",
         "--no-attach",
     ]
-    assert captured["env"] == {"HOME": str(captured["temp_home"]), "SBX_TEST": "credential-free"}
+    assert captured["env"] == {
+        "HOME": str(captured["temp_home"]),
+        "SBX_TEST": "credential-free",
+        "SMOLVM_DISABLE_VERSION_CHECK": "1",
+    }
 
 
 def test_env_vars_are_not_forwarded_by_default_with_host_credentials(
@@ -791,7 +832,7 @@ def test_copy_host_credentials_flag_uses_current_environment(
         "--backend",
         "qemu",
         "--boot-timeout",
-        "30",
+        "60",
         "--no-attach",
     ]
     assert captured["env"] is not None
@@ -896,6 +937,7 @@ def test_reusing_existing_vm_writes_config_only_when_requested(
     smolvm.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setattr(cli, "_smolvm_argv", lambda args: ["smolvm", *args])
+    monkeypatch.setattr(cli, "_sync_guest_clock", lambda vm_id: None)
 
     assert cli.main(["run", "vm1", "--no-attach", "--no-auth-port"]) == 0
     assert not (tmp_path / ".sbx.toml").exists()
@@ -981,7 +1023,7 @@ def test_run_with_project_path_attaches_from_mounted_project_cwd(
         "--backend",
         "qemu",
         "--boot-timeout",
-        "30",
+        "60",
         "--mount",
         f"{project}:{project}",
         "--writable-mounts",
@@ -1034,7 +1076,7 @@ def test_run_exposes_auth_port_by_default_before_attach(
         "--backend",
         "qemu",
         "--boot-timeout",
-        "30",
+        "60",
         "--no-attach",
         "--json",
     ]
@@ -1069,6 +1111,7 @@ def test_run_existing_vm_starts_without_creating(
 
     monkeypatch.setattr(cli, "_run_capture", fake_run_capture)
     monkeypatch.setattr(cli, "_run", fake_run)
+    monkeypatch.setattr(cli, "_sync_guest_clock", lambda vm_id: None)
     monkeypatch.setattr(cli.network, "expose_auth_port", lambda vm_id, host_port, guest_port: 0)
     monkeypatch.setattr(cli, "_attach_as_root", lambda vm_id, launch_command, cwd=None: 0)
 
@@ -1077,7 +1120,7 @@ def test_run_existing_vm_starts_without_creating(
     assert rc == 0
     assert calls == [
         ["smolvm", "sandbox", "info", "vm1", "--json"],
-        ["smolvm", "sandbox", "start", "vm1", "--boot-timeout", "30"],
+        ["smolvm", "sandbox", "start", "vm1", "--boot-timeout", "60"],
         ["smolvm", "sandbox", "stop", "vm1"],
     ]
 
@@ -1185,7 +1228,7 @@ def test_run_positional_name_before_options_does_not_pass_sbx_flags_to_smolvm(
         "--backend",
         "qemu",
         "--boot-timeout",
-        "30",
+        "60",
         "--no-attach",
     ]
 
@@ -1229,7 +1272,7 @@ def test_run_positional_name_creates_missing_vm(
         "--backend",
         "qemu",
         "--boot-timeout",
-        "30",
+        "60",
         "--no-attach",
         "--json",
     ]
@@ -1274,7 +1317,7 @@ def test_run_missing_vm_creates_it(
         "--backend",
         "qemu",
         "--boot-timeout",
-        "30",
+        "60",
         "--no-attach",
         "--json",
     ]
@@ -1305,7 +1348,7 @@ def test_create_is_run_no_attach_alias(
         "--backend",
         "qemu",
         "--boot-timeout",
-        "30",
+        "60",
         "--no-attach",
     ]
 
@@ -1592,7 +1635,7 @@ def test_recreate_deletes_then_starts_vm(
             "--backend",
             "qemu",
             "--boot-timeout",
-            "30",
+            "60",
             "--no-attach",
         ],
     ]
@@ -1631,7 +1674,7 @@ project_path = "{config_project}"
 
     assert rc == 0
     assert capfd.readouterr().out == (
-        "pi start --backend qemu --boot-timeout 30 "
+        "pi start --backend qemu --boot-timeout 60 "
         f"--mount {cli_project}:{cli_project} "
         "--writable-mounts --no-attach\n"
     )
@@ -1668,7 +1711,7 @@ name = "from-config"
 
     assert rc == 0
     assert capfd.readouterr().out == (
-        "claude start --name from-cli --backend qemu --boot-timeout 30 --attach\n"
+        "claude start --name from-cli --backend qemu --boot-timeout 60 --attach\n"
     )
 
 

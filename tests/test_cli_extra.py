@@ -303,8 +303,8 @@ def test_start_local_image_happy_path(
     assert calls == ["sync", "attach"]
     assert fake_smolvm_sdk["started"] is True
     assert fake_smolvm_sdk["waited"] is True
-    assert fake_smolvm_sdk["start_kwargs"] == {"boot_timeout": 30.0}
-    assert fake_smolvm_sdk["wait_kwargs"] == {"timeout": 30.0}
+    assert fake_smolvm_sdk["start_kwargs"] == {"boot_timeout": 60.0}
+    assert fake_smolvm_sdk["wait_kwargs"] == {"timeout": 60.0}
     vm_config = fake_smolvm_sdk["vm_config"]
     assert isinstance(vm_config, dict)
     assert vm_config["vm_id"] == "vm-from-cli"
@@ -626,7 +626,7 @@ def test_prepare_run_user_success_and_failure(
     assert "127.0.1.1" in captured["argv"][-1]
     assert ".ssh .pi .codex .claude .claude.json" in captured["argv"][-1]
 
-    monkeypatch.setattr(cli, "_run_capture", lambda argv: None)
+    monkeypatch.setattr(cli, "_run_capture", lambda argv, **kwargs: None)
     with pytest.raises(cli.ConfigError, match="ssh command not found"):
         cli._prepare_run_user("vm1", "agent")
 
@@ -652,6 +652,25 @@ def test_attach_commands(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "sudo -iu agent" in commands[1][-1]
 
 
+def test_sync_guest_clock_sets_host_time_and_timezone(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[str] = []
+
+    def fake_run_capture(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        captured.extend(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(cli, "_ssh_command", lambda vm_id: ["ssh", vm_id])
+    monkeypatch.setattr(cli, "_host_timezone", lambda: "America/Chicago")
+    monkeypatch.setattr(cli, "_run_capture", fake_run_capture)
+
+    cli._sync_guest_clock("vm1")
+
+    assert captured[:2] == ["ssh", "vm1"]
+    assert "America/Chicago" in captured[2]
+    assert "ln -sf" in captured[2]
+    assert "date -u -s" in captured[2]
+
+
 def test_post_start_actions_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[str, object]] = []
     monkeypatch.setattr(
@@ -664,6 +683,7 @@ def test_post_start_actions_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         cli, "_stop_vm_if_last_session", lambda *args, **kwargs: calls.append(("stop", kwargs))
     )
+    monkeypatch.setattr(cli, "_sync_guest_clock", lambda *args: calls.append(("clock", args)))
     monkeypatch.setattr(cli, "_prepare_run_user", lambda *args: calls.append(("prepare", args)))
     monkeypatch.setattr(cli, "_install_git_config", lambda *args: calls.append(("git", args)))
     monkeypatch.setattr(
@@ -686,7 +706,7 @@ def test_post_start_actions_paths(monkeypatch: pytest.MonkeyPatch) -> None:
         )
         == 0
     )
-    assert calls == [("port", ("vm1", 1, 2))]
+    assert calls == [("clock", ("vm1",)), ("port", ("vm1", 1, 2))]
 
     calls.clear()
     assert (
@@ -704,6 +724,7 @@ def test_post_start_actions_paths(monkeypatch: pytest.MonkeyPatch) -> None:
         == 0
     )
     assert [name for name, _ in calls] == [
+        "clock",
         "register",
         "prepare",
         "git",
@@ -810,14 +831,16 @@ def test_foreground_port_forward_uses_one_ssh_for_multiple_ports(
 def test_delete_vm_error_paths(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr(cli, "_run_capture", lambda argv: None)
+    monkeypatch.setattr(cli, "_run_capture", lambda argv, **kwargs: None)
     assert cli._delete_vm("vm1") == 127
 
     not_found = json.dumps({"data": {"failed": [{"error": "VM 'vm1' not found"}]}})
     monkeypatch.setattr(
         cli,
         "_run_capture",
-        lambda argv: subprocess.CompletedProcess(argv, 1, stdout=not_found, stderr="warn\n"),
+        lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 1, stdout=not_found, stderr="warn\n"
+        ),
     )
     assert cli._delete_vm("vm1") == 0
     captured = capsys.readouterr()
@@ -827,7 +850,7 @@ def test_delete_vm_error_paths(
     monkeypatch.setattr(
         cli,
         "_run_capture",
-        lambda argv: subprocess.CompletedProcess(argv, 3, stdout="not-json", stderr=""),
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 3, stdout="not-json", stderr=""),
     )
     assert cli._delete_vm("vm1") == 3
     assert "not-json" in capsys.readouterr().out
@@ -839,7 +862,9 @@ def test_network_status_variants(
     monkeypatch.setattr(
         cli.network,
         "run_smolvm_capture",
-        lambda argv: subprocess.CompletedProcess(argv, 1, stdout="bad out\n", stderr="bad err\n"),
+        lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 1, stdout="bad out\n", stderr="bad err\n"
+        ),
     )
     assert cli.network.cmd_status(type("Args", (), {"name": "vm1", "host_port": 1455})()) == 1
     captured = capsys.readouterr()
@@ -862,7 +887,7 @@ def test_network_status_variants(
     monkeypatch.setattr(
         cli.network,
         "run_smolvm_capture",
-        lambda argv: subprocess.CompletedProcess(argv, 0, stdout=payload, stderr=""),
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout=payload, stderr=""),
     )
     monkeypatch.setattr(
         cli.network,
@@ -1096,7 +1121,7 @@ def test_network_status_inactive(
     monkeypatch.setattr(
         cli.network,
         "run_smolvm_capture",
-        lambda argv: subprocess.CompletedProcess(argv, 0, stdout=payload, stderr=""),
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout=payload, stderr=""),
     )
     monkeypatch.setattr(cli.network, "_tracked_auth_tunnel", lambda name: None)
     monkeypatch.setattr(cli.network, "_localhost_port_is_listening", lambda port: False)
@@ -1161,6 +1186,7 @@ def test_read_toml_oserror_and_create_alias(
 
 def test_post_start_actions_auth_port_failure_skips_attach(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
+    monkeypatch.setattr(cli, "_sync_guest_clock", lambda vm_id: calls.append("clock"))
     monkeypatch.setattr(cli.network, "expose_auth_port", lambda *args: calls.append("port") or 9)
     monkeypatch.setattr(cli, "_attach_as_root", lambda *args, **kwargs: calls.append("attach") or 0)
 
@@ -1177,7 +1203,7 @@ def test_post_start_actions_auth_port_failure_skips_attach(monkeypatch: pytest.M
         )
         == 9
     )
-    assert calls == ["port"]
+    assert calls == ["clock", "port"]
 
 
 def test_close_auth_port_escalates_to_sigkill(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1211,7 +1237,9 @@ def test_delete_vm_success_path(
     monkeypatch.setattr(
         cli,
         "_run_capture",
-        lambda argv: subprocess.CompletedProcess(argv, 0, stdout='{"data": {}}', stderr=""),
+        lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 0, stdout='{"data": {}}', stderr=""
+        ),
     )
 
     assert cli._delete_vm("vm1") == 0
@@ -1399,7 +1427,7 @@ def test_local_image_qcow2_disk_size_does_not_request_filesystem_growth(
 
 
 def test_network_status_run_capture_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(cli.network, "run_smolvm_capture", lambda argv: None)
+    monkeypatch.setattr(cli.network, "run_smolvm_capture", lambda argv, **kwargs: None)
 
     assert cli.network.cmd_status(type("Args", (), {"name": "vm1", "host_port": 1455})()) == 127
 
@@ -1518,7 +1546,7 @@ def test_start_existing_vm_timeout_hint_when_vm_is_running(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setattr(cli, "_run", lambda argv: 1)
+    monkeypatch.setattr(cli, "_run", lambda argv, **kwargs: 1)
     monkeypatch.setattr(cli, "_get_existing_vm_status", lambda vm_id: "running")
 
     assert cli._start_existing_vm_if_needed("vm1", "stopped", 60) == 1

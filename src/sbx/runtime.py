@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 
 DEBUG = False
+SMOLVM_DISABLE_VERSION_CHECK_ENV = "SMOLVM_DISABLE_VERSION_CHECK"
+SBX_SMOLVM_VERSION_NOTICES_ENV = "SBX_SMOLVM_VERSION_NOTICES"
 
 
 class ConfigError(ValueError):
@@ -92,13 +94,26 @@ def smolvm_argv(args: Sequence[str]) -> list[str]:
     ]
 
 
+def env_boolean(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def smolvm_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
+    result = dict(os.environ if env is None else env)
+    if not env_boolean(result.get(SBX_SMOLVM_VERSION_NOTICES_ENV)):
+        result[SMOLVM_DISABLE_VERSION_CHECK_ENV] = "1"
+    return result
+
+
 def run_smolvm(args: Sequence[str], **kwargs: Any) -> int:
+    kwargs["env"] = smolvm_env(kwargs.get("env"))
     return run(smolvm_argv(args), **kwargs)
 
 
 def run_smolvm_capture(
     args: Sequence[str], **kwargs: Any
 ) -> subprocess.CompletedProcess[str] | None:
+    kwargs["env"] = smolvm_env(kwargs.get("env"))
     return run_capture(smolvm_argv(args), **kwargs)
 
 

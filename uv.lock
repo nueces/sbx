@@ -839,13 +839,13 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.1.1" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=7.1.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.15.21" },
-    { name = "smolvm", specifier = "==0.0.26" },
+    { name = "smolvm", specifier = "==0.0.28" },
 ]
 provides-extras = ["dev"]
 
 [[package]]
 name = "smolvm"
-version = "0.0.26"
+version = "0.0.28"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
@@ -857,9 +857,9 @@ dependencies = [
     { name = "smolvm-core" },
     { name = "zstandard" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/99/ec/f1490b80821c3fee9a95bba4edbff068008ea407687fbd3b80f47b1270dd/smolvm-0.0.26.tar.gz", hash = "sha256:07a3e9b41d8935c5e9b2967057dcb53fc21e2adb78ad9ce11c1c949dbe29300d", size = 748170, upload-time = "2026-07-09T09:06:24.023Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/0b/06/9ba5693ce90463b60ba471467500304240a2cb6664b47083ff7fb1889dfa/smolvm-0.0.28.tar.gz", hash = "sha256:e17311a11eb9ddcbb9588053f7f92c7646b6bd31dbe079cbbd75a5f7041f9a9a", size = 792713, upload-time = "2026-07-20T14:41:20.931Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/92/27/57965b42a93dd3b3da6e059c670788d1f04a15e57b11509df595479fdacb/smolvm-0.0.26-py3-none-any.whl", hash = "sha256:80bd27fd19611532569f361c73c46bb0cde61ee7482629ec175bd90b49a7e6f4", size = 377072, upload-time = "2026-07-09T09:06:22.479Z" },
+    { url = "https://files.pythonhosted.org/packages/bc/6f/692f9f989c75445a0cfa9055122f9d6162f1e5695881d5d4e87525beb4bf/smolvm-0.0.28-py3-none-any.whl", hash = "sha256:28ecf7b2dae73558005745a91115bb2ca890e6c0cb6057a9d9d271c00db4655a", size = 431270, upload-time = "2026-07-20T14:41:19.631Z" },
 ]
 
 [[package]]
