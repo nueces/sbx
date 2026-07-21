@@ -1,29 +1,35 @@
-# `--force-start` design
+# Remove `--force-start` design
 
 ## Goal
 
-Allow a user to retry starting an existing VM whose SmolVM status is `error` without deleting/recreating the VM.
+Use `sbx doctor --fix` as the only safe repair path for existing VMs whose SmolVM status is `error`.
 
-## Scope
+## Previous behavior
 
-In scope:
+`sbx run VM --force-start` and `sbx shell VM --force-start` reset the SmolVM DB row from `error` to `stopped`, cleared stale pid/socket fields when present, then started the VM.
 
-- Add `--force-start` to `sbx run` and `sbx shell`.
-- Keep default behavior safe: `error` VMs still refuse to start unless the flag is passed.
-- Retry the normal SmolVM start path after clearing stale error state.
+## Desired behavior
 
-Out of scope:
+- Remove `--force-start` from `sbx run` and `sbx shell`.
+- `sbx run VM` / `sbx shell VM` with status `error` must refuse to start and print the doctor flow.
+- `sbx doctor --fix` repairs safe local bookkeeping, including marking SmolVM `error` VMs as stopped.
+- The user then reruns `sbx run VM` or `sbx shell VM` normally.
 
-- Repairing corrupted disks/configs.
-- Recreating VMs.
-- Adding a persistent config option.
+Error message shape:
 
-## Behavior
+```text
+sbx: VM 'dt' is in error state.
+sbx: Run `sbx doctor --fix` to repair local VM bookkeeping, then retry `sbx run dt`.
+sbx: If it still fails, run `sbx recreate dt --force`.
+```
 
-- `sbx run VM` / `sbx shell VM` with status `error` returns a clear error.
-- `sbx run VM --force-start` / `sbx shell VM --force-start` resets the SmolVM DB row from `error` to `stopped`, clears stale pid/socket fields when present, then calls `smolvm sandbox start VM` normally.
-- If the VM fails again, SmolVM will put it back into `error`; surface the normal start failure.
+## Why remove it
 
-## Why DB reset
+`--force-start` combines repair and start in one command. `doctor --fix` is clearer: repair state first, then start normally. No compatibility window is needed.
 
-SmolVM currently refuses to start a VM in `error` state. The smallest compatible retry path is to mark the existing VM as stopped before invoking SmolVM's normal start command.
+## Non-goals
+
+- No deprecated alias for `--force-start`.
+- No automatic repair during `run` or `shell`.
+- No guest disk repair.
+- No VM deletion/recreation.
