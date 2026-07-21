@@ -819,7 +819,7 @@ wheels = [
 
 [[package]]
 name = "sbx"
-version = "0.2.4"
+version = "0.2.5.dev0"
 source = { editable = "." }
 dependencies = [
     { name = "smolvm" },
