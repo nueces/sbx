@@ -4,9 +4,11 @@ COMMANDS = (
     "run",
     "create",
     "recreate",
+    "remove",
     "rm",
     "stop",
     "shell",
+    "list",
     "ls",
     "network",
     "image",
@@ -51,7 +53,6 @@ START_OPTIONS = (
     "--help",
 )
 SHELL_OPTIONS = (
-    "--force-start",
     "--keep-running",
     "--run-user",
     "--project-path",
@@ -62,8 +63,9 @@ SHELL_OPTIONS = (
 )
 LS_OPTIONS = ("--all", "-a", "--help")
 RM_OPTIONS = ("--force", "--help")
+DOCTOR_OPTIONS = ("--fix", "--help")
 STOP_OPTIONS = ("--help",)
-RUN_OPTIONS = ("--force-start", *START_OPTIONS)
+RUN_OPTIONS = START_OPTIONS
 AUTH_PORT_OPTIONS = ("--guest-port", "--host-port", "--replace", "--help")
 NETWORK_STATUS_OPTIONS = ("--host-port", "--help")
 IMAGE_BUILD_DEBIAN_OPTIONS = (
@@ -114,6 +116,7 @@ def bash_completion() -> str:
     shell_options = _words(SHELL_OPTIONS)
     ls_options = _words(LS_OPTIONS)
     rm_options = _words(RM_OPTIONS)
+    doctor_options = _words(DOCTOR_OPTIONS)
     stop_options = _words(STOP_OPTIONS)
     network_commands = _words(NETWORK_COMMANDS)
     image_commands = _words(IMAGE_COMMANDS)
@@ -175,10 +178,10 @@ _sbx_complete() {{
         shell)
             COMPREPLY=( $(compgen -W "{shell_options}" -- "$cur") )
             ;;
-        ls)
+        list|ls)
             COMPREPLY=( $(compgen -W "{ls_options}" -- "$cur") )
             ;;
-        rm)
+        remove|rm)
             COMPREPLY=( $(compgen -W "{rm_options}" -- "$cur") )
             ;;
         stop)
@@ -220,6 +223,9 @@ _sbx_complete() {{
                 COMPREPLY=( $(compgen -W "{image_ls_options}" -- "$cur") )
             fi
             ;;
+        doctor)
+            COMPREPLY=( $(compgen -W "{doctor_options}" -- "$cur") )
+            ;;
         completion)
             COMPREPLY=( $(compgen -W "{shells}" -- "$cur") )
             ;;
@@ -237,6 +243,7 @@ def zsh_completion() -> str:
     shell_options = _zsh_words(SHELL_OPTIONS)
     ls_options = _zsh_words(LS_OPTIONS)
     rm_options = _zsh_words(RM_OPTIONS)
+    doctor_options = _zsh_words(DOCTOR_OPTIONS)
     stop_options = _zsh_words(STOP_OPTIONS)
     network_commands = _zsh_words(NETWORK_COMMANDS)
     auth_port_options = _zsh_words(AUTH_PORT_OPTIONS)
@@ -249,7 +256,7 @@ def zsh_completion() -> str:
 # zsh completion for sbx
 _sbx() {{
   local -a commands run_options create_options recreate_options shell_options
-  local -a ls_options rm_options stop_options network_commands
+  local -a ls_options rm_options doctor_options stop_options network_commands
   local -a auth_port_options network_status_options
   local -a image_commands image_build_debian_options image_ls_options shells
   commands=({commands})
@@ -259,6 +266,7 @@ _sbx() {{
   shell_options=({shell_options})
   ls_options=({ls_options})
   rm_options=({rm_options})
+  doctor_options=({doctor_options})
   stop_options=({stop_options})
   network_commands=({network_commands})
   auth_port_options=({auth_port_options})
@@ -286,10 +294,10 @@ _sbx() {{
         shell)
           _describe 'option' shell_options
           ;;
-        ls)
+        list|ls)
           _describe 'option' ls_options
           ;;
-        rm)
+        remove|rm)
           _describe 'option' rm_options
           ;;
         stop)
@@ -320,6 +328,9 @@ _sbx() {{
           else
             _arguments '*: :->args'
           fi
+          ;;
+        doctor)
+          _describe 'option' doctor_options
           ;;
         completion)
           _describe 'shell' shells
@@ -354,6 +365,13 @@ def fish_completion() -> str:
         ("run", RUN_OPTIONS),
         ("create", START_OPTIONS),
         ("recreate", ("--force", *START_OPTIONS)),
+        ("shell", SHELL_OPTIONS),
+        ("list", LS_OPTIONS),
+        ("ls", LS_OPTIONS),
+        ("remove", RM_OPTIONS),
+        ("rm", RM_OPTIONS),
+        ("doctor", DOCTOR_OPTIONS),
+        ("stop", STOP_OPTIONS),
     ):
         for option in options:
             lines.append(
@@ -364,20 +382,6 @@ def fish_completion() -> str:
         lines.append(
             "complete -c sbx -f -n '__fish_seen_argument -l agent' "
             f"-a {agent}"
-        )
-    for option in SHELL_OPTIONS:
-        lines.append(
-            f"complete -c sbx -f -n '__fish_seen_subcommand_from shell' {_fish_flag(option)}"
-        )
-    for option in LS_OPTIONS:
-        lines.append(
-            f"complete -c sbx -f -n '__fish_seen_subcommand_from ls' {_fish_flag(option)}"
-        )
-    for option in RM_OPTIONS:
-        lines.append(f"complete -c sbx -f -n '__fish_seen_subcommand_from rm' {_fish_flag(option)}")
-    for option in STOP_OPTIONS:
-        lines.append(
-            f"complete -c sbx -f -n '__fish_seen_subcommand_from stop' {_fish_flag(option)}"
         )
     network_subcommands = _words(NETWORK_COMMANDS)
     for command in NETWORK_COMMANDS:

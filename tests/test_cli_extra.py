@@ -10,7 +10,7 @@ import smolvm
 import smolvm.facade
 import smolvm.utils
 
-from sbx import cli
+from sbx import cli, guest_customization, lifecycle_warnings, session_state, vm_metadata, vm_state
 
 
 @pytest.fixture(autouse=True)
@@ -18,12 +18,15 @@ def isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(cli, "DEBUG", False)
     monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATHS", (tmp_path / "home-config.toml",))
     monkeypatch.setattr(cli, "LOCAL_CONFIG_PATHS", (tmp_path / ".sbx.toml",))
-    monkeypatch.setattr(cli, "SBX_STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(vm_metadata, "SBX_STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(vm_metadata, "SBX_VMS_FILE", tmp_path / "state" / "vms.json")
+    monkeypatch.setattr(session_state, "SBX_STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(session_state, "SESSIONS_FILE", tmp_path / "state" / "sessions.json")
     monkeypatch.setattr(cli.network, "SBX_STATE_DIR", tmp_path / "state")
     monkeypatch.setattr(cli.network, "TUNNELS_FILE", tmp_path / "state" / "tunnels.json")
-    monkeypatch.setattr(cli, "SESSIONS_FILE", tmp_path / "state" / "sessions.json")
     monkeypatch.setattr(cli, "SMOLVM_DB_PATH", tmp_path / "smolvm.db")
-    monkeypatch.setattr(cli, "_set_vm_hostname", lambda name: None)
+    monkeypatch.setattr(vm_state, "SMOLVM_DB_PATH", tmp_path / "smolvm.db")
+    monkeypatch.setattr(guest_customization, "set_hostname", lambda *args, **kwargs: None)
 
 
 @pytest.fixture
@@ -107,6 +110,105 @@ def _read_vm_config(db_path: Path, vm_id: str) -> dict[str, object]:
     return config
 
 
+def test_vm_metadata_load_save_and_project_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    config = project / ".sbx.toml"
+    config.write_text('[sbx]\nproject_path = "."\n', encoding="utf-8")
+    monkeypatch.setattr(cli, "LOCAL_CONFIG_PATHS", (config,))
+    monkeypatch.chdir(project)
+
+    args = SimpleNamespace(config=None)
+    identity = cli._project_identity(args, {"sbx": {"project_path": "."}})
+    vm_metadata.record_vm_project("vm1", identity)
+
+    assert vm_metadata.load_vm_metadata() == {"vm1": identity}
+    assert identity["project_root"] == str(project.resolve())
+    assert identity["config_path"] == str(config.resolve())
+
+
+def test_vm_metadata_corrupt_json_raises() -> None:
+    vm_metadata.SBX_VMS_FILE.parent.mkdir(parents=True)
+    vm_metadata.SBX_VMS_FILE.write_text("not json", encoding="utf-8")
+
+    with pytest.raises(cli.ConfigError, match="invalid sbx VM metadata"):
+        vm_metadata.load_vm_metadata()
+
+
+def test_sync_existing_vm_mounts_rejects_wrong_project(tmp_path: Path) -> None:
+    old = tmp_path / "old"
+    new = tmp_path / "new"
+    old.mkdir()
+    new.mkdir()
+    _write_vm_row(cli.SMOLVM_DB_PATH, "vm1", status="stopped", config={"workspace_mounts": []})
+    vm_metadata.record_vm_project(
+        "vm1", {"project_root": str(old), "config_path": str(old / ".sbx.toml")}
+    )
+
+    with pytest.raises(cli.ConfigError, match="belongs to"):
+        cli._sync_existing_vm_start_config(
+            "vm1",
+            [f"{new}:/workspace"],
+            writable_mounts=True,
+            port_forwards=[],
+            project={"project_root": str(new), "config_path": str(new / ".sbx.toml")},
+        )
+
+    assert _read_vm_config(cli.SMOLVM_DB_PATH, "vm1") == {"workspace_mounts": []}
+
+
+def test_warn_running_mount_drift_does_not_rewrite(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    host = tmp_path / "project"
+    host.mkdir()
+    config = {"workspace_mounts": [{"host_path": "/old", "guest_path": "/old"}]}
+    _write_vm_row(cli.SMOLVM_DB_PATH, "vm1", status="running", config=config)
+
+    cli._warn_running_mount_drift("vm1", [f"{host}:/workspace"], writable_mounts=True)
+
+    assert "mounts that differ" in capsys.readouterr().err
+    assert _read_vm_config(cli.SMOLVM_DB_PATH, "vm1") == config
+
+
+def test_host_git_config_uses_repo_local_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if argv[:3] == ["git", "-C", str(tmp_path)] and argv[-1] == "user.email":
+            return subprocess.CompletedProcess(argv, 0, stdout="repo@example.com\n", stderr="")
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+
+    monkeypatch.setattr(guest_customization.subprocess, "run", fake_run)
+
+    assert guest_customization.host_git_config(tmp_path) == '[user]\n\temail = "repo@example.com"\n'
+    assert ["git", "-C", str(tmp_path), "config", "--get", "user.email"] in calls
+
+
+def test_doctor_fix_repairs_local_bookkeeping(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    missing = tmp_path / "missing"
+    vm_metadata.record_vm_project(
+        "vm1", {"project_root": str(missing), "config_path": str(missing / ".sbx.toml")}
+    )
+    session_state.save_sessions({"vm1": {"sessions": [{"pid": -1, "kind": "run"}]}})
+    cli.network._save_tunnels({"vm1": {"auth_port": {"pid": -1, "host_port": 1}}})
+    monkeypatch.setattr(vm_state, "smolvm_vms", lambda all_vms=True: [])
+    monkeypatch.setattr(cli, "_run_smolvm", lambda argv: 0)
+
+    assert cli.main(["doctor", "--fix"]) == 0
+
+    assert vm_metadata.load_vm_metadata() == {}
+    assert session_state.load_sessions() == {}
+    assert cli.network._load_tunnels() == {}
+
+
 def test_sync_existing_vm_mounts_updates_stale_stopped_vm(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -119,9 +221,7 @@ def test_sync_existing_vm_mounts_updates_stale_stopped_vm(
         config={"workspace_mounts": [{"host_path": "/old", "guest_path": "/old"}]},
     )
 
-    cli._sync_existing_vm_mounts_from_config(
-        "vm1", [f"{host}:/workspace"], writable_mounts=True
-    )
+    cli._sync_existing_vm_mounts_from_config("vm1", [f"{host}:/workspace"], writable_mounts=True)
 
     assert _read_vm_config(cli.SMOLVM_DB_PATH, "vm1")["workspace_mounts"] == [
         {"host_path": str(host), "guest_path": "/workspace", "mount_tag": None, "writable": True}
@@ -147,9 +247,7 @@ def test_sync_existing_vm_mounts_skips_matching_config(
     }
     _write_vm_row(cli.SMOLVM_DB_PATH, "vm1", status="stopped", config=config)
 
-    cli._sync_existing_vm_mounts_from_config(
-        "vm1", [f"{host}:/workspace"], writable_mounts=False
-    )
+    cli._sync_existing_vm_mounts_from_config("vm1", [f"{host}:/workspace"], writable_mounts=False)
 
     assert _read_vm_config(cli.SMOLVM_DB_PATH, "vm1") == config
     assert capsys.readouterr().out == ""
@@ -166,8 +264,10 @@ def test_cmd_start_syncs_env_before_existing_vm_attach(
     monkeypatch.setattr(
         cli, "_start_existing_vm_if_needed", lambda *args, **kwargs: calls.append("start") or 0
     )
-    monkeypatch.setattr(cli, "_host_git_config", lambda: None)
-    monkeypatch.setattr(cli, "_sync_forwarded_env", lambda *args: calls.append("sync"))
+    monkeypatch.setattr(guest_customization, "host_git_config", lambda project_root=None: None)
+    monkeypatch.setattr(
+        guest_customization, "sync_forwarded_env", lambda *args, **kwargs: calls.append("sync")
+    )
     monkeypatch.setattr(cli, "_post_start_actions", lambda **kwargs: calls.append("attach") or 0)
 
     assert cli.main(["--config", str(config), "run"]) == 0
@@ -197,7 +297,7 @@ def test_cmd_start_does_not_sync_running_vm_mounts(
     calls: list[str] = []
 
     monkeypatch.setattr(cli, "_get_existing_vm_status", lambda vm_id: "running")
-    monkeypatch.setattr(cli, "_host_git_config", lambda: None)
+    monkeypatch.setattr(guest_customization, "host_git_config", lambda project_root=None: None)
     monkeypatch.setattr(
         cli,
         "_sync_existing_vm_mounts_from_config",
@@ -271,7 +371,9 @@ def test_start_local_image_happy_path(
 ) -> None:
     captured: dict[str, object] = {}
     calls: list[str] = []
-    monkeypatch.setattr(cli, "_sync_forwarded_env", lambda *args: calls.append("sync"))
+    monkeypatch.setattr(
+        guest_customization, "sync_forwarded_env", lambda *args, **kwargs: calls.append("sync")
+    )
     monkeypatch.setattr(
         cli,
         "_post_start_actions",
@@ -283,7 +385,7 @@ def test_start_local_image_happy_path(
         args=args,
         config={"sbx": {}},
         image_dir=local_image_dir,
-        manifest=cli._local_image_manifest(local_image_dir),
+        manifest=lifecycle_warnings.local_image_manifest(local_image_dir),
         agent="pi",
         mounts=[".:/workspace"],
         writable_mounts=True,
@@ -347,7 +449,7 @@ def test_simple_helper_error_branches(tmp_path: Path, capsys: pytest.CaptureFixt
     with pytest.raises(cli.ConfigError, match="run_user"):
         cli._validate_run_user("bad user")
     with pytest.raises(cli.ConfigError, match="invalid env var"):
-        cli._validate_env_names(["1BAD"])
+        guest_customization.validate_env_names(["1BAD"])
     cli._print_start_failure('{"error":{"message":"QEMU exited early"}}')
     assert "Try `sbx recreate" in capsys.readouterr().err
 
@@ -366,16 +468,16 @@ def test_ssh_command_and_pid_alive(monkeypatch: pytest.MonkeyPatch) -> None:
             return FakeVm()
 
     monkeypatch.setattr(smolvm.facade, "SmolVM", FakeSmolVM)
-    assert cli._ssh_command("vm1") == ["ssh", "root@host"]
+    assert guest_customization.ssh_command("vm1") == ["ssh", "root@host"]
 
-    monkeypatch.setattr(cli.os, "kill", lambda pid, sig: None)
-    assert cli._pid_is_alive(123) is True
+    monkeypatch.setattr(session_state.os, "kill", lambda pid, sig: None)
+    assert session_state.pid_is_alive(123) is True
 
     def missing_process(pid: int, sig: int) -> None:
         raise ProcessLookupError
 
-    monkeypatch.setattr(cli.os, "kill", missing_process)
-    assert cli._pid_is_alive(123) is False
+    monkeypatch.setattr(session_state.os, "kill", missing_process)
+    assert session_state.pid_is_alive(123) is False
 
 
 def test_ssh_command_missing_vm_raises_config_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -389,7 +491,7 @@ def test_ssh_command_missing_vm_raises_config_error(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(smolvm.facade, "SmolVM", MissingSmolVM)
 
     with pytest.raises(cli.ConfigError, match="VM 'reviewhero' not found"):
-        cli._ssh_command("reviewhero")
+        guest_customization.ssh_command("reviewhero")
 
 
 def test_shell_prechecks_missing_managed_vm_before_registering_session(
@@ -404,7 +506,7 @@ def test_shell_prechecks_missing_managed_vm_before_registering_session(
     def fail_register(vm_id: str, kind: str) -> None:
         raise AssertionError("session should not be registered for a missing VM")
 
-    monkeypatch.setattr(cli, "_register_session", fail_register)
+    monkeypatch.setattr(session_state, "register_session", fail_register)
 
     rc = cli.main(["--config", str(config), "shell"])
 
@@ -424,7 +526,7 @@ def test_shell_reports_missing_vm_from_smolvm_without_traceback(
     config = tmp_path / "config.toml"
     config.write_text('[sbx]\nname = "reviewhero"\nrun_user = "agent"\n', encoding="utf-8")
     monkeypatch.setattr(cli, "_get_existing_vm_status", lambda vm_id: "running")
-    monkeypatch.setattr(cli, "_host_git_config", lambda: None)
+    monkeypatch.setattr(guest_customization, "host_git_config", lambda project_root=None: None)
     monkeypatch.setattr(cli, "_stop_vm_if_last_session", lambda vm_id, *, stop_on_exit: None)
 
     class MissingSmolVM:
@@ -469,7 +571,7 @@ def test_start_local_image_closes_on_start_failure(
             args=args,
             config={"sbx": {}},
             image_dir=local_image_dir,
-            manifest=cli._local_image_manifest(local_image_dir),
+            manifest=lifecycle_warnings.local_image_manifest(local_image_dir),
             agent="pi",
             mounts=[],
             writable_mounts=False,
@@ -554,28 +656,28 @@ def test_start_local_image_validation_errors(
 
 def test_local_image_manifest_errors(tmp_path: Path) -> None:
     with pytest.raises(cli.ConfigError, match="must point to a local image directory"):
-        cli._local_image_manifest(tmp_path / "missing")
+        lifecycle_warnings.local_image_manifest(tmp_path / "missing")
 
     image = tmp_path / "image"
     image.mkdir()
     with pytest.raises(cli.ConfigError, match="manifest not found"):
-        cli._local_image_manifest(image)
+        lifecycle_warnings.local_image_manifest(image)
 
     (image / "smolvm-image.json").write_text("not-json", encoding="utf-8")
     with pytest.raises(cli.ConfigError, match="invalid image manifest JSON"):
-        cli._local_image_manifest(image)
+        lifecycle_warnings.local_image_manifest(image)
 
     (image / "smolvm-image.json").write_text("[]", encoding="utf-8")
     with pytest.raises(cli.ConfigError, match="must be a JSON object"):
-        cli._local_image_manifest(image)
+        lifecycle_warnings.local_image_manifest(image)
 
 
 def test_git_config_missing_git_and_escaping(monkeypatch: pytest.MonkeyPatch) -> None:
     def missing_git(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
         raise FileNotFoundError
 
-    monkeypatch.setattr(cli.subprocess, "run", missing_git)
-    assert cli._host_git_config() is None
+    monkeypatch.setattr(guest_customization.subprocess, "run", missing_git)
+    assert guest_customization.host_git_config() is None
 
     values = {"user.name": 'Ada "Back\\slash"', "user.email": "multi\nline"}
 
@@ -585,15 +687,15 @@ def test_git_config_missing_git_and_escaping(monkeypatch: pytest.MonkeyPatch) ->
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
         return subprocess.CompletedProcess(argv, 0, stdout=value + "\n", stderr="")
 
-    monkeypatch.setattr(cli.subprocess, "run", fake_git)
-    assert cli._host_git_config() == '[user]\n\tname = "Ada \\"Back\\\\slash\\""\n'
+    monkeypatch.setattr(guest_customization.subprocess, "run", fake_git)
+    assert guest_customization.host_git_config() == '[user]\n\tname = "Ada \\"Back\\\\slash\\""\n'
 
 
 def test_install_git_config_for_root_and_user(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     commands: list[list[str]] = []
-    monkeypatch.setattr(cli, "_ssh_command", lambda vm_id: ["ssh", "root@host"])
+    monkeypatch.setattr(guest_customization, "ssh_command", lambda vm_id: ["ssh", "root@host"])
 
     def fake_run_capture(argv: list[str], *, env: dict[str, str] | None = None):
         commands.append(argv)
@@ -601,9 +703,9 @@ def test_install_git_config_for_root_and_user(
 
     monkeypatch.setattr(cli, "_run_capture", fake_run_capture)
 
-    cli._install_git_config("vm1", None, "[user]\n")
-    cli._install_git_config("vm1", "agent", "[user]\n")
-    cli._install_git_config("vm1", "agent", None)
+    guest_customization.install_git_config("vm1", None, "[user]\n", run_capture=fake_run_capture)
+    guest_customization.install_git_config("vm1", "agent", "[user]\n", run_capture=fake_run_capture)
+    guest_customization.install_git_config("vm1", "agent", None, run_capture=fake_run_capture)
 
     assert "/root/.gitconfig" in commands[0][-1]
     assert "/home/agent/.gitconfig" in commands[1][-1]
@@ -613,7 +715,7 @@ def test_install_git_config_for_root_and_user(
 def test_prepare_run_user_success_and_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(cli, "_ssh_command", lambda vm_id: ["ssh", "root@host"])
+    monkeypatch.setattr(guest_customization, "ssh_command", lambda vm_id: ["ssh", "root@host"])
     captured: dict[str, object] = {}
 
     def fake_ok(argv: list[str], *, env: dict[str, str] | None = None):
@@ -621,30 +723,35 @@ def test_prepare_run_user_success_and_failure(
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
     monkeypatch.setattr(cli, "_run_capture", fake_ok)
-    cli._prepare_run_user("vm1", "agent")
+    guest_customization.prepare_run_user("vm1", "agent", run_capture=fake_ok)
     assert "getent hosts" in captured["argv"][-1]
     assert "127.0.1.1" in captured["argv"][-1]
     assert ".ssh .pi .codex .claude .claude.json" in captured["argv"][-1]
 
     monkeypatch.setattr(cli, "_run_capture", lambda argv, **kwargs: None)
     with pytest.raises(cli.ConfigError, match="ssh command not found"):
-        cli._prepare_run_user("vm1", "agent")
+        guest_customization.prepare_run_user("vm1", "agent", run_capture=lambda argv: None)
 
     def fake_fail(argv: list[str], *, env: dict[str, str] | None = None):
         return subprocess.CompletedProcess(argv, 1, stdout="", stderr="bad")
 
     monkeypatch.setattr(cli, "_run_capture", fake_fail)
     with pytest.raises(cli.ConfigError, match="bad"):
-        cli._prepare_run_user("vm1", "agent")
+        guest_customization.prepare_run_user("vm1", "agent", run_capture=fake_fail)
 
 
 def test_attach_commands(monkeypatch: pytest.MonkeyPatch) -> None:
     commands: list[list[str]] = []
-    monkeypatch.setattr(cli, "_ssh_command", lambda vm_id: ["ssh", "root@host"])
-    monkeypatch.setattr(cli, "_run", lambda argv: commands.append(list(argv)) or 0)
+    monkeypatch.setattr(guest_customization, "ssh_command", lambda vm_id: ["ssh", "root@host"])
 
-    assert cli._attach_as_root("vm1", "pi", cwd="/workspace") == 0
-    assert cli._attach_as_user("vm1", "agent", "pi", cwd="/workspace") == 0
+    def run(argv: list[str]) -> int:
+        commands.append(list(argv))
+        return 0
+
+    monkeypatch.setattr(cli, "_run", run)
+
+    assert guest_customization.attach_as_root("vm1", "pi", cwd="/workspace", run=run) == 0
+    assert guest_customization.attach_as_user("vm1", "agent", "pi", cwd="/workspace", run=run) == 0
 
     assert "-t" in commands[0]
     assert "cd /workspace" in commands[0][-1]
@@ -659,7 +766,7 @@ def test_sync_guest_clock_sets_host_time_and_timezone(monkeypatch: pytest.Monkey
         captured.extend(argv)
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(cli, "_ssh_command", lambda vm_id: ["ssh", vm_id])
+    monkeypatch.setattr(guest_customization, "ssh_command", lambda vm_id: ["ssh", vm_id])
     monkeypatch.setattr(cli, "_host_timezone", lambda: "America/Chicago")
     monkeypatch.setattr(cli, "_run_capture", fake_run_capture)
 
@@ -676,21 +783,35 @@ def test_post_start_actions_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         cli.network, "expose_auth_port", lambda *args: calls.append(("port", args)) or 0
     )
-    monkeypatch.setattr(cli, "_register_session", lambda *args: calls.append(("register", args)))
     monkeypatch.setattr(
-        cli, "_unregister_session", lambda *args: calls.append(("unregister", args))
+        session_state, "register_session", lambda *args: calls.append(("register", args))
+    )
+    monkeypatch.setattr(
+        session_state, "unregister_session", lambda *args: calls.append(("unregister", args)) or 0
     )
     monkeypatch.setattr(
         cli, "_stop_vm_if_last_session", lambda *args, **kwargs: calls.append(("stop", kwargs))
     )
     monkeypatch.setattr(cli, "_sync_guest_clock", lambda *args: calls.append(("clock", args)))
-    monkeypatch.setattr(cli, "_prepare_run_user", lambda *args: calls.append(("prepare", args)))
-    monkeypatch.setattr(cli, "_install_git_config", lambda *args: calls.append(("git", args)))
     monkeypatch.setattr(
-        cli, "_attach_as_user", lambda *args, **kwargs: calls.append(("user", args)) or 0
+        guest_customization,
+        "prepare_run_user",
+        lambda *args, **kwargs: calls.append(("prepare", args)),
     )
     monkeypatch.setattr(
-        cli, "_attach_as_root", lambda *args, **kwargs: calls.append(("root", args)) or 0
+        guest_customization,
+        "install_git_config",
+        lambda *args, **kwargs: calls.append(("git", args)),
+    )
+    monkeypatch.setattr(
+        guest_customization,
+        "attach_as_user",
+        lambda *args, **kwargs: calls.append(("user", args)) or 0,
+    )
+    monkeypatch.setattr(
+        guest_customization,
+        "attach_as_root",
+        lambda *args, **kwargs: calls.append(("root", args)) or 0,
     )
 
     assert (
@@ -735,7 +856,7 @@ def test_post_start_actions_paths(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_tunnel_and_session_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(cli, "_pid_is_alive", lambda pid: pid == 123)
+    monkeypatch.setattr(session_state, "pid_is_alive", lambda pid: pid == 123)
     monkeypatch.setattr(cli.network, "pid_is_alive", lambda pid: pid == 123)
     cli.network._record_auth_tunnel("vm1", pid=123, host_port=1455, guest_port=1455)
     assert cli.network._tracked_auth_tunnel("vm1") == {
@@ -753,16 +874,16 @@ def test_tunnel_and_session_state(monkeypatch: pytest.MonkeyPatch) -> None:
     cli.network._save_tunnels({"bad": [], "dead": {"auth_port": {"pid": 999, "host_port": 1}}})
     assert cli.network._tracked_auth_tunnel_for_host_port(1) is None
 
-    cli._save_sessions(
+    session_state.save_sessions(
         {"vm1": {"sessions": [{"pid": 123, "kind": "run"}, {"pid": 999, "kind": "run"}]}}
     )
-    assert cli._active_sessions("vm1") == [{"pid": 123, "kind": "run"}]
+    assert session_state.active_sessions("vm1") == [{"pid": 123, "kind": "run"}]
 
     stopped: list[list[str]] = []
     monkeypatch.setattr(cli, "_run_smolvm", lambda argv: stopped.append(list(argv)) or 0)
     cli._stop_vm_if_last_session("vm1", stop_on_exit=False)
     assert stopped == []
-    cli._save_sessions({})
+    session_state.save_sessions({})
     cli._stop_vm_if_last_session("vm1", stop_on_exit=True)
     assert stopped == [["sandbox", "stop", "vm1"]]
 
@@ -805,6 +926,7 @@ def test_foreground_port_forward_uses_one_ssh_for_multiple_ports(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, list[str]] = {}
+
     def fake_run(argv: list[str]) -> int:
         captured["argv"] = list(argv)
         return 0
@@ -812,9 +934,12 @@ def test_foreground_port_forward_uses_one_ssh_for_multiple_ports(
     monkeypatch.setattr(cli.network, "ssh_command", lambda vm_id: ["ssh", "root@host"])
     monkeypatch.setattr(cli.network, "run", fake_run)
 
-    assert cli.network._foreground_port_forward(
-        "vm1", [("127.0.0.1", 3000, 3000), ("127.0.0.1", 8080, 80)]
-    ) == 0
+    assert (
+        cli.network._foreground_port_forward(
+            "vm1", [("127.0.0.1", 3000, 3000), ("127.0.0.1", 8080, 80)]
+        )
+        == 0
+    )
     assert captured["argv"] == [
         "ssh",
         "-N",
@@ -897,7 +1022,7 @@ def test_network_status_variants(
     assert cli.network.cmd_status(type("Args", (), {"name": "vm1", "host_port": 1455})()) == 0
     assert "active" in capsys.readouterr().out
 
-    monkeypatch.setattr(cli.network, "_tracked_auth_tunnel", lambda name: None)
+    monkeypatch.setattr(cli.network, "_tracked_auth_tunnel", lambda *args, **kwargs: None)
     monkeypatch.setattr(cli.network, "_localhost_port_is_listening", lambda port: True)
     assert cli.network.cmd_status(type("Args", (), {"name": "vm1", "host_port": 1455})()) == 0
     assert "busy/untracked" in capsys.readouterr().out
@@ -929,7 +1054,7 @@ def test_sync_forwarded_env_sets_present_and_unsets_missing(
     monkeypatch.setenv("SBX_PRESENT", "value")
     monkeypatch.delenv("SBX_MISSING", raising=False)
 
-    cli._sync_forwarded_env("vm1", ["SBX_PRESENT", "SBX_MISSING"])
+    guest_customization.sync_forwarded_env("vm1", ["SBX_PRESENT", "SBX_MISSING"])
 
     assert calls == [
         ("from_id", {}),
@@ -962,11 +1087,13 @@ def test_sync_forwarded_env_uses_direct_ssh_for_legacy_vm(
         return subprocess.CompletedProcess(argv, 0, "export OLD=kept\nexport SBX_TOKEN=old\n", "")
 
     monkeypatch.setattr(smolvm.facade, "SmolVM", FakeSmolVM, raising=False)
-    monkeypatch.setattr(cli, "_ssh_command", lambda vm_id: ["ssh", vm_id])
+    monkeypatch.setattr(guest_customization, "ssh_command", lambda vm_id: ["ssh", vm_id])
     monkeypatch.setattr(cli, "_run_capture", fake_run_capture)
     monkeypatch.setenv("SBX_TOKEN", "value")
 
-    cli._sync_forwarded_env("vm1", ["SBX_TOKEN", "MISSING"])
+    guest_customization.sync_forwarded_env(
+        "vm1", ["SBX_TOKEN", "MISSING"], run_capture=fake_run_capture
+    )
 
     assert calls[0:2] == [("from_id", {}), ("close", None)]
     assert calls[2] == ("ssh", "cat /etc/profile.d/smolvm_env.sh 2>/dev/null || true")
@@ -984,7 +1111,7 @@ def test_sync_forwarded_env_empty_allowlist_skips_smolvm(
 
     monkeypatch.setattr(smolvm.facade, "SmolVM", FakeSmolVM, raising=False)
 
-    cli._sync_forwarded_env("vm1", [])
+    guest_customization.sync_forwarded_env("vm1", [])
 
 
 def test_config_and_validation_error_branches(tmp_path: Path) -> None:
@@ -1003,7 +1130,7 @@ def test_config_and_validation_error_branches(tmp_path: Path) -> None:
     with pytest.raises(cli.ConfigError, match="run_user"):
         cli._validate_run_user("bad user")
     with pytest.raises(cli.ConfigError, match="invalid env var"):
-        cli._validate_env_names(["BAD-NAME"])
+        guest_customization.validate_env_names(["BAD-NAME"])
     with pytest.raises(cli.ConfigError, match="could not read"):
         cli._extract_started_vm_name("not-json")
     with pytest.raises(cli.ConfigError, match="did not include"):
@@ -1123,7 +1250,7 @@ def test_network_status_inactive(
         "run_smolvm_capture",
         lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout=payload, stderr=""),
     )
-    monkeypatch.setattr(cli.network, "_tracked_auth_tunnel", lambda name: None)
+    monkeypatch.setattr(cli.network, "_tracked_auth_tunnel", lambda *args, **kwargs: None)
     monkeypatch.setattr(cli.network, "_localhost_port_is_listening", lambda port: False)
 
     assert cli.network.cmd_status(type("Args", (), {"name": "vm1", "host_port": 1455})()) == 0
@@ -1188,7 +1315,9 @@ def test_post_start_actions_auth_port_failure_skips_attach(monkeypatch: pytest.M
     calls: list[str] = []
     monkeypatch.setattr(cli, "_sync_guest_clock", lambda vm_id: calls.append("clock"))
     monkeypatch.setattr(cli.network, "expose_auth_port", lambda *args: calls.append("port") or 9)
-    monkeypatch.setattr(cli, "_attach_as_root", lambda *args, **kwargs: calls.append("attach") or 0)
+    monkeypatch.setattr(
+        guest_customization, "attach_as_root", lambda *args, **kwargs: calls.append("attach") or 0
+    )
 
     assert (
         cli._post_start_actions(
@@ -1208,7 +1337,7 @@ def test_post_start_actions_auth_port_failure_skips_attach(monkeypatch: pytest.M
 
 def test_close_auth_port_escalates_to_sigkill(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli.network, "_tracked_auth_tunnel", lambda name: {"pid": 123})
-    monkeypatch.setattr(cli.network, "_remove_auth_tunnel_record", lambda name: None)
+    monkeypatch.setattr(cli.network, "_remove_auth_tunnel_record", lambda *args, **kwargs: None)
     monkeypatch.setattr(cli.network.time, "sleep", lambda seconds: None)
     times = iter([0.0, 4.0])
     monkeypatch.setattr(cli.network.time, "monotonic", lambda: next(times))
@@ -1222,7 +1351,9 @@ def test_close_auth_port_escalates_to_sigkill(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_stop_vm_skips_when_other_sessions_active(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(cli, "_active_sessions", lambda vm_id: [{"pid": 123, "kind": "run"}])
+    monkeypatch.setattr(
+        session_state, "active_sessions", lambda vm_id: [{"pid": 123, "kind": "run"}]
+    )
     stopped: list[list[str]] = []
     monkeypatch.setattr(cli, "_run", lambda argv: stopped.append(list(argv)) or 0)
 
@@ -1478,21 +1609,14 @@ def test_recreate_success_deletes_then_starts(monkeypatch: pytest.MonkeyPatch) -
 
 def test_start_existing_vm_if_needed_variants(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[list[str]] = []
-    marked: list[str] = []
     monkeypatch.setattr(cli, "_run_smolvm", lambda argv: calls.append(list(argv)) or 0)
-    monkeypatch.setattr(
-        cli, "_mark_error_vm_stopped_for_restart", lambda vm_id: marked.append(vm_id)
-    )
 
     assert cli._start_existing_vm_if_needed("vm1", "running", 60) == 0
     assert calls == []
     assert cli._start_existing_vm_if_needed("vm1", "stopped", 60) == 0
     assert calls == [["sandbox", "start", "vm1", "--boot-timeout", "60"]]
     assert cli._start_existing_vm_if_needed("vm1", "error", 60) == 1
-    assert marked == []
-    assert cli._start_existing_vm_if_needed("vm1", "error", 60, force_start=True) == 0
-    assert marked == ["vm1"]
-    assert calls[-1] == ["sandbox", "start", "vm1", "--boot-timeout", "60"]
+    assert calls == [["sandbox", "start", "vm1", "--boot-timeout", "60"]]
 
 
 def test_mark_error_vm_stopped_for_restart_clears_stale_runtime_fields() -> None:
@@ -1505,7 +1629,7 @@ def test_mark_error_vm_stopped_for_restart_clears_stale_runtime_fields() -> None
             ("vm1", "error", 123, "/tmp/stale.sock"),
         )
 
-    cli._mark_error_vm_stopped_for_restart("vm1")
+    vm_state.mark_error_vm_stopped_for_restart("vm1")
 
     with sqlite3.connect(cli.SMOLVM_DB_PATH) as conn:
         row = conn.execute(
@@ -1521,25 +1645,10 @@ def test_mark_error_vm_stopped_for_restart_clears_stale_runtime_fields() -> None
         ["shell", "--force-start", "--keep-running", "--no-git-config", "vm1"],
     ],
 )
-def test_force_start_is_passed_to_existing_vm_start(
-    monkeypatch: pytest.MonkeyPatch, argv: list[str]
-) -> None:
-    captured: dict[str, object] = {}
-    monkeypatch.setattr(cli, "_get_existing_vm_status", lambda vm_id: "error")
-    monkeypatch.setattr(
-        cli,
-        "_start_existing_vm_if_needed",
-        lambda vm_id, status, timeout, *, force_start=False: captured.update(
-            {"vm_id": vm_id, "status": status, "force_start": force_start}
-        )
-        or 0,
-    )
-    monkeypatch.setattr(cli, "_post_start_actions", lambda **kwargs: 0)
-    monkeypatch.setattr(cli, "_sync_forwarded_env_or_error", lambda vm_id, names: True)
-    monkeypatch.setattr(cli, "_run_smolvm", lambda argv: 0)
-
-    assert cli.main(argv) == 0
-    assert captured == {"vm_id": "vm1", "status": "error", "force_start": True}
+def test_force_start_is_rejected(argv: list[str]) -> None:
+    with pytest.raises(SystemExit) as exc:
+        cli.main(argv)
+    assert exc.value.code == 2
 
 
 def test_start_existing_vm_timeout_hint_when_vm_is_running(
@@ -1588,20 +1697,20 @@ def test_pid_is_alive_permission_error(monkeypatch: pytest.MonkeyPatch) -> None:
     def permission_error(pid: int, sig: int) -> None:
         raise PermissionError
 
-    monkeypatch.setattr(cli.os, "kill", permission_error)
-    assert cli._pid_is_alive(123) is True
+    monkeypatch.setattr(session_state.os, "kill", permission_error)
+    assert session_state.pid_is_alive(123) is True
 
 
 def test_unregister_session_keeps_other_active_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(cli.os, "getpid", lambda: 111)
-    monkeypatch.setattr(cli, "_pid_is_alive", lambda pid: pid == 222)
-    cli._save_sessions(
+    monkeypatch.setattr(session_state.os, "getpid", lambda: 111)
+    monkeypatch.setattr(session_state, "pid_is_alive", lambda pid: pid == 222)
+    session_state.save_sessions(
         {"vm1": {"sessions": [{"pid": 111, "kind": "run"}, {"pid": 222, "kind": "shell"}]}}
     )
 
-    cli._unregister_session("vm1")
+    session_state.unregister_session("vm1")
 
-    assert cli._load_sessions() == {"vm1": {"sessions": [{"pid": 222, "kind": "shell"}]}}
+    assert session_state.load_sessions() == {"vm1": {"sessions": [{"pid": 222, "kind": "shell"}]}}
 
 
 def test_network_auth_port_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:

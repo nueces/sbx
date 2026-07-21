@@ -33,7 +33,6 @@ def test_completion_scripts_include_all_command_option_groups() -> None:
             "close-auth-port",
             "status",
             "build-debian",
-            "force-start",
             "force",
             "host-port",
             "guest-port",
