@@ -2,7 +2,7 @@
 
 ## Implementation
 
-1. [x] Add `_sync_forwarded_env(vm_id, names)` in `src/sbx/cli.py` that sets host-present keys and unsets host-missing keys via SmolVM's Python API.
+1. [x] Add `guest_setup.sync_forwarded_env(vm_id, names)` that sets host-present keys and unsets host-missing keys via SmolVM's Python API, with direct-SSH fallback for legacy VMs.
 2. [x] Call env sync in the existing-VM `sbx run` path after start/reuse succeeds and before attach.
 3. [x] Call env sync only in the local-image new-VM attach path; fresh preset VMs already inject allowlisted env during preset apply.
 4. [x] Make `sbx shell` read `[sbx].env`, validate it, and sync before attach.

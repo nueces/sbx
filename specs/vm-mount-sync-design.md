@@ -45,10 +45,11 @@ The logic belongs in `cmd_start()` in the existing-VM branch, before `_start_exi
 ```python
 if existing_status is not None:
     if existing_status != "running":
-        _sync_existing_vm_mounts_from_config(
+        _sync_existing_vm_start_config(
             vm_name=str(requested_name),
             mounts=effective_mounts,
             writable_mounts=writable_mounts,
+            port_forwards=effective_port_forwards,
         )
     start_rc = _start_existing_vm_if_needed(...)
 ```
@@ -58,7 +59,7 @@ if existing_status is not None:
 1. `project_path` as a same-path mount, first.
 2. Any configured/CLI `mount` entries, with bare paths converted to same-path mounts.
 
-The sync helper reads SmolVM's state DB, loads the target row's JSON config, replaces `workspace_mounts` only when needed, and writes the row back only when the mount list actually changed.
+The sync helper reads SmolVM's state DB, loads the target row's JSON config, replaces `workspace_mounts` and `port_forwards` only when needed, and writes the row back only when the stored config actually changed.
 
 Desired stored mount shape:
 

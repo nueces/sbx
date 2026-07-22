@@ -53,10 +53,10 @@ Out of scope:
 
 ## Design
 
-Use the lazy path: add one small helper in `src/sbx/cli.py` and call it before attach.
+Use the lazy path: keep one small helper in `src/sbx/guest_setup.py` and call it before attach.
 
 ```python
-def _sync_forwarded_env(vm_id: str, names: list[str]) -> None:
+def sync_forwarded_env(vm_id: str, names: list[str]) -> None:
     values = {name: os.environ[name] for name in names if name in os.environ}
     missing = [name for name in names if name not in os.environ]
     if not values and not missing:
@@ -83,7 +83,7 @@ The exact implementation may differ, but it must not put secret values in subpro
 In `cmd_start()`'s existing-VM branch, after `_start_existing_vm_if_needed(...)` succeeds and before `_post_start_actions(...)`:
 
 ```python
-_sync_forwarded_env(str(requested_name), forward_env)
+guest_setup.sync_forwarded_env(str(requested_name), forward_env)
 ```
 
 This covers both stopped VMs that just started and running VMs that are being reused.
@@ -96,11 +96,11 @@ Avoid duplicate env writes:
 - Fresh local-image VM: post-sync before attach. Local-image startup does not run SmolVM preset install, so nothing else applies `[sbx].env`.
 - `--no-attach` / `create`: skip post-sync. No new agent/shell process is being started by `sbx`; the next `run` or `shell` attach will sync first.
 
-Call `_sync_forwarded_env(...)` directly in the few paths that need it; do not add a generic flag unless another caller appears.
+Call `guest_setup.sync_forwarded_env(...)` directly in the few paths that need it; do not add a generic flag unless another caller appears.
 
 ### `sbx shell`
 
-In `cmd_passthrough()`'s shell branch, read and validate `[sbx].env` from config, then call `_sync_forwarded_env(name, forward_env)` before attaching. `sbx shell` does not need a new `--env` flag for the first version; config is enough and keeps the CLI small.
+In `cmd_shell()`, read and validate `[sbx].env` from config, then call `guest_setup.sync_forwarded_env(name, forward_env)` before attaching. `sbx shell` does not need a new `--env` flag for the first version; config is enough and keeps the CLI small.
 
 ## Missing host variables
 
@@ -124,9 +124,9 @@ Use focused tests with fake SmolVM modules/classes. Do not boot real VMs.
 
 Test cases:
 
-- `_sync_forwarded_env` sets host-present keys through `SmolVM.from_id(...).set_env_vars(...)`.
-- `_sync_forwarded_env` unsets configured-but-host-missing keys through `unset_env_vars(...)`.
-- `_sync_forwarded_env` does nothing for an empty allowlist.
+- `guest_setup.sync_forwarded_env` sets host-present keys through `SmolVM.from_id(...).set_env_vars(...)`.
+- `guest_setup.sync_forwarded_env` unsets configured-but-host-missing keys through `unset_env_vars(...)`.
+- `guest_setup.sync_forwarded_env` does nothing for an empty allowlist.
 - Existing-VM `sbx run` calls env sync before attach.
 - `sbx shell` reads `[sbx].env` and calls env sync before attach.
 - Invalid env names still fail before VM operations.
