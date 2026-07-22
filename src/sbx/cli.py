@@ -238,14 +238,6 @@ def _sync_existing_vm_start_config(
     print(f"sbx: updated {', '.join(updated)} for existing VM '{vm_name}'")
 
 
-def _sync_existing_vm_mounts_from_config(
-    vm_name: str, mounts: Sequence[str], *, writable_mounts: bool
-) -> None:
-    _sync_existing_vm_start_config(
-        vm_name, mounts, writable_mounts=writable_mounts, port_forwards=[]
-    )
-
-
 def _project_guest_cwd(path_value: Any) -> str | None:
     if path_value is None:
         return None

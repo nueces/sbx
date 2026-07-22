@@ -1,7 +1,6 @@
 import json
 import os
 import shlex
-import shutil
 import subprocess
 import sys
 from argparse import Namespace
@@ -115,15 +114,6 @@ def run_smolvm_capture(
 ) -> subprocess.CompletedProcess[str] | None:
     kwargs["env"] = smolvm_env(kwargs.get("env"))
     return run_capture(smolvm_argv(args), **kwargs)
-
-
-def require(command: str, install_hint: str | None = None) -> bool:
-    if shutil.which(command):
-        return True
-    print(f"sbx: required command not found: {command}", file=sys.stderr)
-    if install_hint:
-        print(install_hint, file=sys.stderr)
-    return False
 
 
 def missing_vm_message(vm_id: str) -> str:

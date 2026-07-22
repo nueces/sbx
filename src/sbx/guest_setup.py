@@ -186,19 +186,13 @@ def sync_forwarded_env(
 
     from smolvm.facade import SmolVM
 
-    probe = SmolVM.from_id(vm_id)
-    try:
-        info = getattr(probe, "_info", None)
-        comm_channel = getattr(getattr(info, "config", None), "comm_channel", None)
-    finally:
-        probe.close()
-
-    if comm_channel is None:
-        sync_forwarded_env_direct_ssh(vm_id, values, missing, run_capture=run_capture, ssh=ssh)
-        return
-
     vm = SmolVM.from_id(vm_id)
     try:
+        info = getattr(vm, "_info", None)
+        comm_channel = getattr(getattr(info, "config", None), "comm_channel", None)
+        if comm_channel is None:
+            sync_forwarded_env_direct_ssh(vm_id, values, missing, run_capture=run_capture, ssh=ssh)
+            return
         if values:
             vm.set_env_vars(values)
         if missing:

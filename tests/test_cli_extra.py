@@ -87,11 +87,6 @@ def fake_smolvm_sdk(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str
     return captured
 
 
-@pytest.fixture
-def completed_ok() -> subprocess.CompletedProcess[str]:
-    return subprocess.CompletedProcess(["cmd"], 0, stdout="ok", stderr="")
-
-
 def _write_vm_row(db_path: Path, vm_id: str, *, status: str, config: dict[str, object]) -> None:
     with sqlite3.connect(db_path) as conn:
         conn.execute("CREATE TABLE vms (id TEXT PRIMARY KEY, status TEXT, config TEXT)")
@@ -221,7 +216,9 @@ def test_sync_existing_vm_mounts_updates_stale_stopped_vm(
         config={"workspace_mounts": [{"host_path": "/old", "guest_path": "/old"}]},
     )
 
-    cli._sync_existing_vm_mounts_from_config("vm1", [f"{host}:/workspace"], writable_mounts=True)
+    cli._sync_existing_vm_start_config(
+        "vm1", [f"{host}:/workspace"], writable_mounts=True, port_forwards=[]
+    )
 
     assert _read_vm_config(cli.SMOLVM_DB_PATH, "vm1")["workspace_mounts"] == [
         {"host_path": str(host), "guest_path": "/workspace", "mount_tag": None, "writable": True}
@@ -247,7 +244,9 @@ def test_sync_existing_vm_mounts_skips_matching_config(
     }
     _write_vm_row(cli.SMOLVM_DB_PATH, "vm1", status="stopped", config=config)
 
-    cli._sync_existing_vm_mounts_from_config("vm1", [f"{host}:/workspace"], writable_mounts=False)
+    cli._sync_existing_vm_start_config(
+        "vm1", [f"{host}:/workspace"], writable_mounts=False, port_forwards=[]
+    )
 
     assert _read_vm_config(cli.SMOLVM_DB_PATH, "vm1") == config
     assert capsys.readouterr().out == ""
@@ -300,7 +299,7 @@ def test_cmd_start_does_not_sync_running_vm_mounts(
     monkeypatch.setattr(guest_setup, "host_git_config", lambda project_root=None: None)
     monkeypatch.setattr(
         cli,
-        "_sync_existing_vm_mounts_from_config",
+        "_sync_existing_vm_start_config",
         lambda *args, **kwargs: calls.append("sync"),
     )
     monkeypatch.setattr(cli, "_post_start_actions", lambda **kwargs: 0)
@@ -355,12 +354,12 @@ def test_workspace_mount_specs_reject_duplicate_guest_paths(tmp_path: Path) -> N
 def test_sync_existing_vm_mounts_missing_db_or_row_does_nothing(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    cli._sync_existing_vm_mounts_from_config("missing", [], writable_mounts=False)
+    cli._sync_existing_vm_start_config("missing", [], writable_mounts=False, port_forwards=[])
     assert capsys.readouterr().out == ""
 
     with sqlite3.connect(cli.SMOLVM_DB_PATH) as conn:
         conn.execute("CREATE TABLE vms (id TEXT PRIMARY KEY, status TEXT, config TEXT)")
-    cli._sync_existing_vm_mounts_from_config("missing", [], writable_mounts=False)
+    cli._sync_existing_vm_start_config("missing", [], writable_mounts=False, port_forwards=[])
     assert capsys.readouterr().out == ""
 
 
@@ -436,10 +435,6 @@ def test_run_helpers_and_require_errors(
 
     monkeypatch.setattr(runtime.subprocess, "run", called_process_error)
     assert runtime.run(["cmd"]) == 9
-
-    monkeypatch.setattr(runtime.shutil, "which", lambda command: None)
-    assert runtime.require("missing", "install it") is False
-    assert "install it" in capsys.readouterr().err
 
 
 def test_simple_helper_error_branches(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -1054,8 +1049,6 @@ def test_sync_forwarded_env_sets_present_and_unsets_missing(
 
     assert calls == [
         ("from_id", {}),
-        ("close", None),
-        ("from_id", {}),
         ("set", {"SBX_PRESENT": "value"}),
         ("unset", ["SBX_MISSING"]),
         ("close", None),
@@ -1089,10 +1082,11 @@ def test_sync_forwarded_env_uses_direct_ssh_for_legacy_vm(
 
     guest_setup.sync_forwarded_env("vm1", ["SBX_TOKEN", "MISSING"], run_capture=fake_run_capture)
 
-    assert calls[0:2] == [("from_id", {}), ("close", None)]
-    assert calls[2] == ("ssh", "cat /etc/profile.d/smolvm_env.sh 2>/dev/null || true")
-    assert calls[3][0] == "ssh"
-    assert "base64 -d" in str(calls[3][1])
+    assert calls[0] == ("from_id", {})
+    assert calls[1] == ("ssh", "cat /etc/profile.d/smolvm_env.sh 2>/dev/null || true")
+    assert calls[2][0] == "ssh"
+    assert "base64 -d" in str(calls[2][1])
+    assert calls[3] == ("close", None)
 
 
 def test_sync_forwarded_env_empty_allowlist_skips_smolvm(
