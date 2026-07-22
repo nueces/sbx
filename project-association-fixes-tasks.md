@@ -65,8 +65,8 @@
 
 - [x] Add `src/sbx/guest_setup.py`.
 - [x] Reuse shared runtime SSH/process helpers instead of duplicating them.
-- [x] Move host/env helpers: env-name validation, forwarded-env sanitizing, credential-free env, and host Git config rendering.
-- [x] Move guest mutators: hostname setting, Git config install, run-user preparation, and forwarded env sync.
+- [x] Move host/env helpers: env-name validation, forwarded-env sanitizing, credential-free env, host timezone lookup, and host Git config rendering.
+- [x] Move guest mutators: hostname setting, clock/timezone sync, Git config install, run-user preparation, and forwarded env sync.
 - [x] Use one generic `attach(...)` helper for root/user attach.
 - [x] Keep `_post_start_actions` in `src/sbx/cli.py`.
 - [x] Update imports, call sites, and tests to patch/use `guest_setup` directly.

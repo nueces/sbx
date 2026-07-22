@@ -2,10 +2,10 @@
 
 ## Implementation
 
-1. [x] Add `_sync_existing_vm_mounts_from_config(...)` in `src/sbx/cli.py` that parses effective mount specs, opens SmolVM's SQLite state DB, compares `workspace_mounts`, and writes only when different.
+1. [x] Add `_sync_existing_vm_start_config(...)` in `src/sbx/cli.py` that parses effective mount/port-forward specs, opens SmolVM's SQLite state DB, compares stored start config, and writes only when different.
 2. [x] Call the helper from `cmd_start()` only when the named VM exists and is not running.
 3. [x] Keep running VMs unchanged; users must `sbx stop` before mount edits take effect.
-4. [x] Print one short message only when mounts are updated.
+4. [x] Print one short message only when mounts or port forwards are updated.
 
 ## Tests
 

@@ -280,8 +280,8 @@ Keep `cli.py` as command glue, not the owner of state and repair logic. Extract 
    - `doctor_error_vms`
    - `run_doctor_checks(fix: bool) -> int`
 6. `src/sbx/guest_setup.py`
-   - host-derived setup: env validation/sanitizing, credential-free env, host Git config
-   - guest-applied setup: hostname, Git config install, run-user preparation, forwarded env sync
+   - host-derived setup: env validation/sanitizing, credential-free env, host Git config, host timezone lookup
+   - guest-applied setup: hostname, clock/timezone sync, Git config install, run-user preparation, forwarded env sync
    - one generic `attach(...)` helper using the shared runtime SSH command
 
 Leave CLI config resolution, parser setup, and `cmd_*` wrappers in `cli.py`. Keep project identity resolution in `cli.py` unless config loading is extracted later. Keep `_post_start_actions` in `cli.py` because it orchestrates auth-port, session tracking, attach, and stop policy.
