@@ -1,10 +1,9 @@
-import argparse
 import json
 import os
 import shlex
-import shutil
 import subprocess
 import sys
+from argparse import Namespace
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -19,7 +18,7 @@ class ConfigError(ValueError):
 
 
 def vm_name_from_arg_or_config(
-    args: argparse.Namespace, config: Mapping[str, Any] | None, command: str
+    args: Namespace, config: Mapping[str, Any] | None, command: str
 ) -> str | None:
     name = getattr(args, "name", None)
     sbx = (config or {}).get("sbx", {})
@@ -117,15 +116,6 @@ def run_smolvm_capture(
     return run_capture(smolvm_argv(args), **kwargs)
 
 
-def require(command: str, install_hint: str | None = None) -> bool:
-    if shutil.which(command):
-        return True
-    print(f"sbx: required command not found: {command}", file=sys.stderr)
-    if install_hint:
-        print(install_hint, file=sys.stderr)
-    return False
-
-
 def missing_vm_message(vm_id: str) -> str:
     return (
         f"VM {vm_id!r} not found. `sbx shell` attaches to an existing sandbox; "
@@ -147,10 +137,14 @@ def ssh_command(vm_id: str) -> list[str]:
         vm.close()
 
 
-def read_json_object(path: Path) -> dict[str, Any]:
+def read_json_object(path: Path, *, error: str | None = None) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as exc:
+        if error is not None:
+            raise ConfigError(f"{error}: {path}: {exc}") from exc
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -170,11 +164,3 @@ def pid_is_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
-
-
-class suppress_process_errors:
-    def __enter__(self) -> None:
-        return None
-
-    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
-        return isinstance(exc, (ProcessLookupError, PermissionError, OSError))

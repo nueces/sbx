@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from typing import Any
 
 from sbx.constants import SBX_STATE_DIR, TUNNELS_FILE
@@ -19,7 +20,6 @@ from sbx.runtime import (
     run,
     run_smolvm_capture,
     ssh_command,
-    suppress_process_errors,
     vm_name_from_arg_or_config,
     write_json_object,
 )
@@ -123,13 +123,13 @@ def _close_tracked_auth_tunnel(vm_id: str) -> bool:
         return False
 
     pid = int(tracked["pid"])
-    with suppress_process_errors():
+    with suppress(ProcessLookupError, PermissionError, OSError):
         os.killpg(pid, signal.SIGTERM)
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline and pid_is_alive(pid):
         time.sleep(0.1)
     if pid_is_alive(pid):
-        with suppress_process_errors():
+        with suppress(ProcessLookupError, PermissionError, OSError):
             os.killpg(pid, signal.SIGKILL)
     _remove_auth_tunnel_record(vm_id)
     return True
@@ -210,7 +210,7 @@ def expose_auth_port(vm_id: str, host_port: int, guest_port: int, *, replace: bo
             return 0
         time.sleep(0.1)
 
-    with suppress_process_errors():
+    with suppress(ProcessLookupError, PermissionError, OSError):
         os.killpg(proc.pid, signal.SIGTERM)
     print(f"sbx: auth port tunnel did not become ready on localhost:{host_port}", file=sys.stderr)
     return 1

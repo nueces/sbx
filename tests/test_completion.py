@@ -33,7 +33,6 @@ def test_completion_scripts_include_all_command_option_groups() -> None:
             "close-auth-port",
             "status",
             "build-debian",
-            "force-start",
             "force",
             "host-port",
             "guest-port",
@@ -52,7 +51,7 @@ def test_bash_completion_completes_redirection_targets(tmp_path) -> None:
 source {str(script)!r}
 COMP_WORDS=(sbx completion bash)
 COMP_CWORD=3
-COMP_LINE={f'sbx completion bash > {str(target)[:-1]}'!r}
+COMP_LINE={f"sbx completion bash > {str(target)[:-1]}"!r}
 COMP_POINT=${{#COMP_LINE}}
 _sbx_complete
 printf '%s\n' "${{COMPREPLY[@]}}"
