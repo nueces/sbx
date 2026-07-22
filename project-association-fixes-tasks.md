@@ -45,7 +45,7 @@
 ## Phase 6: extract non-CLI modules
 
 - [x] Move VM metadata helpers into `src/sbx/vm_metadata.py`: load, save, record, and validate project association.
-- [x] Move session bookkeeping into `src/sbx/session_state.py`: PID liveness, session load, and session save.
+- [x] Move session bookkeeping into `src/sbx/session_state.py`: session load/save, live filtering, registration, and unregistering.
 - [x] Move VM state helpers into `src/sbx/vm_state.py`: VM listing, stored start config lookup, and error-state restart repair.
 - [x] Move lifecycle/config warning helpers into `src/sbx/lifecycle_warnings.py`: existing VM config mismatches, local image warnings, and doctor config-state reporting.
 - [x] Move safe doctor repair checks into `src/sbx/doctor.py`: metadata, sessions, tunnels, error VMs, and `run_doctor_checks(fix: bool)`.
@@ -61,15 +61,15 @@
 - [x] Update error-state tests to use doctor repair instead of forced start.
 - [x] Add/keep tests proving `run`/`shell` reject `--force-start` as an unknown option.
 
-## Phase 8: extract guest customization
+## Phase 8: extract guest setup
 
-- [x] Add `src/sbx/guest_customization.py`.
-- [x] Move `_ssh_command` into it as `ssh_command`.
+- [x] Add `src/sbx/guest_setup.py`.
+- [x] Reuse shared runtime SSH/process helpers instead of duplicating them.
 - [x] Move host/env helpers: env-name validation, forwarded-env sanitizing, credential-free env, and host Git config rendering.
 - [x] Move guest mutators: hostname setting, Git config install, run-user preparation, and forwarded env sync.
-- [x] Move attach helpers if they only need SSH command/runners.
+- [x] Use one generic `attach(...)` helper for root/user attach.
 - [x] Keep `_post_start_actions` in `src/sbx/cli.py`.
-- [x] Update imports, call sites, and tests to patch/use `guest_customization` directly.
+- [x] Update imports, call sites, and tests to patch/use `guest_setup` directly.
 - [x] Run `ruff check src tests`.
 - [x] Run `pytest --no-cov`.
 

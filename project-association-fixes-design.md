@@ -258,9 +258,12 @@ Keep `cli.py` as command glue, not the owner of state and repair logic. Extract 
    - `record_vm_project`
    - `validate_vm_project`
 2. `src/sbx/session_state.py`
-   - `pid_is_alive`
    - `load_sessions`
    - `save_sessions`
+   - `live_sessions`
+   - `active_sessions`
+   - `register_session`
+   - `unregister_session`
 3. `src/sbx/vm_state.py`
    - `smolvm_vms`
    - `existing_vm_start_config`
@@ -276,11 +279,10 @@ Keep `cli.py` as command glue, not the owner of state and repair logic. Extract 
    - `doctor_tunnels`
    - `doctor_error_vms`
    - `run_doctor_checks(fix: bool) -> int`
-6. `src/sbx/guest_customization.py`
-   - `ssh_command`
-   - host-derived customization: env validation/sanitizing, credential-free env, host Git config
-   - guest-applied customization: hostname, Git config install, run-user preparation, forwarded env sync
-   - attach helpers that only need SSH command/runners
+6. `src/sbx/guest_setup.py`
+   - host-derived setup: env validation/sanitizing, credential-free env, host Git config
+   - guest-applied setup: hostname, Git config install, run-user preparation, forwarded env sync
+   - one generic `attach(...)` helper using the shared runtime SSH command
 
 Leave CLI config resolution, parser setup, and `cmd_*` wrappers in `cli.py`. Keep project identity resolution in `cli.py` unless config loading is extracted later. Keep `_post_start_actions` in `cli.py` because it orchestrates auth-port, session tracking, attach, and stop policy.
 
@@ -288,7 +290,7 @@ Leave CLI config resolution, parser setup, and `cmd_*` wrappers in `cli.py`. Kee
 
 ```python
 def cmd_doctor(args):
-    rc = _run_smolvm(["doctor", "--backend", DEFAULT_BACKEND])
+    rc = runtime.run_smolvm(["doctor", "--backend", DEFAULT_BACKEND])
     lifecycle_warnings.doctor_config_state(args.config_data)
     return rc or doctor.run_doctor_checks(fix=args.fix)
 ```
@@ -304,7 +306,7 @@ def cmd_doctor(args):
 7. Extract reusable non-CLI modules in the order above.
 8. Add `sbx doctor --fix` for safe metadata/error-state repairs using the extracted modules.
 9. Remove `--force-start`; use `sbx doctor --fix` as the only error-state repair path.
-10. Extract guest customization helpers so `cli.py` only decides when to customize the guest.
+10. Extract guest setup helpers so `cli.py` only decides when to mutate or attach to the guest.
 
 ## Non-goals
 

@@ -65,16 +65,16 @@ The CLI must expose user-intent commands instead of mirroring every VM backend c
 | `sbx run [NAME]` | Create the sandbox if missing, start it if stopped, expose auth callback unless disabled, then attach to the selected agent. |
 | `sbx create [NAME]` | Create/provision/start the sandbox without attaching and without auth callback forwarding by default. |
 | `sbx recreate [NAME]` | Destroy the sandbox, then create it again. Must require confirmation unless forced. |
-| `sbx rm [NAME]` | Destroy the sandbox. Must require confirmation unless forced. |
+| `sbx remove [NAME]` / `sbx rm [NAME]` | Destroy the sandbox. Must require confirmation unless forced. |
 | `sbx stop [NAME]` | Stop the sandbox without removing disk/state. |
 | `sbx shell [NAME]` | Open an interactive shell in the sandbox. |
-| `sbx ls` | List sandboxes. `--all`/`-a` includes stopped sandboxes. |
+| `sbx list` / `sbx ls` | List sbx-managed sandboxes. `--all`/`-a` includes stopped sandboxes. |
 | `sbx network auth-port [NAME]` | Expose a guest callback port to host localhost. |
 | `sbx network close-auth-port [NAME]` | Close the tracked callback tunnel. |
 | `sbx network status [NAME]` | Show sandbox networking and auth callback tunnel state. |
 | `sbx image build-debian` | Build a local ready-to-run Debian/Pi image. |
 | `sbx image ls` | List local ready-to-run images. |
-| `sbx doctor` | Run non-sudo diagnostics for the configured backend. |
+| `sbx doctor [--fix]` | Run non-sudo diagnostics for the configured backend; `--fix` repairs safe local bookkeeping only. |
 | `sbx completion SHELL` | Print shell completion for supported shells. |
 | `sbx --version` | Print the package/tool version. |
 
@@ -188,7 +188,7 @@ For a named VM:
 - if it does not exist, `run` creates it;
 - `create` creates/provisions without attaching;
 - `recreate` destroys then creates;
-- `rm` destroys;
+- `remove` destroys; `rm` is an alias;
 - destructive commands require confirmation unless forced;
 - destructive commands must refuse non-interactive confirmation unless forced.
 
