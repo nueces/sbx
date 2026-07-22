@@ -1,18 +1,13 @@
 import argparse
 import json
 import os
-import re
-import shlex
-import shutil
 import signal
 import sqlite3
-import subprocess
 import sys
 import tempfile
 import tomllib
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -21,8 +16,9 @@ import sbx.network as network
 from sbx import (
     __version__,
     doctor,
-    guest_customization,
+    guest_setup,
     lifecycle_warnings,
+    runtime,
     session_state,
     vm_metadata,
     vm_state,
@@ -34,115 +30,13 @@ from sbx.constants import (
     SMOLVM_DB_PATH,
 )
 from sbx.image import build_debian
-from sbx.runtime import ConfigError as RuntimeConfigError
-from sbx.runtime import smolvm_env
+from sbx.runtime import ConfigError
 
 AGENTS = ("pi", "claude", "codex")
 MIB = 1024 * 1024
 LAUNCH_COMMANDS = {"pi": "pi", "claude": "claude", "codex": "codex"}
-USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]*[$]?$", re.IGNORECASE)
-VM_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
-ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-FORWARDABLE_ENV_VARS = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
-SAFE_GIT_CONFIG_KEYS = (
-    "user.name",
-    "user.email",
-    "init.defaultBranch",
-    "pull.rebase",
-    "push.default",
-    "core.autocrlf",
-    "core.eol",
-)
 DEFAULT_CONFIG_PATHS = (Path.home() / ".config" / "sbx" / "config.toml",)
 LOCAL_CONFIG_PATHS = (Path.cwd() / ".sbx.toml",)
-DEBUG = False
-
-
-ConfigError = RuntimeConfigError
-
-
-def _debug(message: str) -> None:
-    if DEBUG:
-        print(f"sbx debug: {message}", file=sys.stderr)
-
-
-def _debug_command(argv: Sequence[str], env: Mapping[str, str] | None) -> None:
-    _debug(f"run: {shlex.join(list(argv))}")
-    active_env = env if env is not None else os.environ
-    env_source = "custom" if env is not None else "current"
-    interesting = {
-        key: active_env.get(key)
-        for key in ("HOME", "SMOLVM_DATA_DIR", "XDG_STATE_HOME")
-        if active_env.get(key) is not None
-    }
-    _debug(f"env source: {env_source}; {interesting}")
-
-
-def _run(argv: Sequence[str], *, check: bool = False, env: Mapping[str, str] | None = None) -> int:
-    _debug_command(argv, env)
-    try:
-        proc = subprocess.run(list(argv), check=check, env=dict(env) if env is not None else None)
-    except FileNotFoundError:
-        print(f"sbx: command not found on PATH: {argv[0]}", file=sys.stderr)
-        return 127
-    except subprocess.CalledProcessError as exc:
-        _debug(f"return code: {exc.returncode}")
-        return exc.returncode
-    _debug(f"return code: {proc.returncode}")
-    return proc.returncode
-
-
-def _run_capture(
-    argv: Sequence[str], *, env: Mapping[str, str] | None = None
-) -> subprocess.CompletedProcess[str] | None:
-    _debug_command(argv, env)
-    try:
-        result = subprocess.run(
-            list(argv),
-            check=False,
-            text=True,
-            capture_output=True,
-            env=dict(env) if env is not None else None,
-        )
-        _debug(f"return code: {result.returncode}")
-        if result.stdout:
-            _debug(f"stdout: {result.stdout.strip()[:2000]}")
-        if result.stderr:
-            _debug(f"stderr: {result.stderr.strip()[:2000]}")
-        return result
-    except FileNotFoundError:
-        print(f"sbx: command not found on PATH: {argv[0]}", file=sys.stderr)
-        return None
-
-
-def _smolvm_argv(args: Sequence[str]) -> list[str]:
-    return [
-        sys.executable,
-        "-c",
-        "from smolvm.cli.main import main; raise SystemExit(main())",
-        *args,
-    ]
-
-
-def _run_smolvm(args: Sequence[str], **kwargs: Any) -> int:
-    kwargs["env"] = smolvm_env(kwargs.get("env"))
-    return _run(_smolvm_argv(args), **kwargs)
-
-
-def _run_smolvm_capture(
-    args: Sequence[str], **kwargs: Any
-) -> subprocess.CompletedProcess[str] | None:
-    kwargs["env"] = smolvm_env(kwargs.get("env"))
-    return _run_capture(_smolvm_argv(args), **kwargs)
-
-
-def _require(command: str, install_hint: str | None = None) -> bool:
-    if shutil.which(command):
-        return True
-    print(f"sbx: required command not found: {command}", file=sys.stderr)
-    if install_hint:
-        print(install_hint, file=sys.stderr)
-    return False
 
 
 def _deep_merge(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
@@ -187,9 +81,9 @@ def load_config(explicit_path: str | None = None) -> dict[str, Any]:
     config: dict[str, Any] = {}
     for path in paths:
         if path.exists():
-            _debug(f"loading config: {path}")
+            runtime.debug(f"loading config: {path}")
             config = _deep_merge(config, _read_toml(path))
-    _debug(f"merged config: {config}")
+    runtime.debug(f"merged config: {config}")
     return config
 
 
@@ -358,24 +252,9 @@ def _project_guest_cwd(path_value: Any) -> str | None:
     return str(_resolve_project_path(str(path_value)))
 
 
-def _validate_run_user(user: str) -> str:
-    if not USERNAME_RE.match(user):
-        raise ConfigError("[sbx].run_user must be a valid Linux user name")
-    return user
-
-
-def _validate_vm_name(name: str) -> str:
-    if not VM_NAME_RE.match(name):
-        raise ConfigError(
-            "[sbx].name must be a valid hostname: lowercase letters, digits, hyphens, "
-            "1-63 chars, no leading/trailing hyphen"
-        )
-    return name
-
-
 def _sync_forwarded_env_or_error(vm_id: str, names: list[str]) -> bool:
     try:
-        guest_customization.sync_forwarded_env(vm_id, names, run_capture=_run_capture)
+        guest_setup.sync_forwarded_env(vm_id, names, run_capture=runtime.run_capture)
     except Exception as exc:  # noqa: BLE001 - keep CLI errors user-friendly.
         print(f"sbx: failed to sync environment for VM {vm_id!r}: {exc}", file=sys.stderr)
         return False
@@ -409,7 +288,7 @@ def _validate_boot_timeout(value: Any) -> float:
 
 
 def _smolvm_info_vm(vm_id: str) -> Mapping[str, Any] | None:
-    completed = _run_smolvm_capture(["sandbox", "info", vm_id, "--json"])
+    completed = runtime.run_smolvm_capture(["sandbox", "info", vm_id, "--json"])
     if completed is None or completed.returncode != 0:
         return None
     try:
@@ -503,7 +382,7 @@ def _start_existing_vm_if_needed(vm_id: str, status: str, boot_timeout: float) -
         )
         print(f"sbx: If it still fails, run `sbx recreate {vm_id} --force`.", file=sys.stderr)
         return 1
-    rc = _run_smolvm(["sandbox", "start", vm_id, "--boot-timeout", f"{boot_timeout:g}"])
+    rc = runtime.run_smolvm(["sandbox", "start", vm_id, "--boot-timeout", f"{boot_timeout:g}"])
     if rc != 0:
         _maybe_print_boot_timeout_running_hint(vm_id, boot_timeout)
     return rc
@@ -541,90 +420,49 @@ def _extract_started_vm_name(stdout: str) -> str:
     return name
 
 
-def _host_timezone() -> str:
-    zoneinfo = Path("/usr/share/zoneinfo")
-    try:
-        target = Path("/etc/localtime").resolve()
-        return target.relative_to(zoneinfo).as_posix()
-    except (OSError, ValueError):
-        pass
-    try:
-        timezone = Path("/etc/timezone").read_text(encoding="utf-8").strip()
-    except OSError:
-        return "UTC"
-    return timezone or "UTC"
-
-
-def _sync_guest_clock(vm_id: str) -> None:
-    timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
-    timezone = _host_timezone()
-    script = f"""
-set -eu
-zone={shlex.quote(timezone)}
-if [ -f "/usr/share/zoneinfo/$zone" ]; then
-  ln -sf "/usr/share/zoneinfo/$zone" /etc/localtime
-  printf '%s\n' "$zone" > /etc/timezone
-fi
-date -u -s {shlex.quote(timestamp)}
-"""
-    cmd = guest_customization.ssh_command(vm_id)
-    cmd.append("bash -lc " + shlex.quote(script))
-    completed = _run_capture(cmd)
-    if completed is None:
-        raise ConfigError("failed to sync VM clock: ssh command not found")
-    if completed.returncode != 0:
-        stderr = completed.stderr.strip() or completed.stdout.strip()
-        raise ConfigError(f"failed to sync VM clock: {stderr}")
-
-
 def _stop_vm_if_last_session(vm_id: str, *, stop_on_exit: bool) -> None:
     if not stop_on_exit:
-        _debug(f"not stopping {vm_id}: stop_on_exit disabled")
+        runtime.debug(f"not stopping {vm_id}: stop_on_exit disabled")
         return
     if session_state.active_sessions(vm_id):
-        _debug(f"not stopping {vm_id}: other sbx sessions still active")
+        runtime.debug(f"not stopping {vm_id}: other sbx sessions still active")
         return
-    _debug(f"stopping {vm_id}: no other sbx sessions active")
-    _run_smolvm(["sandbox", "stop", vm_id])
+    runtime.debug(f"stopping {vm_id}: no other sbx sessions active")
+    runtime.run_smolvm(["sandbox", "stop", vm_id])
 
 
 def _post_start_actions(
     *,
     vm_name: str,
-    agent: str,
+    command: str,
     attach: bool,
     run_user: str | None,
     auth_port: bool,
-    auth_host_port: int,
-    auth_guest_port: int,
+    auth_host_port: int = 0,
+    auth_guest_port: int = 0,
     stop_on_exit: bool,
-    launch_command: str | None = None,
     cwd: str | None = None,
     git_config_text: str | None = None,
+    session_kind: str = "run",
 ) -> int:
-    _sync_guest_clock(vm_name)
+    guest_setup.sync_guest_clock(vm_name, run_capture=runtime.run_capture)
     if auth_port:
         port_rc = network.expose_auth_port(vm_name, auth_host_port, auth_guest_port)
         if port_rc != 0:
             return port_rc
     if not attach:
         return 0
-    command = launch_command or LAUNCH_COMMANDS[agent]
-    session_state.register_session(vm_name, "run")
+    session_state.register_session(vm_name, session_kind)
     try:
         if run_user is not None:
-            guest_customization.prepare_run_user(vm_name, run_user, run_capture=_run_capture)
-            guest_customization.install_git_config(
-                vm_name, run_user, git_config_text, run_capture=_run_capture
-            )
-            return guest_customization.attach_as_user(vm_name, run_user, command, cwd=cwd, run=_run)
-        guest_customization.install_git_config(
-            vm_name, None, git_config_text, run_capture=_run_capture
+            guest_setup.prepare_run_user(vm_name, run_user, run_capture=runtime.run_capture)
+        guest_setup.install_git_config(
+            vm_name, run_user, git_config_text, run_capture=runtime.run_capture
         )
-        return guest_customization.attach_as_root(vm_name, command, cwd=cwd, run=_run)
+        return guest_setup.attach(vm_name, command, user=run_user, cwd=cwd, run=runtime.run)
     finally:
         remaining = session_state.unregister_session(vm_name)
-        _debug(f"unregistered session for {vm_name}; remaining={remaining}")
+        runtime.debug(f"unregistered session for {vm_name}; remaining={remaining}")
         _stop_vm_if_last_session(vm_name, stop_on_exit=stop_on_exit)
 
 
@@ -826,7 +664,7 @@ def _start_preset_with_sdk(
             )
             vm.start(boot_timeout=boot_timeout)
             vm.wait_for_ssh(timeout=boot_timeout)
-            guest_customization.set_hostname(str(vm.vm_id), run_capture=_run_capture)
+            guest_setup.set_hostname(str(vm.vm_id), run_capture=runtime.run_capture)
             ssh = vm._ensure_ssh_for_env()
             apply_preset(ssh, preset, install_timeout=install_timeout)
             return str(vm.vm_id)
@@ -834,14 +672,12 @@ def _start_preset_with_sdk(
             if vm is not None:
                 vm.close()
 
-    env = guest_customization.sanitize_forwarded_env(dict(os.environ), forward_env)
+    env = guest_setup.sanitize_forwarded_env(dict(os.environ), forward_env)
     temp_home_ctx = None
     if not copy_host_credentials:
         temp_home_ctx = tempfile.TemporaryDirectory(prefix="sbx-no-credentials-")
-        env = guest_customization.credential_free_env(
-            Path(temp_home_ctx.name), forward_env=forward_env
-        )
-        _debug(f"credential-free HOME: {temp_home_ctx.name}")
+        env = guest_setup.credential_free_env(Path(temp_home_ctx.name), forward_env=forward_env)
+        runtime.debug(f"credential-free HOME: {temp_home_ctx.name}")
 
     try:
         with _patched_environ(env):
@@ -863,7 +699,7 @@ def _start_preset_with_sdk(
 
     return _post_start_actions(
         vm_name=vm_name,
-        agent=agent,
+        command=LAUNCH_COMMANDS[agent],
         attach=attach,
         run_user=run_user,
         auth_port=auth_port,
@@ -973,7 +809,7 @@ def _start_local_image(
         vm.start(boot_timeout=boot_timeout)
         vm.wait_for_ssh(timeout=boot_timeout)
         vm_name = vm.vm_id
-        guest_customization.set_hostname(str(vm_name), run_capture=_run_capture)
+        guest_setup.set_hostname(str(vm_name), run_capture=runtime.run_capture)
     except Exception:
         vm.close()
         raise
@@ -990,21 +826,20 @@ def _start_local_image(
         print(f"Started '{vm_name}'.")
     return _post_start_actions(
         vm_name=vm_name,
-        agent=agent,
+        command=launch_command or LAUNCH_COMMANDS[agent],
         attach=attach,
         run_user=run_user,
         auth_port=auth_port,
         auth_host_port=auth_host_port,
         auth_guest_port=auth_guest_port,
         stop_on_exit=stop_on_exit,
-        launch_command=launch_command,
         cwd=cwd,
         git_config_text=git_config_text,
     )
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    rc = _run_smolvm(["doctor", "--backend", DEFAULT_BACKEND])
+    rc = runtime.run_smolvm(["doctor", "--backend", DEFAULT_BACKEND])
     lifecycle_warnings.doctor_config_state(
         getattr(args, "config_data", {}), smolvm_info=_smolvm_info_vm
     )
@@ -1088,14 +923,14 @@ def cmd_start(args: argparse.Namespace) -> int:
     attach = True if args.attach is None else bool(args.attach)
     run_user = _arg_or_config(args, "run_user", config, "sbx")
     if run_user is not None:
-        run_user = _validate_run_user(str(run_user))
+        run_user = guest_setup.validate_run_user(str(run_user))
     copy_host_credentials = bool(
         _arg_or_config(args, "copy_host_credentials", config, "sbx", default=False)
     )
-    forward_env = guest_customization.validate_env_names(
+    forward_env = guest_setup.validate_env_names(
         args.env if args.env is not None else _list_value(sbx_cfg.get("env"), key="[sbx].env")
     )
-    _debug(
+    runtime.debug(
         "run options: "
         f"agent={agent!r}, name={getattr(args, 'name', None)!r}, attach={attach!r}, "
         f"run_user={run_user!r}, copy_host_credentials={copy_host_credentials!r}, "
@@ -1107,7 +942,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     auth_guest_port = int(_arg_or_config(args, "auth_guest_port", config, "sbx", default=1455))
     stop_on_exit = bool(_arg_or_config(args, "stop_on_exit", config, "sbx", default=True))
     git_config = bool(_arg_or_config(args, "git_config", config, "sbx", default=True))
-    git_config_text = guest_customization.host_git_config(project_root) if git_config else None
+    git_config_text = guest_setup.host_git_config(project_root) if git_config else None
     cpus_value = _arg_or_config(args, "cpus", config, "sbx")
     cpus = _validate_cpus(cpus_value) if cpus_value is not None else None
     try:
@@ -1119,9 +954,9 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     requested_name = _arg_or_config(args, "name", config, "sbx")
     if requested_name:
-        requested_name = _validate_vm_name(str(requested_name))
+        requested_name = guest_setup.validate_vm_name(str(requested_name))
         existing_status = _get_existing_vm_status(str(requested_name))
-        _debug(f"existing VM lookup: name={requested_name!r}, status={existing_status!r}")
+        runtime.debug(f"existing VM lookup: name={requested_name!r}, status={existing_status!r}")
         if existing_status is not None:
             if existing_status != "running":
                 try:
@@ -1154,7 +989,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             vm_metadata.record_vm_project(str(requested_name), project_identity)
             return _post_start_actions(
                 vm_name=str(requested_name),
-                agent=str(agent),
+                command=LAUNCH_COMMANDS[str(agent)],
                 attach=attach,
                 run_user=str(run_user) if run_user is not None else None,
                 auth_port=auth_port,
@@ -1243,19 +1078,19 @@ def cmd_start(args: argparse.Namespace) -> int:
         argv.append("--json")
 
     temp_home_ctx = None
-    smolvm_env = guest_customization.sanitize_forwarded_env(dict(os.environ), forward_env)
+    smolvm_env = guest_setup.sanitize_forwarded_env(dict(os.environ), forward_env)
     if not copy_host_credentials:
         temp_home_ctx = tempfile.TemporaryDirectory(prefix="sbx-no-credentials-")
-        smolvm_env = guest_customization.credential_free_env(
+        smolvm_env = guest_setup.credential_free_env(
             Path(temp_home_ctx.name), forward_env=forward_env
         )
-        _debug(f"credential-free HOME: {temp_home_ctx.name}")
+        runtime.debug(f"credential-free HOME: {temp_home_ctx.name}")
 
     if not managed_start:
         try:
-            rc = _run_smolvm(argv, env=smolvm_env)
+            rc = runtime.run_smolvm(argv, env=smolvm_env)
             if rc == 0 and requested_name:
-                guest_customization.set_hostname(str(requested_name), run_capture=_run_capture)
+                guest_setup.set_hostname(str(requested_name), run_capture=runtime.run_capture)
                 _maybe_write_project_config(
                     args, config, vm_name=str(requested_name), agent=str(agent), created=True
                 )
@@ -1265,7 +1100,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             if temp_home_ctx is not None:
                 temp_home_ctx.cleanup()
 
-    completed = _run_smolvm_capture(argv, env=smolvm_env)
+    completed = runtime.run_smolvm_capture(argv, env=smolvm_env)
     if temp_home_ctx is not None:
         temp_home_ctx.cleanup()
     if completed is None:
@@ -1283,7 +1118,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         return completed.returncode
 
     vm_name = _extract_started_vm_name(completed.stdout)
-    guest_customization.set_hostname(vm_name, run_capture=_run_capture)
+    guest_setup.set_hostname(vm_name, run_capture=runtime.run_capture)
     _maybe_write_project_config(args, config, vm_name=vm_name, agent=str(agent), created=True)
     vm_metadata.record_vm_project(vm_name, project_identity)
     if auth_port:
@@ -1299,28 +1134,18 @@ def cmd_start(args: argparse.Namespace) -> int:
     else:
         print(f"Started '{vm_name}'. Auth callback port: localhost:{auth_host_port}")
 
-    if not attach:
-        return 0
-    session_state.register_session(vm_name, "run")
-    try:
-        if run_user is not None:
-            guest_customization.prepare_run_user(vm_name, str(run_user), run_capture=_run_capture)
-            guest_customization.install_git_config(
-                vm_name, str(run_user), git_config_text, run_capture=_run_capture
-            )
-            return guest_customization.attach_as_user(
-                vm_name, str(run_user), LAUNCH_COMMANDS[str(agent)], cwd=project_guest_cwd, run=_run
-            )
-        guest_customization.install_git_config(
-            vm_name, None, git_config_text, run_capture=_run_capture
-        )
-        return guest_customization.attach_as_root(
-            vm_name, LAUNCH_COMMANDS[str(agent)], cwd=project_guest_cwd, run=_run
-        )
-    finally:
-        remaining = session_state.unregister_session(vm_name)
-        _debug(f"unregistered session for {vm_name}; remaining={remaining}")
-        _stop_vm_if_last_session(vm_name, stop_on_exit=stop_on_exit)
+    return _post_start_actions(
+        vm_name=vm_name,
+        command=LAUNCH_COMMANDS[str(agent)],
+        attach=attach,
+        run_user=str(run_user) if run_user is not None else None,
+        auth_port=False,
+        auth_host_port=auth_host_port,
+        auth_guest_port=auth_guest_port,
+        stop_on_exit=stop_on_exit,
+        cwd=project_guest_cwd,
+        git_config_text=git_config_text,
+    )
 
 
 def _confirm_destructive_action(message: str, *, force: bool) -> bool:
@@ -1333,24 +1158,14 @@ def _confirm_destructive_action(message: str, *, force: bool) -> bool:
     return answer in {"y", "yes"}
 
 
-def _vm_name_from_arg_or_config(
-    args: argparse.Namespace, config: Mapping[str, Any], command: str
-) -> str | None:
-    name = getattr(args, "name", None) or _cfg(config, "sbx", "name")
-    if not name:
-        print(f"sbx: {command} requires a VM name argument or [sbx].name", file=sys.stderr)
-        return None
-    return str(name)
-
-
 def cmd_shell(args: argparse.Namespace) -> int:
     config = args.config_data
     project_identity = _project_identity(args, config)
-    name = _vm_name_from_arg_or_config(args, config, "shell")
+    name = runtime.vm_name_from_arg_or_config(args, config, "shell")
     if name is None:
         return 2
     try:
-        forward_env = guest_customization.validate_env_names(
+        forward_env = guest_setup.validate_env_names(
             _list_value(_sbx_config(config).get("env"), key="[sbx].env")
         )
     except ConfigError as exc:
@@ -1358,7 +1173,7 @@ def cmd_shell(args: argparse.Namespace) -> int:
         return 2
     run_user = None if args.root else args.run_user or _cfg(config, "sbx", "run_user")
     if run_user is not None:
-        run_user = _validate_run_user(str(run_user))
+        run_user = guest_setup.validate_run_user(str(run_user))
     project_path = args.project_path or _cfg(config, "sbx", "project_path")
     project_guest_cwd = _project_guest_cwd(project_path)
     smolvm_command = ["sandbox", "ssh", name]
@@ -1368,9 +1183,7 @@ def cmd_shell(args: argparse.Namespace) -> int:
         args.git_config if args.git_config is not None else _cfg(config, "sbx", "git_config", True)
     )
     git_config_text = (
-        guest_customization.host_git_config(Path(project_identity["project_root"]))
-        if git_config
-        else None
+        guest_setup.host_git_config(Path(project_identity["project_root"])) if git_config else None
     )
     try:
         port_forwards = _list_value(
@@ -1384,7 +1197,7 @@ def cmd_shell(args: argparse.Namespace) -> int:
     if (
         run_user is not None or project_guest_cwd is not None or git_config_text is not None
     ) and existing_status is None:
-        print(f"sbx: {guest_customization.missing_vm_message(name)}", file=sys.stderr)
+        print(f"sbx: {runtime.missing_vm_message(name)}", file=sys.stderr)
         return 1
     if existing_status is not None:
         if existing_status != "running":
@@ -1421,39 +1234,38 @@ def cmd_shell(args: argparse.Namespace) -> int:
             return start_rc
     if not _sync_forwarded_env_or_error(name, forward_env):
         return 1
+    if run_user is not None or project_guest_cwd is not None or git_config_text is not None:
+        return _post_start_actions(
+            vm_name=name,
+            command="bash",
+            attach=True,
+            run_user=run_user,
+            auth_port=False,
+            stop_on_exit=stop_on_exit,
+            cwd=project_guest_cwd,
+            git_config_text=git_config_text,
+            session_kind="shell",
+        )
     session_state.register_session(name, "shell")
     try:
-        if run_user is not None:
-            guest_customization.prepare_run_user(name, run_user, run_capture=_run_capture)
-            guest_customization.install_git_config(
-                name, run_user, git_config_text, run_capture=_run_capture
-            )
-            return guest_customization.attach_as_user(
-                name, run_user, "bash", cwd=project_guest_cwd, run=_run
-            )
-        if project_guest_cwd is not None or git_config_text is not None:
-            guest_customization.install_git_config(
-                name, None, git_config_text, run_capture=_run_capture
-            )
-            return guest_customization.attach_as_root(name, "bash", cwd=project_guest_cwd, run=_run)
-        return _run_smolvm(smolvm_command)
+        return runtime.run_smolvm(smolvm_command)
     finally:
         remaining = session_state.unregister_session(name)
-        _debug(f"unregistered session for {name}; remaining={remaining}")
+        runtime.debug(f"unregistered session for {name}; remaining={remaining}")
         _stop_vm_if_last_session(name, stop_on_exit=stop_on_exit)
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
     config = args.config_data
-    name = _vm_name_from_arg_or_config(args, config, "stop")
+    name = runtime.vm_name_from_arg_or_config(args, config, "stop")
     if name is None:
         return 2
-    return _run_smolvm(["sandbox", "stop", name])
+    return runtime.run_smolvm(["sandbox", "stop", name])
 
 
 def cmd_remove(args: argparse.Namespace) -> int:
     config = args.config_data
-    name = _vm_name_from_arg_or_config(args, config, str(args.action))
+    name = runtime.vm_name_from_arg_or_config(args, config, str(args.action))
     if name is None:
         return 2
     if not _confirm_destructive_action(f"Destroy VM '{name}'?", force=args.force):
@@ -1463,7 +1275,7 @@ def cmd_remove(args: argparse.Namespace) -> int:
 
 def _delete_vm(vm_id: str, extra_args: Sequence[str] | None = None) -> int:
     extra = list(extra_args or [])
-    completed = _run_smolvm_capture(["sandbox", "delete", vm_id, *extra, "--json"])
+    completed = runtime.run_smolvm_capture(["sandbox", "delete", vm_id, *extra, "--json"])
     if completed is None:
         return 127
     if completed.stderr:
@@ -1829,17 +1641,15 @@ def _normalize_argv(argv: Sequence[str]) -> list[str]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    global DEBUG
-
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     normalized_argv = _normalize_argv(raw_argv)
     parser = build_parser()
     args = parser.parse_args(normalized_argv)
-    DEBUG = bool(args.debug)
-    _debug(f"argv: {raw_argv}")
+    runtime.DEBUG = bool(args.debug)
+    runtime.debug(f"argv: {raw_argv}")
     if normalized_argv != raw_argv:
-        _debug(f"normalized argv: {normalized_argv}")
+        runtime.debug(f"normalized argv: {normalized_argv}")
     if args.action in {"completion", "image"}:
         args.config_data = {}
     else:

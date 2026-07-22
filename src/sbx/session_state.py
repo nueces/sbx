@@ -1,44 +1,37 @@
-import json
 import os
 from collections.abc import Mapping
 from typing import Any
 
 from sbx.constants import SBX_STATE_DIR, SESSIONS_FILE
-
-
-def pid_is_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+from sbx.runtime import pid_is_alive, read_json_object, write_json_object
 
 
 def load_sessions() -> dict[str, Any]:
-    try:
-        return json.loads(SESSIONS_FILE.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+    return read_json_object(SESSIONS_FILE)
 
 
 def save_sessions(data: Mapping[str, Any]) -> None:
-    SBX_STATE_DIR.mkdir(parents=True, exist_ok=True)
-    SESSIONS_FILE.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_json_object(SESSIONS_FILE, data, state_dir=SBX_STATE_DIR)
+
+
+def live_sessions(raw_sessions: object) -> list[dict[str, Any]]:
+    sessions = (
+        [item for item in raw_sessions if isinstance(item, dict)]
+        if isinstance(raw_sessions, list)
+        else []
+    )
+    return [
+        item
+        for item in sessions
+        if isinstance(item.get("pid"), int) and pid_is_alive(int(item["pid"]))
+    ]
 
 
 def active_sessions(vm_id: str) -> list[dict[str, Any]]:
     data = load_sessions()
     raw_sessions = data.get(vm_id, {}).get("sessions", [])
     sessions = [item for item in raw_sessions if isinstance(item, dict)]
-    active = [
-        item
-        for item in sessions
-        if isinstance(item.get("pid"), int) and pid_is_alive(int(item["pid"]))
-    ]
+    active = live_sessions(raw_sessions)
     if active != sessions:
         if active:
             data.setdefault(vm_id, {})["sessions"] = active

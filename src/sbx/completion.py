@@ -357,10 +357,7 @@ def fish_completion() -> str:
     for option in GLOBAL_OPTIONS:
         lines.append(f"complete -c sbx -f -l {option.removeprefix('--')}")
     for command in COMMANDS:
-        lines.append(
-            "complete -c sbx -f -n '__fish_use_subcommand' "
-            f"-a {command}"
-        )
+        lines.append(f"complete -c sbx -f -n '__fish_use_subcommand' -a {command}")
     for command, options in (
         ("run", RUN_OPTIONS),
         ("create", START_OPTIONS),
@@ -379,10 +376,7 @@ def fish_completion() -> str:
                 f"{_fish_flag(option)}"
             )
     for agent in AGENTS:
-        lines.append(
-            "complete -c sbx -f -n '__fish_seen_argument -l agent' "
-            f"-a {agent}"
-        )
+        lines.append(f"complete -c sbx -f -n '__fish_seen_argument -l agent' -a {agent}")
     network_subcommands = _words(NETWORK_COMMANDS)
     for command in NETWORK_COMMANDS:
         lines.append(
@@ -408,14 +402,10 @@ def fish_completion() -> str:
         )
     for option in IMAGE_BUILD_DEBIAN_OPTIONS:
         lines.append(
-            "complete -c sbx -f -n '__fish_seen_subcommand_from build-debian' "
-            f"{_fish_flag(option)}"
+            f"complete -c sbx -f -n '__fish_seen_subcommand_from build-debian' {_fish_flag(option)}"
         )
     for option in IMAGE_LS_OPTIONS:
-        lines.append(
-            "complete -c sbx -f -n '__fish_seen_subcommand_from ls' "
-            f"{_fish_flag(option)}"
-        )
+        lines.append(f"complete -c sbx -f -n '__fish_seen_subcommand_from ls' {_fish_flag(option)}")
     for shell in COMPLETION_SHELLS:
         lines.append(f"complete -c sbx -f -n '__fish_seen_subcommand_from completion' -a {shell}")
     return "\n".join(lines) + "\n"

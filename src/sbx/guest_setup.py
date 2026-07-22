@@ -5,12 +5,14 @@ import shlex
 import subprocess
 from collections.abc import Callable
 from contextlib import suppress
+from datetime import UTC, datetime
 from pathlib import Path
 
 from sbx import runtime
-from sbx.runtime import ConfigError
+from sbx.runtime import ConfigError, ssh_command
 
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]*[$]?$", re.IGNORECASE)
 VM_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 FORWARDABLE_ENV_VARS = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
 SAFE_GIT_CONFIG_KEYS = (
@@ -31,6 +33,12 @@ def validate_vm_name(name: str) -> str:
             "1-63 chars, no leading/trailing hyphen"
         )
     return name
+
+
+def validate_run_user(user: str) -> str:
+    if not USERNAME_RE.match(user):
+        raise ConfigError("[sbx].run_user must be a valid Linux user name")
+    return user
 
 
 def validate_env_names(names: list[str]) -> list[str]:
@@ -107,27 +115,6 @@ def host_git_config(project_root: Path | None = None) -> str | None:
             lines.append(f'\t{option} = "{escaped}"')
         lines.append("")
     return "\n".join(lines)
-
-
-def missing_vm_message(vm_id: str) -> str:
-    return (
-        f"VM {vm_id!r} not found. `sbx shell` attaches to an existing sandbox; "
-        f"create it with `sbx run {vm_id}` or list VMs with `sbx ls -a`."
-    )
-
-
-def ssh_command(vm_id: str) -> list[str]:
-    from smolvm.exceptions import VMNotFoundError
-    from smolvm.facade import SmolVM
-
-    try:
-        vm = SmolVM.from_id(vm_id)
-    except VMNotFoundError as exc:
-        raise ConfigError(missing_vm_message(vm_id)) from exc
-    try:
-        return list(vm._ssh_direct_command())
-    finally:
-        vm.close()
 
 
 def parse_managed_env_script(text: str) -> dict[str, str]:
@@ -218,6 +205,49 @@ def sync_forwarded_env(
             vm.unset_env_vars(missing)
     finally:
         vm.close()
+
+
+def host_timezone() -> str:
+    zoneinfo = Path("/usr/share/zoneinfo")
+    try:
+        target = Path("/etc/localtime").resolve()
+        return target.relative_to(zoneinfo).as_posix()
+    except (OSError, ValueError):
+        pass
+    try:
+        timezone = Path("/etc/timezone").read_text(encoding="utf-8").strip()
+    except OSError:
+        return "UTC"
+    return timezone or "UTC"
+
+
+def sync_guest_clock(
+    vm_id: str,
+    *,
+    run_capture: Callable[[list[str]], subprocess.CompletedProcess[str] | None] | None = None,
+    ssh: Callable[[str], list[str]] | None = None,
+) -> None:
+    run_capture = run_capture or runtime.run_capture
+    ssh = ssh or ssh_command
+    timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+    timezone = host_timezone()
+    script = f"""
+set -eu
+zone={shlex.quote(timezone)}
+if [ -f "/usr/share/zoneinfo/$zone" ]; then
+  ln -sf "/usr/share/zoneinfo/$zone" /etc/localtime
+  printf '%s\n' "$zone" > /etc/timezone
+fi
+date -u -s {shlex.quote(timestamp)}
+"""
+    cmd = ssh(vm_id)
+    cmd.append("bash -lc " + shlex.quote(script))
+    completed = run_capture(cmd)
+    if completed is None:
+        raise ConfigError("failed to sync VM clock: ssh command not found")
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip() or completed.stdout.strip()
+        raise ConfigError(f"failed to sync VM clock: {stderr}")
 
 
 def set_hostname(
@@ -328,9 +358,10 @@ chown -R {quoted_user}:{quoted_user} {home}
         raise ConfigError(f"failed to prepare run user {user!r}: {stderr}")
 
 
-def attach_as_root(
+def attach(
     vm_id: str,
     launch_command: str,
+    user: str | None = None,
     cwd: str | None = None,
     *,
     run: Callable[[list[str]], int] | None = None,
@@ -338,6 +369,7 @@ def attach_as_root(
 ) -> int:
     from smolvm.env import ENV_FILE
 
+    run = run or runtime.run
     ssh = ssh or ssh_command
     cmd = ssh(vm_id)
     cd_prefix = f"cd {shlex.quote(cwd)} || exit; " if cwd is not None else ""
@@ -346,31 +378,8 @@ def attach_as_root(
         'export PATH="$HOME/.local/bin:$PATH"; '
         f"exec {launch_command}"
     )
-    cmd.insert(-1, "-t")
-    cmd.append(remote)
-    return run(cmd)
-
-
-def attach_as_user(
-    vm_id: str,
-    user: str,
-    launch_command: str,
-    cwd: str | None = None,
-    *,
-    run: Callable[[list[str]], int] | None = None,
-    ssh: Callable[[str], list[str]] | None = None,
-) -> int:
-    from smolvm.env import ENV_FILE
-
-    ssh = ssh or ssh_command
-    cmd = ssh(vm_id)
-    quoted_user = shlex.quote(user)
-    cd_prefix = f"cd {shlex.quote(cwd)} || exit; " if cwd is not None else ""
-    remote = f"sudo -iu {quoted_user} bash -lc " + shlex.quote(
-        f"{cd_prefix}[ -r {ENV_FILE} ] && . {ENV_FILE}; "
-        'export PATH="$HOME/.local/bin:$PATH"; '
-        f"exec {launch_command}"
-    )
+    if user is not None:
+        remote = f"sudo -iu {shlex.quote(user)} bash -lc " + shlex.quote(remote)
     cmd.insert(-1, "-t")
     cmd.append(remote)
     return run(cmd)

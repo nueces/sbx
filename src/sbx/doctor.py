@@ -46,11 +46,7 @@ def doctor_sessions(*, fix: bool) -> None:
     for vm_id, vm_data in list(data.items()):
         raw = vm_data.get("sessions", []) if isinstance(vm_data, dict) else []
         sessions = [item for item in raw if isinstance(item, dict)]
-        active = [
-            item
-            for item in sessions
-            if isinstance(item.get("pid"), int) and session_state.pid_is_alive(int(item["pid"]))
-        ]
+        active = session_state.live_sessions(raw)
         if active == sessions:
             continue
         changed = True

@@ -146,8 +146,7 @@ def existing_vm_config_mismatches(
         if configured is None or existing is None or configured == existing:
             continue
         mismatches.append(
-            f"{config_key}: config requests {configured}{unit}, "
-            f"existing VM has {existing}{unit}"
+            f"{config_key}: config requests {configured}{unit}, existing VM has {existing}{unit}"
         )
     return mismatches
 
