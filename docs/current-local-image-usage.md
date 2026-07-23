@@ -48,12 +48,13 @@ The local image manifest is `smolvm-image.json`:
   "sbx": {
     "agent": "pi",
     "features": ["docker"],
-    "launch_command": "pi"
+    "launch_command": "pi",
+    "run_user": "agent"
   }
 }
 ```
 
-`sbx` reads this manifest to locate the kernel/rootfs, validate the configured agent, and list image features with `sbx image ls`.
+`sbx` reads this manifest to locate the kernel/rootfs, validate the configured agent, default the guest user when CLI/config omit it, and list image features with `sbx image list`. CLI and `[sbx].run_user` override the manifest value.
 
 ## Runtime flow
 
@@ -81,7 +82,7 @@ When `sbx run` starts a missing VM from this image, `sbx`:
 3. creates a SmolVM `VMConfig` using those paths and `comm_channel="ssh"`;
 4. starts the VM through the SmolVM SDK;
 5. waits for SSH readiness;
-6. prepares `run_user`, safe Git config, auth callback forwarding, and project cwd as configured;
+6. prepares the configured or manifest-defaulted `run_user`, safe Git config, auth callback forwarding, and project cwd;
 7. launches the configured agent command, usually `pi`.
 
 In code this path is handled by `src/sbx/cli.py` in `_start_local_image()`.

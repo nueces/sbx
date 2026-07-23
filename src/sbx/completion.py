@@ -16,58 +16,39 @@ COMMANDS = (
     "completion",
 )
 NETWORK_COMMANDS = ("forward", "auth-port", "close-auth-port", "status")
-IMAGE_COMMANDS = ("build", "ls")
+IMAGE_COMMANDS = ("build", "list", "ls")
 AGENTS = ("pi", "claude", "codex")
 
 GLOBAL_OPTIONS = ("--config", "--debug", "--help")
 START_OPTIONS = (
     "--agent",
-    "--name",
     "--memory",
     "--cpus",
     "--disk-size",
-    "--os",
     "--image",
     "--mount",
     "--project-path",
     "--run-user",
     "--env",
-    "--auth-port",
-    "--no-auth-port",
-    "--auth-host-port",
-    "--auth-guest-port",
-    "--copy-host-credentials",
-    "--no-copy-host-credentials",
-    "--git-config",
-    "--no-git-config",
     "--writable-mounts",
-    "--attach",
     "--no-attach",
     "--stop-on-exit",
     "--keep-running",
     "--boot-timeout",
     "--install-timeout",
     "--write-config",
-    "--no-write-config",
     "--json",
     "--help",
 )
-SHELL_OPTIONS = (
-    "--keep-running",
-    "--run-user",
-    "--project-path",
-    "--git-config",
-    "--no-git-config",
-    "--root",
-    "--help",
-)
-LS_OPTIONS = ("--all", "-a", "--help")
+SHELL_OPTIONS = ("--keep-running", "--run-user", "--project-path", "--root", "--help")
+LS_OPTIONS = ("--running", "--json", "--help")
 RM_OPTIONS = ("--force", "--help")
 DOCTOR_OPTIONS = ("--fix", "--help")
 STOP_OPTIONS = ("--help",)
 RUN_OPTIONS = START_OPTIONS
+FORWARD_OPTIONS = ("--name", "--help")
 AUTH_PORT_OPTIONS = ("--guest-port", "--host-port", "--replace", "--help")
-NETWORK_STATUS_OPTIONS = ("--host-port", "--help")
+NETWORK_STATUS_OPTIONS = ("--host-port", "--json", "--help")
 IMAGE_BUILD_OPTIONS = (
     "--name",
     "--base-image",
@@ -115,6 +96,7 @@ def bash_completion() -> str:
     stop_options = _words(STOP_OPTIONS)
     network_commands = _words(NETWORK_COMMANDS)
     image_commands = _words(IMAGE_COMMANDS)
+    forward_options = _words(FORWARD_OPTIONS)
     auth_port_options = _words(AUTH_PORT_OPTIONS)
     network_status_options = _words(NETWORK_STATUS_OPTIONS)
     image_build_options = _words(IMAGE_BUILD_OPTIONS)
@@ -193,7 +175,7 @@ _sbx_complete() {{
             if [[ -z "$subcmd" ]]; then
                 COMPREPLY=( $(compgen -W "{network_commands}" -- "$cur") )
             elif [[ "$subcmd" == "forward" ]]; then
-                COMPREPLY=( $(compgen -W "--help" -- "$cur") )
+                COMPREPLY=( $(compgen -W "{forward_options}" -- "$cur") )
             elif [[ "$subcmd" == "auth-port" ]]; then
                 COMPREPLY=( $(compgen -W "{auth_port_options}" -- "$cur") )
             elif [[ "$subcmd" == "close-auth-port" ]]; then
@@ -214,7 +196,7 @@ _sbx_complete() {{
                 COMPREPLY=( $(compgen -W "{image_commands}" -- "$cur") )
             elif [[ "$subcmd" == "build" ]]; then
                 COMPREPLY=( $(compgen -W "{image_build_options}" -- "$cur") )
-            elif [[ "$subcmd" == "ls" ]]; then
+            elif [[ "$subcmd" == "list" || "$subcmd" == "ls" ]]; then
                 COMPREPLY=( $(compgen -W "{image_ls_options}" -- "$cur") )
             fi
             ;;
@@ -241,6 +223,7 @@ def zsh_completion() -> str:
     doctor_options = _zsh_words(DOCTOR_OPTIONS)
     stop_options = _zsh_words(STOP_OPTIONS)
     network_commands = _zsh_words(NETWORK_COMMANDS)
+    forward_options = _zsh_words(FORWARD_OPTIONS)
     auth_port_options = _zsh_words(AUTH_PORT_OPTIONS)
     network_status_options = _zsh_words(NETWORK_STATUS_OPTIONS)
     image_commands = _zsh_words(IMAGE_COMMANDS)
@@ -252,7 +235,7 @@ def zsh_completion() -> str:
 _sbx() {{
   local -a commands run_options create_options recreate_options shell_options
   local -a ls_options rm_options doctor_options stop_options network_commands
-  local -a auth_port_options network_status_options
+  local -a forward_options auth_port_options network_status_options
   local -a image_commands image_build_options image_ls_options shells
   commands=({commands})
   run_options=({run_options})
@@ -264,6 +247,7 @@ _sbx() {{
   doctor_options=({doctor_options})
   stop_options=({stop_options})
   network_commands=({network_commands})
+  forward_options=({forward_options})
   auth_port_options=({auth_port_options})
   network_status_options=({network_status_options})
   image_commands=({image_commands})
@@ -302,7 +286,7 @@ _sbx() {{
           if (( CURRENT == 3 )); then
             _describe 'network command' network_commands
           elif [[ $words[3] == "forward" ]]; then
-            _describe 'option' '(--help)'
+            _describe 'option' forward_options
           elif [[ $words[3] == "auth-port" ]]; then
             _describe 'option' auth_port_options
           elif [[ $words[3] == "close-auth-port" ]]; then
@@ -318,7 +302,7 @@ _sbx() {{
             _describe 'image command' image_commands
           elif [[ $words[3] == "build" ]]; then
             _describe 'option' image_build_options
-          elif [[ $words[3] == "ls" ]]; then
+          elif [[ $words[3] == "list" || $words[3] == "ls" ]]; then
             _describe 'option' image_ls_options
           else
             _arguments '*: :->args'
@@ -379,7 +363,7 @@ def fish_completion() -> str:
             f"and not __fish_seen_subcommand_from {network_subcommands}' -a {command}"
         )
     for command, options in (
-        ("forward", ("--help",)),
+        ("forward", FORWARD_OPTIONS),
         ("auth-port", AUTH_PORT_OPTIONS),
         ("close-auth-port", ("--help",)),
         ("status", NETWORK_STATUS_OPTIONS),

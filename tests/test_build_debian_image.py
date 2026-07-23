@@ -158,6 +158,7 @@ def test_default_build_always_uses_docker_kernel_and_feature(
     manifest = json.loads((tmp_path / "sbx" / "smolvm-image.json").read_text())
     assert manifest["kernel"] == "vmlinux.bin"
     assert manifest["sbx"]["features"] == ["docker"]
+    assert manifest["sbx"]["run_user"] == "agent"
     output = capsys.readouterr().out
     assert "kernel:" in output
     assert "sbx run the-quest" in output
