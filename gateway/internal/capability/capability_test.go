@@ -68,6 +68,17 @@ func TestCapabilityRejectsAlterationAndExpiry(t *testing.T) {
 	}
 }
 
+func FuzzVerify(f *testing.F) {
+	f.Add("1|vm1|worker1|flow|rule|1|2|AAAAAAAAAAAAAAAA|example.com|443", "password", "example.com", uint16(443))
+	f.Fuzz(func(t *testing.T, username, password, host string, port uint16) {
+		if len(username) > 1024 || len(password) > 1024 || len(host) > 1024 {
+			return
+		}
+		issuer := testIssuer(t, "a", "vm1", "worker1", time.Unix(1, 0))
+		_, _ = issuer.Verify(username, password, host, port)
+	})
+}
+
 func TestCapabilityKeyDescriptorHelpers(t *testing.T) {
 	key, err := GenerateKey()
 	if err != nil || len(key) != KeySize {

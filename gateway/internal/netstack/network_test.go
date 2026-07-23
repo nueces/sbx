@@ -16,3 +16,19 @@ func TestNetworkLifecycle(t *testing.T) {
 	}
 	network.Inject([]byte{0}) // malformed Ethernet input must not panic.
 }
+
+func FuzzInjectEthernetFrame(f *testing.F) {
+	f.Add([]byte{0})
+	f.Add(make([]byte, 14+20))
+	f.Fuzz(func(t *testing.T, frame []byte) {
+		if len(frame) > 65535 {
+			return
+		}
+		network, err := New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		network.Inject(frame)
+		network.Close()
+	})
+}
