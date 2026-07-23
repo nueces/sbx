@@ -33,6 +33,8 @@ GATEWAY_SOURCE_DIR = Path(__file__).resolve().parents[2] / "gateway"
 GATEWAY_WORKER = GATEWAY_SOURCE_DIR / "sbx-gateway"
 GATEWAY_MEDIATOR_PYTHON = GATEWAY_SOURCE_DIR / "mediator" / ".venv" / "bin" / "python"
 GATEWAY_MEDIATOR_LAUNCHER = GATEWAY_SOURCE_DIR / "mediator" / "launch.py"
+MAX_CONFIG_BYTES = 1 << 20
+MAX_LOG_BYTES = 100 * 1024 * 1024
 GUEST_ADDRESS = "192.0.2.2"
 APPROVED_HOOKS = frozenset({"package-audit"})
 _ALLOWED_NETWORK_KEYS = frozenset(
@@ -664,12 +666,18 @@ def _private_directory(path: Path, *, create: bool = False) -> None:
         raise GatewayStateError(f"unsafe gateway state directory: {path}")
 
 
+def _reject_symlink_ancestors(path: Path) -> None:
+    for parent in (path, *path.parents):
+        if parent.exists() and parent.is_symlink():
+            raise GatewayStateError(f"unsafe gateway state parent: {parent}")
+
+
 def _state_root(root: Path | None = None) -> Path:
     selected = GATEWAY_STATE_DIR if root is None else root
     parent = selected.parent
-    if parent.exists() and parent.is_symlink():
-        raise GatewayStateError(f"unsafe gateway state parent: {parent}")
+    _reject_symlink_ancestors(parent)
     parent.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_ancestors(parent)
     _private_directory(selected, create=True)
     return selected
 
@@ -677,6 +685,8 @@ def _state_root(root: Path | None = None) -> Path:
 def _atomic_json(directory: Path, name: str, data: Mapping[str, Any]) -> None:
     _private_directory(directory)
     encoded = (json.dumps(data, indent=2, sort_keys=True) + "\n").encode()
+    if len(encoded) > MAX_CONFIG_BYTES:
+        raise GatewayStateError(f"gateway state is too large: {directory / name}")
     directory_fd = os.open(
         directory,
         os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
@@ -951,6 +961,52 @@ class GatewayAuthenticationError(GatewayLifecycleError):
     pass
 
 
+def _resolve_artifact(
+    environment_name: str,
+    candidates: Sequence[Path | str | None],
+    *,
+    executable: bool,
+    label: str,
+) -> Path:
+    override = os.environ.get(environment_name)
+    selected = (override,) if override is not None else candidates
+    for candidate in selected:
+        if candidate is None:
+            continue
+        path = Path(candidate).expanduser()
+        if override is not None and not path.is_absolute():
+            break
+        try:
+            resolved = path.resolve(strict=True)
+            info = resolved.stat()
+        except OSError:
+            continue
+        if (
+            stat.S_ISREG(info.st_mode)
+            and not stat.S_IMODE(info.st_mode) & 0o022
+            and (not executable or os.access(resolved, os.X_OK))
+        ):
+            return path.absolute()
+    raise GatewayLifecycleError(f"{label} is missing or unsafe")
+
+
+def _sanitized_child_environment(directory: Path) -> dict[str, str]:
+    return {
+        "HOME": str(directory),
+        "LANG": "C.UTF-8",
+        "PATH": os.defpath,
+        "TZ": "UTC",
+    }
+
+
+def _hardening_ready(value: object, platform: str) -> bool:
+    if platform == "darwin":
+        return isinstance(value, str)
+    return isinstance(value, str) and {"no_new_privs", "seccomp", "rlimits"} <= set(
+        value.split(",")
+    )
+
+
 class GatewayController:
     """Own one gateway incarnation from reserved listeners through teardown."""
 
@@ -992,6 +1048,7 @@ class GatewayController:
         self._mediator_policy_payload: bytes | None = None
         self._immutable_policy: bytes | None = None
         self._qemu_pid: int | None = None
+        self._warned_hardening = False
         self.mediator_address: str | None = None
         self.worker_incarnation = uuid.uuid4().hex
         self._incarnation_token = secrets.token_bytes(32)
@@ -1015,11 +1072,22 @@ class GatewayController:
 
     def _open_log(self, name: str) -> BinaryIO:
         assert self.directory is not None
+        _private_directory(self.directory)
+        if not name.endswith(".log") or "/" in name or "\\" in name:
+            raise GatewayLifecycleError("invalid gateway log name")
+        size = sum(
+            entry.stat(follow_symlinks=False).st_size
+            for entry in os.scandir(self.directory)
+            if entry.is_file(follow_symlinks=False) and entry.name.endswith(".log")
+        )
+        if size >= MAX_LOG_BYTES:
+            raise GatewayLifecycleError("gateway log limit is exhausted")
         fd = os.open(
             self.directory / name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
             0o600,
         )
+        os.fchmod(fd, 0o600)
         stream = os.fdopen(fd, "wb", buffering=0)
         self._logs.append(stream)
         return stream
@@ -1029,6 +1097,13 @@ class GatewayController:
         try:
             listener.bind(str(self.qemu_socket))
             os.chmod(self.qemu_socket, 0o600)
+            info = self.qemu_socket.lstat()
+            if (
+                not stat.S_ISSOCK(info.st_mode)
+                or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+            ):
+                raise GatewayLifecycleError("unsafe gateway QEMU socket")
             listener.listen()
         except BaseException:
             listener.close()
@@ -1140,10 +1215,18 @@ class GatewayController:
 
     def _mediator_command(self, key_fd: int, ready_fd: int, policy_fd: int) -> list[str]:
         assert self.directory is not None
-        python = Path(os.environ.get("SBX_GATEWAY_MEDIATOR_PYTHON", GATEWAY_MEDIATOR_PYTHON))
-        launcher = Path(os.environ.get("SBX_GATEWAY_MEDIATOR_LAUNCHER", GATEWAY_MEDIATOR_LAUNCHER))
-        if not python.is_file() or not launcher.is_file():
-            raise GatewayLifecycleError("pinned gateway mediator runtime is missing")
+        python = _resolve_artifact(
+            "SBX_GATEWAY_MEDIATOR_PYTHON",
+            (GATEWAY_MEDIATOR_PYTHON, shutil.which("python3.12")),
+            executable=True,
+            label="pinned gateway mediator runtime",
+        )
+        launcher = _resolve_artifact(
+            "SBX_GATEWAY_MEDIATOR_LAUNCHER",
+            (GATEWAY_MEDIATOR_LAUNCHER,),
+            executable=False,
+            label="gateway mediator launcher",
+        )
         return [
             str(python),
             str(launcher),
@@ -1159,13 +1242,18 @@ class GatewayController:
             str(policy_fd),
             "--confdir",
             str(self.directory),
+            "--open-files",
+            str(self.config.quotas.open_files),
         ]
 
     def _worker_command(self, key_fd: int | None, token_fd: int) -> list[str]:
         assert self.directory is not None
-        worker = Path(os.environ.get("SBX_GATEWAY_BIN", GATEWAY_WORKER))
-        if not worker.is_file():
-            raise GatewayLifecycleError("exact gateway worker artifact is missing")
+        worker = _resolve_artifact(
+            "SBX_GATEWAY_BIN",
+            (GATEWAY_WORKER, shutil.which("sbx-gateway")),
+            executable=True,
+            label="exact gateway worker artifact",
+        )
         policy = _read_json(self.directory / "policy.json")
         digest = policy.get("digest")
         if not isinstance(digest, str):
@@ -1296,7 +1384,9 @@ class GatewayController:
                     stdout=self._open_log(f"mediator-{self.worker_incarnation}.log"),
                     stderr=subprocess.STDOUT,
                     pass_fds=(mediator_key, ready_write, mediator_policy_fd),
+                    close_fds=True,
                     start_new_session=True,
+                    env=_sanitized_child_environment(self.directory),
                 )
                 self.processes["mediator"] = mediator
             finally:
@@ -1328,8 +1418,19 @@ class GatewayController:
             or ready.get("pid") != mediator.pid
             or ready.get("vm_id") != self.vm_id
             or ready.get("incarnation") != self.worker_incarnation
+            or not _hardening_ready(ready.get("hardening"), self.config.platform)
         ):
             raise GatewayAuthenticationError("mediator readiness identity mismatch")
+        if (
+            self.config.platform == "linux"
+            and "landlock-unavailable" in ready["hardening"]
+            and not self._warned_hardening
+        ):
+            print(
+                "sbx: warning: Landlock is unavailable; gateway filesystem confinement is reduced",
+                file=sys.stderr,
+            )
+            self._warned_hardening = True
         self.mediator_address = f"127.0.0.1:{ready['port']}"
 
         has_http = any(rule.protocol == "http" for rule in self.config.rules)
@@ -1346,7 +1447,9 @@ class GatewayController:
                 pass_fds=(qemu_fd, token_fd, *ingress_fds)
                 if worker_key is None
                 else (qemu_fd, token_fd, worker_key, *ingress_fds),
+                close_fds=True,
                 start_new_session=True,
+                env=_sanitized_child_environment(self.directory),
             )
             self.processes["worker"] = worker
             self._worker_stdout = worker.stdout
@@ -1367,6 +1470,7 @@ class GatewayController:
             )
             or ready.get("mediator") is not has_http
             or ready.get("ingress") != len(self.listener_rules)
+            or not _hardening_ready(ready.get("hardening"), self.config.platform)
         ):
             raise GatewayAuthenticationError("worker readiness identity mismatch")
 
@@ -1415,7 +1519,9 @@ class GatewayController:
         if self.directory is None:
             raise GatewayLifecycleError("gateway has not been prepared")
         try:
-            self._read_worker_status("network-ready")
+            ready = self._read_worker_status("network-ready")
+            if self.config.platform == "linux" and ready.get("qemu_pid") != qemu_pid:
+                raise GatewayAuthenticationError("QEMU peer process identity mismatch")
             if any(process.poll() is not None for process in self.processes.values()):
                 raise GatewayLifecycleError("gateway component exited during startup")
             self._qemu_pid = qemu_pid
@@ -1465,7 +1571,13 @@ class GatewayController:
                     if time.monotonic() >= deadline:
                         raise GatewayLifecycleError("replacement worker readiness timed out")
                     self._start_data_plane(deadline)
-                    self._read_worker_status("network-ready", deadline)
+                    ready = self._read_worker_status("network-ready", deadline)
+                    if (
+                        self.config.platform == "linux"
+                        and self._qemu_pid is not None
+                        and ready.get("qemu_pid") != self._qemu_pid
+                    ):
+                        raise GatewayAuthenticationError("QEMU peer process identity mismatch")
                     if any(process.poll() is not None for process in self.processes.values()):
                         raise GatewayLifecycleError("replacement component exited during readiness")
                     update_state(self.directory, status="ready", pids=self._process_ids())
@@ -1486,6 +1598,11 @@ class GatewayController:
             worker = self.processes.get("worker")
             mediator = self.processes.get("mediator")
             try:
+                if (
+                    self.directory is not None
+                    and read_state(self.directory)["status"] == "draining"
+                ):
+                    return
                 if worker is not None and worker.poll() is not None:
                     self.recover()
                 elif mediator is not None and mediator.poll() is not None:
@@ -1633,6 +1750,7 @@ def stop(vm_id: str, *, root: Path | None = None) -> None:
     if directory is None:
         return
     state = read_state(directory, vm_id=vm_id)
+    update_state(directory, status="draining")
     for component in ("worker", "mediator"):
         pid = state["pids"].get(component)
         if pid is None or not _pid_is_running(pid):

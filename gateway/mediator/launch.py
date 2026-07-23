@@ -10,6 +10,8 @@ import stat
 import sys
 from pathlib import Path
 
+from hardening import apply, close_unexpected_fds, sanitized_environment
+
 MITMPROXY_VERSION = "12.2.3"
 PYTHON_VERSION = (3, 12, 13)
 
@@ -73,6 +75,7 @@ def main() -> None:
     parser.add_argument("--policy-fd", type=_fd)
     parser.add_argument("--confdir", required=True, type=Path)
     parser.add_argument("--upstream-ca", type=Path)
+    parser.add_argument("--open-files", type=int, default=4096)
     args = parser.parse_args()
     if sys.version_info[:3] != PYTHON_VERSION:
         raise RuntimeError("mediator requires CPython 3.12.13")
@@ -80,19 +83,27 @@ def main() -> None:
         raise RuntimeError("mediator requires mitmproxy 12.2.3")
     confdir = _private_directory(args.confdir)
     upstream_ca = args.upstream_ca.resolve(strict=True) if args.upstream_ca else None
+    if not 64 <= args.open_files <= 4096:
+        raise RuntimeError("mediator open-file limit must be between 64 and 4096")
     os.umask(0o077)
-    environment = os.environ.copy()
-    environment.update(
-        SBX_GATEWAY_KEY_FD=str(args.key_fd),
-        SBX_GATEWAY_READY_FD=str(args.ready_fd),
-        SBX_GATEWAY_VM_ID=args.vm_id,
-        SBX_GATEWAY_INCARNATION=args.incarnation,
-    )
-    if args.package_auth_fd is not None:
-        environment["SBX_GATEWAY_PACKAGE_AUTH_FD"] = str(args.package_auth_fd)
-    if args.policy_fd is not None:
-        environment["SBX_GATEWAY_POLICY_FD"] = str(args.policy_fd)
+    os.chdir(confdir)
     argv = command(confdir, upstream_ca)
+    status = apply(confdir, args.open_files)
+    values = {
+        "SBX_GATEWAY_KEY_FD": str(args.key_fd),
+        "SBX_GATEWAY_READY_FD": str(args.ready_fd),
+        "SBX_GATEWAY_VM_ID": args.vm_id,
+        "SBX_GATEWAY_INCARNATION": args.incarnation,
+    }
+    preserve = {args.key_fd, args.ready_fd}
+    if args.package_auth_fd is not None:
+        values["SBX_GATEWAY_PACKAGE_AUTH_FD"] = str(args.package_auth_fd)
+        preserve.add(args.package_auth_fd)
+    if args.policy_fd is not None:
+        values["SBX_GATEWAY_POLICY_FD"] = str(args.policy_fd)
+        preserve.add(args.policy_fd)
+    environment = sanitized_environment(confdir, status, values)
+    close_unexpected_fds(preserve)
     os.execve(argv[0], argv, environment)
 
 

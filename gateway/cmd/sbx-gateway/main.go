@@ -19,20 +19,32 @@ import (
 
 	"github.com/nueces/sbx/gateway/internal/capability"
 	"github.com/nueces/sbx/gateway/internal/config"
+	"github.com/nueces/sbx/gateway/internal/hardening"
 	gatewaynet "github.com/nueces/sbx/gateway/internal/netstack"
 	"github.com/nueces/sbx/gateway/internal/qemustream"
 	"github.com/nueces/sbx/gateway/internal/syntheticdns"
+	"golang.org/x/sys/unix"
 )
 
-func readConfig(path string) ([]byte, error) {
-	info, err := os.Lstat(path)
+func readConfig(path string, private bool) ([]byte, error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, err
 	}
-	if info.Mode()&os.ModeSymlink != 0 || info.Size() > 1<<20 {
+	file := os.NewFile(uintptr(fd), "worker-config")
+	if file == nil {
+		unix.Close(fd)
 		return nil, errors.New("unsafe config file")
 	}
-	return os.ReadFile(path)
+	defer file.Close()
+	var info unix.Stat_t
+	if err := unix.Fstat(fd, &info); err != nil {
+		return nil, err
+	}
+	if info.Mode&unix.S_IFMT != unix.S_IFREG || info.Size > 1<<20 || private && (info.Uid != uint32(os.Getuid()) || info.Mode&0o777 != 0o600) {
+		return nil, errors.New("unsafe config file")
+	}
+	return io.ReadAll(io.LimitReader(file, 1<<20+1))
 }
 
 type stringFlags []string
@@ -71,7 +83,9 @@ func inheritedQEMUListener(fd int, path string) (net.Listener, error) {
 	}
 	address, ok := listener.Addr().(*net.UnixAddr)
 	info, pathErr := os.Lstat(path)
-	if !ok || address.Name != path || pathErr != nil || info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 {
+	var systemInfo unix.Stat_t
+	statErr := unix.Lstat(path, &systemInfo)
+	if !ok || address.Name != path || pathErr != nil || statErr != nil || info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 || info.Mode().Perm() != 0o600 || systemInfo.Uid != uint32(os.Getuid()) {
 		listener.Close()
 		return nil, errors.New("controller QEMU listener ownership mismatch")
 	}
@@ -96,7 +110,7 @@ func run() error {
 	if *configPath == "" || !filepath.IsAbs(*configPath) {
 		return errors.New("--config must be an absolute path")
 	}
-	data, err := readConfig(*configPath)
+	data, err := readConfig(*configPath, !*prepare)
 	if err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
@@ -163,6 +177,7 @@ func run() error {
 		primed[rule.Host] = true
 	}
 	var mediator *gatewaynet.Mediator
+	allowedPorts := make([]uint16, 0, len(cfg.Rules)+1)
 	for _, rule := range cfg.Rules {
 		if rule.Protocol != "http" {
 			continue
@@ -183,7 +198,19 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("mediator: %w", err)
 		}
+		_, rawPort, _ := net.SplitHostPort(*mediatorAddress)
+		port, _ := net.LookupPort("tcp", rawPort)
+		allowedPorts = append(allowedPorts, uint16(port))
 		break
+	}
+	for _, rule := range cfg.Rules {
+		if rule.Protocol != "http" {
+			allowedPorts = append(allowedPorts, rule.Ports...)
+		}
+	}
+	hardeningStatus, err := hardening.Apply(cfg.Quotas.OpenFiles, allowedPorts)
+	if err != nil {
+		return fmt.Errorf("hardening: %w", err)
 	}
 	dhcp, err := network.ServeDHCP()
 	if err != nil {
@@ -200,7 +227,7 @@ func run() error {
 		"status": "ready", "version": 1, "vm_id": cfg.VMID,
 		"generation": cfg.Generation, "digest": cfg.Digest, "incarnation": *workerIncarnation,
 		"incarnation_proof": proof, "mediator": mediator != nil,
-		"ingress": len(registeredIngress),
+		"ingress": len(registeredIngress), "hardening": hardeningStatus.Encode(),
 	}); err != nil {
 		return fmt.Errorf("readiness: %w", err)
 	}
@@ -209,6 +236,10 @@ func run() error {
 		return fmt.Errorf("accept: %w", err)
 	}
 	defer conn.Close()
+	qemuPID, err := peerPID(conn)
+	if err != nil {
+		return fmt.Errorf("QEMU peer identity: %w", err)
+	}
 	stream := qemustream.New(conn, 600*time.Second)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -226,7 +257,7 @@ func run() error {
 			networkReady.Do(func() {
 				ingress.DiscardPending()
 				outputMu.Lock()
-				fmt.Fprintln(os.Stdout, `{"status":"network-ready"}`)
+				fmt.Fprintf(os.Stdout, "{\"status\":\"network-ready\",\"qemu_pid\":%d}\n", qemuPID)
 				outputMu.Unlock()
 				ingress.Start()
 			})

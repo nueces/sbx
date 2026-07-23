@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/nueces/sbx/gateway/internal/config"
@@ -21,6 +23,39 @@ func TestIncarnationProofBindsEveryIdentity(t *testing.T) {
 	}
 	if proof == incarnationProof([]byte("abcdefghijabcdefghijabcdefghijkl"), "vm1", "g1", "digest", "worker1") {
 		t.Fatal("incarnation proof accepted another token")
+	}
+}
+
+func TestReadConfigRejectsSymlinkPermissionsAndOversize(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "policy.json")
+	if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readConfig(path, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readConfig(path, true); err == nil {
+		t.Fatal("accepted non-private runtime config")
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(directory, "link.json")
+	if err := os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readConfig(link, true); err == nil {
+		t.Fatal("accepted symlink config")
+	}
+	if err := os.Truncate(path, 1<<20+1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readConfig(path, true); err == nil {
+		t.Fatal("accepted oversized config")
 	}
 }
 

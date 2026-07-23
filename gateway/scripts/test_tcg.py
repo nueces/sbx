@@ -29,7 +29,26 @@ PLACEHOLDER = "SBX_SECRET_package_" + "p" * 43
 FAKE_TOKEN = "fake-real-token-task10"
 COMMAND_TIMEOUT = 10
 PROCESS_STOP_TIMEOUT = 5
-INTEGRATION_TIMEOUT = 120
+INTEGRATION_TIMEOUT = 180
+MAX_TRANSCRIPT_BYTES = 1024 * 1024
+
+
+def tool(environment: str, *names: str) -> str:
+    override = os.environ.get(environment)
+    if override:
+        path = Path(override).expanduser().absolute()
+        target = path.resolve(strict=True)
+        require(target.is_file() and os.access(target, os.X_OK), f"unsafe {environment} tool")
+        return str(path)
+    for name in names:
+        resolved = shutil.which(name)
+        if resolved:
+            return str(Path(resolved).absolute())
+    raise SystemExit(f"required tool is missing: {', '.join(names)}")
+
+
+def child_environment(home: Path) -> dict[str, str]:
+    return {"HOME": str(home), "LANG": "C.UTF-8", "PATH": os.defpath, "TZ": "UTC"}
 
 
 def require(condition: bool, message: str) -> None:
@@ -60,8 +79,11 @@ def echo_server(listener: socket.socket, stop: threading.Event) -> None:
         except OSError:
             return
         with conn:
-            while data := conn.recv(65536):
-                conn.sendall(data)
+            try:
+                while data := conn.recv(65536):
+                    conn.sendall(data)
+            except OSError:
+                continue
 
 
 class PackageHandler(BaseHTTPRequestHandler):
@@ -96,7 +118,7 @@ def package_server(runtime: Path) -> tuple[ThreadingHTTPServer, Path]:
     key = runtime / "upstream-key.pem"
     subprocess.run(
         [
-            "openssl",
+            tool("SBX_OPENSSL_BIN", "openssl"),
             "req",
             "-x509",
             "-newkey",
@@ -136,6 +158,11 @@ def start_mediator(
     incarnation: str = "worker1",
 ) -> tuple[subprocess.Popen[str], dict[str, object], Path]:
     mediator_dir = Path(__file__).parents[1] / "mediator"
+    python = tool(
+        "SBX_GATEWAY_MEDIATOR_PYTHON",
+        str(mediator_dir / ".venv/bin/python"),
+        "python3.12",
+    )
     confdir = runtime / "mediator"
     confdir.mkdir(mode=0o700, exist_ok=True)
     helper = runtime / "token-helper"
@@ -163,7 +190,7 @@ def start_mediator(
     os.close(auth_write)
     process = subprocess.Popen(
         [
-            str(mediator_dir / ".venv/bin/python"),
+            python,
             str(mediator_dir / "launch.py"),
             "--vm-id",
             "tcg-test",
@@ -179,12 +206,15 @@ def start_mediator(
             str(confdir),
             "--upstream-ca",
             str(upstream_ca),
+            "--open-files",
+            "4096",
         ],
         pass_fds=(key_read, ready_write, auth_read),
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=True,
+        env=child_environment(runtime),
     )
     PROCESSES.append(process)
     os.close(key_read)
@@ -252,6 +282,7 @@ def start_worker(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         start_new_session=True,
+        env=child_environment(config.parent),
     )
     os.close(token_read)
     os.close(key_read)
@@ -286,16 +317,25 @@ def terminate(process: subprocess.Popen[str] | None) -> None:
 
 def main() -> int:
     require(platform.system() == "Linux", "required Linux TCG test unavailable")
-    qemu = shutil.which("qemu-system-x86_64")
-    require(qemu is not None, "qemu-system-x86_64 is required")
+    qemu = tool("SBX_QEMU_BIN", "qemu-system-x86_64")
     accelerators = subprocess.check_output(
         [qemu, "-accel", "help"], text=True, timeout=COMMAND_TIMEOUT
     )
     require("tcg" in accelerators.split(), "QEMU TCG accelerator is required")
 
-    gateway = Path(os.environ.get("SBX_GATEWAY_BIN", Path(__file__).parents[1] / "sbx-gateway"))
-    require(gateway.is_file(), f"build the worker first: {gateway}")
-    manifest_path = Path.home() / ".smolvm/images/rootless-gateway-test/smolvm-image.json"
+    gateway = Path(
+        tool(
+            "SBX_GATEWAY_BIN",
+            str(Path(__file__).parents[1] / "sbx-gateway"),
+            "sbx-gateway",
+        )
+    )
+    manifest_path = Path(
+        os.environ.get(
+            "SBX_GATEWAY_TEST_IMAGE",
+            Path.home() / ".smolvm/images/rootless-gateway-test/smolvm-image.json",
+        )
+    ).expanduser()
     require(manifest_path.is_file(), "run gateway/scripts/build_test_guest.sh first")
     manifest = json.loads(manifest_path.read_text())
     kernel = (
@@ -424,6 +464,7 @@ def main() -> int:
             timeout=COMMAND_TIMEOUT,
         )
         config.write_text(prepared)
+        config.chmod(0o600)
         digest = json.loads(prepared)["digest"]
         worker = start_worker(
             gateway,
@@ -447,6 +488,8 @@ def main() -> int:
         )
         command = [
             qemu,
+            "-sandbox",
+            "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny",
             "-nodefaults",
             "-serial",
             "stdio",
@@ -488,6 +531,7 @@ def main() -> int:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            env=child_environment(runtime),
         )
         PROCESSES.append(qemu_process)
         transcript: list[str] = []
@@ -509,6 +553,11 @@ def main() -> int:
             if not selector.select(timeout=1):
                 continue
             chunk = os.read(qemu_process.stdout.fileno(), 65536).decode(errors="replace")
+            require(
+                sum(len(value.encode()) for value in transcript) + len(chunk.encode())
+                <= MAX_TRANSCRIPT_BYTES,
+                "QEMU transcript exceeded its bounded log limit",
+            )
             transcript.append(chunk)
             output = "".join(transcript)
             if "GATEWAY_INGRESS_READY" in output and not ingress_complete:
@@ -546,9 +595,14 @@ def main() -> int:
                 )
                 require(PLACEHOLDER not in repr(package.records), "placeholder reached upstream")  # type: ignore[attr-defined]
                 process_material = b""
+                protected_metadata = 0
                 for process in (worker, mediator, qemu_process):
-                    process_material += Path(f"/proc/{process.pid}/cmdline").read_bytes()
-                    process_material += Path(f"/proc/{process.pid}/environ").read_bytes()
+                    for name in ("cmdline", "environ"):
+                        try:
+                            process_material += Path(f"/proc/{process.pid}/{name}").read_bytes()
+                        except PermissionError:
+                            protected_metadata += 1
+                require(protected_metadata >= 1, "hardened process metadata remained readable")
                 state_material = b"".join(
                     path.read_bytes() for path in runtime.rglob("*") if path.is_file()
                 )
@@ -612,17 +666,26 @@ def main() -> int:
                 initial_complete = True
 
             if "GATEWAY_RECOVERY_INGRESS_READY" in output and not recovery_ingress_complete:
-                connection = http.client.HTTPConnection(
-                    "127.0.0.1", ingress_listeners[0].getsockname()[1], timeout=10
-                )
-                connection.request("GET", "/recovered")
-                response = connection.getresponse()
-                require(
-                    response.status == 200 and response.read() == b"recovered-ingress",
-                    "replacement ingress flow failed",
-                )
-                connection.close()
-                recovery_ingress_complete = True
+                retry_deadline = time.monotonic() + COMMAND_TIMEOUT
+                while time.monotonic() < retry_deadline:
+                    connection = http.client.HTTPConnection(
+                        "127.0.0.1", ingress_listeners[0].getsockname()[1], timeout=1
+                    )
+                    try:
+                        connection.request("GET", "/recovered")
+                        response = connection.getresponse()
+                        if response.status == 200 and response.read() == b"recovered-ingress":
+                            recovery_ingress_complete = True
+                            break
+                    except OSError:
+                        time.sleep(0.1)
+                    finally:
+                        connection.close()
+                if not recovery_ingress_complete:
+                    if worker.stdout is not None and select.select([worker.stdout], [], [], 0)[0]:
+                        print(os.read(worker.stdout.fileno(), 65536), file=sys.stderr)
+                    print("".join(transcript), end="", file=sys.stderr)
+                    raise SystemExit("replacement ingress flow failed")
                 transcript.append("GATEWAY_RECOVERY_INGRESS_PASS\n")
 
             if "GATEWAY_RECOVERY_PASS" in output:
