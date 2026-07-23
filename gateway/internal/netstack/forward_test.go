@@ -2,6 +2,7 @@ package netstack
 
 import (
 	"context"
+	"io"
 	"net"
 	"testing"
 
@@ -18,6 +19,45 @@ func TestForwarderQuotas(t *testing.T) {
 		t.Fatal("flow quota was not released")
 	}
 	f.release("example.com")
+}
+
+func tcpPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
+	t.Helper()
+	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted := make(chan *net.TCPConn, 1)
+	go func() { conn, _ := listener.AcceptTCP(); accepted <- conn }()
+	client, err := net.DialTCP("tcp", nil, listener.Addr().(*net.TCPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := <-accepted
+	listener.Close()
+	return client, server
+}
+
+func TestRelayStreamsAndHalfCloses(t *testing.T) {
+	guestApp, guestRelay := tcpPair(t)
+	upstreamRelay, upstreamApp := tcpPair(t)
+	result := make(chan [2]uint64, 1)
+	go func() { up, down := relay(guestRelay, upstreamRelay); result <- [2]uint64{up, down} }()
+	_, _ = guestApp.Write([]byte("upload"))
+	_ = guestApp.CloseWrite()
+	if got, _ := io.ReadAll(upstreamApp); string(got) != "upload" {
+		t.Fatalf("upload %q", got)
+	}
+	_, _ = upstreamApp.Write([]byte("download"))
+	_ = upstreamApp.CloseWrite()
+	if got, _ := io.ReadAll(guestApp); string(got) != "download" {
+		t.Fatalf("download %q", got)
+	}
+	if counts := <-result; counts != [2]uint64{6, 8} {
+		t.Fatalf("counts %v", counts)
+	}
+	guestApp.Close()
+	upstreamApp.Close()
 }
 
 func TestDialRejectsForbiddenAddressUnlessExplicit(t *testing.T) {

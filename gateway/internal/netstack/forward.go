@@ -1,13 +1,16 @@
 package netstack
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nueces/sbx/gateway/internal/config"
@@ -18,12 +21,22 @@ import (
 )
 
 type TCPForwarder struct {
-	config   config.Config
-	resolver *syntheticdns.Resolver
-	total    chan struct{}
-	mu       sync.Mutex
-	perDest  map[string]int
-	dialer   net.Dialer
+	config     config.Config
+	resolver   *syntheticdns.Resolver
+	total      chan struct{}
+	mu         sync.Mutex
+	perDest    map[string]int
+	dialer     net.Dialer
+	uploaded   atomic.Uint64
+	downloaded atomic.Uint64
+}
+
+type ForwardStats struct {
+	Uploaded, Downloaded uint64
+}
+
+func (f *TCPForwarder) Stats() ForwardStats {
+	return ForwardStats{Uploaded: f.uploaded.Load(), Downloaded: f.downloaded.Load()}
 }
 
 func (n *Network) ForwardTCP(cfg config.Config, resolver *syntheticdns.Resolver) *TCPForwarder {
@@ -105,7 +118,9 @@ func (f *TCPForwarder) forward(request *tcp.ForwarderRequest, rule config.Rule, 
 		return
 	}
 	guest := gonet.NewTCPConn(&wq, endpoint)
-	relay(guest, upstream)
+	uploaded, downloaded := relay(guest, upstream)
+	f.uploaded.Add(uploaded)
+	f.downloaded.Add(downloaded)
 }
 
 func (f *TCPForwarder) dial(ctx context.Context, rule config.Rule, host string, port uint16) (net.Conn, error) {
@@ -127,19 +142,43 @@ func (f *TCPForwarder) dial(ctx context.Context, rule config.Rule, host string, 
 
 type closeWriter interface{ CloseWrite() error }
 
-func relay(a, b net.Conn) {
+func relay(guest, upstream net.Conn) (uint64, uint64) {
 	var wg sync.WaitGroup
-	copyOne := func(dst, src net.Conn) {
+	var uploaded, downloaded uint64
+	copyOne := func(dst, src net.Conn, count *uint64) {
 		defer wg.Done()
-		_, _ = io.Copy(dst, src)
+		*count, _ = copyIdle(dst, src, 600*time.Second)
 		if closer, ok := dst.(closeWriter); ok {
 			_ = closer.CloseWrite()
 		}
 	}
 	wg.Add(2)
-	go copyOne(a, b)
-	go copyOne(b, a)
+	go copyOne(upstream, guest, &uploaded)
+	go copyOne(guest, upstream, &downloaded)
 	wg.Wait()
-	_ = a.Close()
-	_ = b.Close()
+	_ = guest.Close()
+	_ = upstream.Close()
+	return uploaded, downloaded
+}
+
+func copyIdle(dst, src net.Conn, idle time.Duration) (uint64, error) {
+	buffer := make([]byte, 32*1024)
+	var copied uint64
+	for {
+		_ = src.SetReadDeadline(time.Now().Add(idle))
+		n, err := src.Read(buffer)
+		if n != 0 {
+			_ = dst.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if _, writeErr := io.CopyN(dst, bytes.NewReader(buffer[:n]), int64(n)); writeErr != nil {
+				return copied, writeErr
+			}
+			copied += uint64(n)
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return copied, nil
+			}
+			return copied, err
+		}
+	}
 }
