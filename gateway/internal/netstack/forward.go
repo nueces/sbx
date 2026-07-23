@@ -44,15 +44,19 @@ func (f *TCPForwarder) handle(request *tcp.ForwarderRequest) {
 		return
 	}
 	host := ip.String()
-	if synthetic, found := f.resolver.Host(ip); found {
-		host = synthetic
+	synthetic := false
+	if name, found := f.resolver.Acquire(ip); found {
+		host, synthetic = name, true
 	}
 	rule, allowed := f.config.Match("tcp", host, id.LocalPort)
 	if !allowed || !f.acquire(host) {
+		if synthetic {
+			f.resolver.Release(ip)
+		}
 		request.Complete(true)
 		return
 	}
-	go f.forward(request, rule, host, id.LocalPort)
+	go f.forward(request, rule, host, id.LocalPort, ip, synthetic)
 }
 
 func (f *TCPForwarder) acquire(host string) bool {
@@ -81,8 +85,11 @@ func (f *TCPForwarder) release(host string) {
 	<-f.total
 }
 
-func (f *TCPForwarder) forward(request *tcp.ForwarderRequest, rule config.Rule, host string, port uint16) {
+func (f *TCPForwarder) forward(request *tcp.ForwarderRequest, rule config.Rule, host string, port uint16, syntheticIP netip.Addr, synthetic bool) {
 	defer f.release(host)
+	if synthetic {
+		defer f.resolver.Release(syntheticIP)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	upstream, err := f.dial(ctx, rule, host, port)

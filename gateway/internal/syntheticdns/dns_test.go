@@ -2,12 +2,17 @@ package syntheticdns
 
 import (
 	"encoding/binary"
+	"fmt"
 	"testing"
 )
 
 type allow map[string]bool
 
 func (a allow) AllowsHost(host string) bool { return a[host] }
+
+type allowAll struct{}
+
+func (allowAll) AllowsHost(string) bool { return true }
 
 func query(name string, qtype uint16) []byte {
 	packet := make([]byte, 12)
@@ -30,15 +35,52 @@ func TestResolver(t *testing.T) {
 		t.Fatal("unstable answer")
 	}
 	ip, _ := r.Resolve("api.example")
-	if host, ok := r.Host(ip); !ok || host != "api.example" {
+	if host, ok := r.Acquire(ip); !ok || host != "api.example" {
 		t.Fatal("reverse mapping missing")
 	}
+	r.Release(ip)
 	denied := r.Reply(query("bad.example", 1))
 	if denied == nil || denied[3]&15 != 5 {
 		t.Fatal("denied query was not refused")
 	}
 	if got := r.Reply(query("api.example", 28)); got == nil || binary.BigEndian.Uint16(got[6:8]) != 0 {
 		t.Fatal("AAAA behavior")
+	}
+}
+
+func TestActiveMappingIsNotEvicted(t *testing.T) {
+	r := New(allowAll{})
+	first, _ := r.Resolve("host-0.example")
+	if _, ok := r.Acquire(first); !ok {
+		t.Fatal("failed to activate mapping")
+	}
+	for i := 1; i < MaxMappings; i++ {
+		if _, err := r.Resolve(fmt.Sprintf("host-%d.example", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := r.Resolve("new.example"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := r.Resolve("host-0.example"); got != first {
+		t.Fatal("evicted active mapping")
+	}
+	r.Release(first)
+}
+
+func TestSnapshotRestore(t *testing.T) {
+	original := New(allow{"api.example": true})
+	want, _ := original.Resolve("api.example")
+	restored := New(allow{"api.example": true})
+	if err := restored.Restore(original.Snapshot()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := restored.Resolve("api.example")
+	if err != nil || got != want {
+		t.Fatalf("restored %s, want %s: %v", got, want, err)
+	}
+	if err := New(allowAll{}).Restore([]Mapping{{Host: "bad", IP: "127.0.0.1"}}); err == nil {
+		t.Fatal("restored out-of-pool address")
 	}
 }
 

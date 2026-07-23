@@ -37,7 +37,7 @@ func New() (*Network, error) {
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, arp.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 	})
-	link := channel.New(1024, MTU, GatewayMAC)
+	link := channel.New(1024, MTU+header.EthernetMinimumSize, GatewayMAC)
 	if err := s.CreateNIC(NICID, ethernet.New(link)); err != nil {
 		s.Destroy()
 		return nil, errors.New(err.String())

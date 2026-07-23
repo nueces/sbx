@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,19 +18,15 @@ import (
 	"github.com/nueces/sbx/gateway/internal/syntheticdns"
 )
 
-func loadConfig(path string) (config.Config, error) {
+func readConfig(path string) ([]byte, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
-		return config.Config{}, err
+		return nil, err
 	}
 	if info.Mode()&os.ModeSymlink != 0 || info.Size() > 1<<20 {
-		return config.Config{}, errors.New("unsafe config file")
+		return nil, errors.New("unsafe config file")
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return config.Config{}, err
-	}
-	return config.Parse(data)
+	return os.ReadFile(path)
 }
 
 func validateIdentity(cfg config.Config, vmID, generation, digest string) error {
@@ -42,17 +39,29 @@ func validateIdentity(cfg config.Config, vmID, generation, digest string) error 
 func run() error {
 	socket := flag.String("socket", "", "controller-owned QEMU Unix socket path")
 	configPath := flag.String("config", "", "immutable worker JSON config")
+	prepare := flag.Bool("prepare", false, "normalize and sign the config, then exit")
 	vmID := flag.String("vm-id", "", "expected VM identity")
 	generation := flag.String("generation", "", "expected VM generation")
 	digest := flag.String("digest", "", "expected immutable config digest")
 	flag.Parse()
-	if *socket == "" || !filepath.IsAbs(*socket) {
-		return errors.New("--socket must be an absolute path")
-	}
 	if *configPath == "" || !filepath.IsAbs(*configPath) {
 		return errors.New("--config must be an absolute path")
 	}
-	cfg, err := loadConfig(*configPath)
+	data, err := readConfig(*configPath)
+	if err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+	if *prepare {
+		cfg, err := config.Prepare(data)
+		if err != nil {
+			return fmt.Errorf("config: %w", err)
+		}
+		return json.NewEncoder(os.Stdout).Encode(cfg)
+	}
+	if *socket == "" || !filepath.IsAbs(*socket) {
+		return errors.New("--socket must be an absolute path")
+	}
+	cfg, err := config.Parse(data)
 	if err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
@@ -94,7 +103,7 @@ func run() error {
 		return fmt.Errorf("accept: %w", err)
 	}
 	defer conn.Close()
-	stream := qemustream.New(conn, 30*time.Second)
+	stream := qemustream.New(conn, 600*time.Second)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errs := make(chan error, 2)
@@ -121,12 +130,21 @@ func run() error {
 			}
 		}
 	}()
-	err = <-errs
-	cancel()
-	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
-		return nil
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case err = <-errs:
+			cancel()
+			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			return fmt.Errorf("data plane stopped (%+v): %w", stream.Stats(), err)
+		case <-ticker.C:
+			stats := stream.Stats()
+			fmt.Fprintf(os.Stdout, "{\"frames_read\":%d,\"frames_written\":%d,\"frames_rejected\":%d}\n", stats.Read, stats.Written, stats.Rejected)
+		}
 	}
-	return err
 }
 
 func main() {
