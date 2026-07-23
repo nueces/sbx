@@ -23,13 +23,14 @@ Do not edit or commit directly to `main`, `specification/main`, or `webpage/main
 
 Keep the current `argparse` command hierarchy and command handlers. This feature does not need a parser framework, command registry, compatibility layer, or new command namespace.
 
-The work has five seams:
+The work has six seams:
 
 1. remove rejected flags and reorganize help;
 2. make JSON output deterministic;
 3. change listing and forwarding semantics;
-4. improve initial config output and credential-copy warnings; and
-5. update completions and user documentation.
+4. improve initial config output and credential-copy warnings;
+5. expose consistent `list`/`ls` aliases for VM and image inventories; and
+6. update completions and replace the exhaustive README with a curated workflow guide.
 
 ## CLI option changes
 
@@ -46,7 +47,7 @@ For `run`, `create`, and `recreate`:
 
 Also remove Git-config flags from `shell` so Git forwarding is configuration-only.
 
-Do not remove unrelated `--name` options, such as `image build-debian --name` or the accepted `network forward --name` selector.
+Do not remove unrelated `--name` options, such as `image build --name` or the accepted `network forward --name` selector.
 
 Build help groups with standard `argparse` argument groups. Keep one shared start-option helper; do not create separate command classes or schemas.
 
@@ -105,7 +106,7 @@ Successful `run --no-attach --json`, `create --json`, and `recreate --json` emit
 {"vm":{"name":"project-sbx","status":"running"}}
 ```
 
-Successful `sbx ls --json` emits a top-level array, matching `image ls --json` style:
+Successful `sbx ls --json` emits a top-level array, matching `image list --json` / `image ls --json` style:
 
 ```json
 [
@@ -161,6 +162,8 @@ Remove `-a` and `--all` immediately. Keep both `ls` and `list` visible and funct
 
 Build one structured row per VM, then render that same data as either a table or JSON to prevent format drift.
 
+Keep `sbx image ls` and add `sbx image list` as an identical visible alias. Both forms support the existing human and `--json` output.
+
 ## Configuration and first-run behavior
 
 Preserve these rules:
@@ -194,7 +197,8 @@ Update the existing static bash, zsh, and fish generators; do not replace them i
 - retain `--no-attach` and `--write-config`;
 - replace `ls --all`/`-a` with `--running` and add `--json`;
 - add `network forward --name` and `network status --json`;
-- keep both command aliases visible; and
+- expose both `image list` and `image ls` with the same options;
+- keep all accepted long and short command aliases visible; and
 - keep path and enum completion behavior unchanged where still applicable.
 
 ## Documentation and website
@@ -210,6 +214,8 @@ At minimum inspect and update:
 - `docs/environment-forwarding.md` if examples or option tables are affected;
 - shell-completion examples/tests; and
 - `webpage/main/index.html` or its matching website feature worktree if it mentions changed behavior.
+
+Make the README a friendly guide rather than a complete reference. Lead with installation, `sbx image build`, first project creation with the curated image, subsequent short commands, adding mounts through `.sbx.toml` plus `sbx stop`/`sbx run`, and installing extra tools through `sbx shell`. Explain that VM-disk changes survive stop/start but not `recreate` or `rm`; note that the curated image includes Pi, OpenCode launches from a shell, and npm agent commands should follow vendor-supported installation flags. Link focused docs and `sbx --help` for complete details.
 
 Document security policy as reproducible `.sbx.toml` configuration. Remove examples for deleted flags and show the new list, forwarding, JSON, and first-run behavior.
 
@@ -244,4 +250,4 @@ UV_PROJECT_ENVIRONMENT=/tmp/sbx-cli-ux-venv \
 - no hidden compatibility aliases or deprecation warnings;
 - no JSON error schema;
 - no changes to the underlying VM lifecycle model; and
-- no unrelated config, image-builder, networking, or website redesign.
+- no unrelated config, image-build internals, networking, or website redesign.

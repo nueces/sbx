@@ -6,10 +6,18 @@ Status: implemented and committed in `feature/cli-ux-simplification`.
 
 Make the common `sbx` workflow easier to discover without removing advanced VM, image, or networking capabilities.
 
-The preferred first-run workflow should remain:
+The preferred curated workflow is:
 
 ```bash
+sbx image build
 cd project
+sbx run the-quest \
+  --image '~/.smolvm/images/sbx' \
+  --run-user agent \
+  --project-path . \
+  --writable-mounts
+
+# Later runs use the generated .sbx.toml.
 sbx run
 ```
 
@@ -33,7 +41,7 @@ A name can come from positional `NAME`, `--name`, or `[sbx].name`. Supplying bot
 
 ### JSON output is inconsistent
 
-`run/create/recreate --json` produces JSON only on some creation paths and may still attach interactively. `image ls` supports JSON, while the more useful `sbx ls` and `network status` do not.
+`run/create/recreate --json` produces JSON only on some creation paths and may still attach interactively. Image listing supports JSON, while the more useful `sbx ls` and `network status` do not.
 
 ### Listing hides stopped sandboxes
 
@@ -45,7 +53,7 @@ A name can come from positional `NAME`, `--name`, or `[sbx].name`. Supplying bot
 
 ### Aliases add visible surface area
 
-Both `remove`/`rm` and `list`/`ls` appear in help and completion. This duplication was reviewed and accepted; both forms will remain visible.
+Both `remove`/`rm` and `list`/`ls` appear in help and completion. This duplication was reviewed and accepted. Image listing follows the same visible `image list`/`image ls` convention.
 
 ## Proposed command model
 
@@ -68,7 +76,8 @@ Diagnostics
 
 Advanced
   sbx network ...
-  sbx image ...
+  sbx image build
+  sbx image list / sbx image ls
   sbx completion ...
 ```
 
@@ -112,6 +121,8 @@ Do not add another namespace or a required setup command.
    - Continue automatically writing minimal config when a new VM is created without `.sbx.toml`.
    - For an existing VM or config, write/add missing values only when `--write-config` is supplied; never overwrite existing values.
 8. Improve first-run output after automatic `.sbx.toml` creation with concise next-step commands shown only on initial project creation. **Decision: accepted.**
+9. Keep `sbx image ls` and add the visible `sbx image list` alias for consistency with top-level listing. **Decision: accepted.**
+10. Replace the exhaustive README reference with a friendly guide centered on the curated image, first project creation, durable `.sbx.toml`, adding mounts after creation, and installing extra tools through `sbx shell`. Keep full detail in focused docs and command help. **Decision: accepted.**
 
 ## Configuration wizard decision
 
@@ -138,5 +149,6 @@ Removed syntax is not a permanent behavior contract. Do not keep tests that enum
 - Every supported `--json` path emits only valid JSON with a documented schema.
 - `sbx ls` shows stopped VMs without requiring an option.
 - Port-forward VM selection is unambiguous.
-- Both long and short command aliases remain visible and functional.
+- Top-level listing exposes `list`/`ls`, removal exposes `remove`/`rm`, and image listing exposes `image list`/`image ls`.
 - First-run use still requires no initialization command.
+- The README leads with the curated image and project workflow, including the stop/run cycle required to add mounts to an existing sandbox.
