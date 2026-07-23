@@ -42,6 +42,7 @@ def create_preset(
     boot_timeout: float,
     install_timeout: int,
     host_env: Mapping[str, str],
+    start_vm: Callable[[SmolVM], None] | None = None,
     before_provision: Callable[[str], None] | None = None,
     run_user: str = "root",
     env_values: Mapping[str, str | None] | None = None,
@@ -81,7 +82,10 @@ def create_preset(
             operation.lock(str(vm.vm_id))
             if before_provision is not None:
                 before_provision(str(vm.vm_id))
-            guest_setup.start_vm(str(vm.vm_id), boot_timeout=boot_timeout, status="created")
+            if start_vm is None:
+                guest_setup.start_vm(str(vm.vm_id), boot_timeout=boot_timeout, status="created")
+            else:
+                start_vm(vm)
             vm.refresh()
             with guest_setup.bootstrap_session(
                 str(vm.vm_id), run_user, env_values=env_values, timeout=boot_timeout

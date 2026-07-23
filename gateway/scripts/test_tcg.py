@@ -26,6 +26,9 @@ PROCESSES: list[subprocess.Popen[str]] = []
 SERVERS: list[ThreadingHTTPServer] = []
 PLACEHOLDER = "SBX_SECRET_package_" + "p" * 43
 FAKE_TOKEN = "fake-real-token-task10"
+COMMAND_TIMEOUT = 10
+PROCESS_STOP_TIMEOUT = 5
+INTEGRATION_TIMEOUT = 120
 
 
 def require(condition: bool, message: str) -> None:
@@ -112,6 +115,7 @@ def package_server(runtime: Path) -> tuple[ThreadingHTTPServer, Path]:
         check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        timeout=COMMAND_TIMEOUT,
     )
     server = ThreadingHTTPServer(("127.0.0.1", 0), PackageHandler)
     server.records = []  # type: ignore[attr-defined]
@@ -181,7 +185,7 @@ def start_mediator(
     os.close(key_read)
     os.close(ready_write)
     os.close(auth_read)
-    readable, _, _ = select.select([ready_read], [], [], 10)
+    readable, _, _ = select.select([ready_read], [], [], COMMAND_TIMEOUT)
     payload = os.read(ready_read, 4096) if readable else b""
     os.close(ready_read)
     require(bool(payload), "mediator readiness timed out")
@@ -193,17 +197,19 @@ def terminate(process: subprocess.Popen[str] | None) -> None:
         return
     os.killpg(process.pid, signal.SIGTERM)
     try:
-        process.wait(5)
+        process.wait(PROCESS_STOP_TIMEOUT)
     except subprocess.TimeoutExpired:
         os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
+        process.wait(PROCESS_STOP_TIMEOUT)
 
 
 def main() -> int:
     require(platform.system() == "Linux", "required Linux TCG test unavailable")
     qemu = shutil.which("qemu-system-x86_64")
     require(qemu is not None, "qemu-system-x86_64 is required")
-    accelerators = subprocess.check_output([qemu, "-accel", "help"], text=True)
+    accelerators = subprocess.check_output(
+        [qemu, "-accel", "help"], text=True, timeout=COMMAND_TIMEOUT
+    )
     require("tcg" in accelerators.split(), "QEMU TCG accelerator is required")
 
     gateway = Path(os.environ.get("SBX_GATEWAY_BIN", Path(__file__).parents[1] / "sbx-gateway"))
@@ -294,7 +300,9 @@ def main() -> int:
             )
         )
         prepared = subprocess.check_output(
-            [str(gateway), "--prepare", "--config", str(raw)], text=True
+            [str(gateway), "--prepare", "--config", str(raw)],
+            text=True,
+            timeout=COMMAND_TIMEOUT,
         )
         config.write_text(prepared)
         digest = json.loads(prepared)["digest"]
@@ -389,7 +397,7 @@ def main() -> int:
         )
         PROCESSES.append(qemu_process)
         transcript: list[str] = []
-        deadline = time.monotonic() + 120
+        deadline = time.monotonic() + INTEGRATION_TIMEOUT
         selector = selectors.DefaultSelector()
         assert qemu_process.stdout is not None
         os.set_blocking(qemu_process.stdout.fileno(), False)
@@ -436,10 +444,12 @@ def main() -> int:
                     require(secret not in status_material, "fake token leaked into status output")
                 terminate(worker)
                 require(worker.poll() is not None, "worker did not stop")
-                worker_stdout, _ = worker.communicate()
+                worker_stdout, _ = worker.communicate(timeout=PROCESS_STOP_TIMEOUT)
                 require(qemu_process.poll() is None, "QEMU did not survive worker loss")
                 terminate(mediator)
-                mediator_stdout, mediator_stderr = mediator.communicate()
+                mediator_stdout, mediator_stderr = mediator.communicate(
+                    timeout=PROCESS_STOP_TIMEOUT
+                )
                 logs = (mediator_stdout + mediator_stderr + worker_stdout + output).encode()
                 for secret in (*forbidden_secrets, PLACEHOLDER.encode()):
                     require(secret not in logs, "secret leaked into host or guest logs")

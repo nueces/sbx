@@ -6,20 +6,31 @@ import json
 import os
 import posixpath
 import re
+import secrets
+import select
+import shutil
+import signal
+import socket
 import stat
+import subprocess
 import sys
+import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from sbx.constants import SBX_STATE_DIR
 from sbx.runtime import ConfigError, pid_is_alive
 
 GATEWAY_STATE_DIR = SBX_STATE_DIR / "gateway"
+GATEWAY_SOURCE_DIR = Path(__file__).resolve().parents[2] / "gateway"
+GATEWAY_WORKER = GATEWAY_SOURCE_DIR / "sbx-gateway"
+GATEWAY_MEDIATOR_PYTHON = GATEWAY_SOURCE_DIR / "mediator" / ".venv" / "bin" / "python"
+GATEWAY_MEDIATOR_LAUNCHER = GATEWAY_SOURCE_DIR / "mediator" / "launch.py"
 GUEST_ADDRESS = "192.0.2.2"
 APPROVED_HOOKS = frozenset({"package-audit"})
 _ALLOWED_NETWORK_KEYS = frozenset(
@@ -910,6 +921,454 @@ def update_state(
         }
     _validated_state(data, directory.parent.name, directory.name)
     _atomic_json(directory, "state.json", data)
+
+
+class GatewayLifecycleError(RuntimeError):
+    pass
+
+
+class GatewayController:
+    """Own one gateway incarnation from reserved listeners through teardown."""
+
+    def __init__(
+        self,
+        config: GatewayConfig,
+        vm_id: str,
+        *,
+        root: Path | None = None,
+        generation: str | None = None,
+        runner: Callable[..., Any] = subprocess.Popen,
+        socket_factory: Callable[..., socket.socket] = socket.socket,
+        timeout: float = 10.0,
+    ) -> None:
+        self.config = config
+        self.vm_id = _validate_id(vm_id, "VM identity")
+        self.generation = generation or uuid.uuid4().hex
+        _validate_id(self.generation, "gateway generation")
+        self.root = root
+        self.runner = runner
+        self.socket_factory = socket_factory
+        if timeout <= 0:
+            raise ValueError("gateway lifecycle timeout must be positive")
+        self.timeout = timeout
+        self.directory: Path | None = None
+        self.listeners: list[socket.socket] = []
+        self.listener_rules: tuple[IngressRule, ...] = ()
+        self.processes: dict[str, Any] = {}
+        self._worker_stdout: BinaryIO | None = None
+        self._worker_buffer = bytearray()
+        self._logs: list[BinaryIO] = []
+        self._closed = False
+        self.mediator_address: str | None = None
+        self.worker_incarnation = uuid.uuid4().hex
+        random = bytearray(secrets.token_bytes(6))
+        random[0] = (random[0] | 2) & 0xFE
+        self.mac = ":".join(f"{value:02x}" for value in random)
+
+    @property
+    def qemu_socket(self) -> Path:
+        if self.directory is None:
+            raise GatewayLifecycleError("gateway has not been prepared")
+        return self.directory / "qemu-net.sock"
+
+    def _open_log(self, name: str) -> BinaryIO:
+        assert self.directory is not None
+        fd = os.open(
+            self.directory / name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        stream = os.fdopen(fd, "wb", buffering=0)
+        self._logs.append(stream)
+        return stream
+
+    def _reserve_listeners(self) -> None:
+        rules = []
+        for rule in self.config.ingress:
+            family = socket.AF_INET6 if ":" in rule.listen_host else socket.AF_INET
+            listener = self.socket_factory(family, socket.SOCK_STREAM)
+            try:
+                listener.bind((rule.listen_host, rule.host_port))
+                listener.listen()
+                host, port = listener.getsockname()[:2]
+            except BaseException:
+                listener.close()
+                raise
+            self.listeners.append(listener)
+            rules.append(replace(rule, listen_host=str(host), host_port=int(port)))
+        self.listener_rules = tuple(rules)
+
+    @staticmethod
+    def _pipe_with(value: bytes) -> int:
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, value)
+        except BaseException:
+            os.close(read_fd)
+            raise
+        finally:
+            os.close(write_fd)
+        return read_fd
+
+    def _mediator_command(self, key_fd: int, ready_fd: int) -> list[str]:
+        assert self.directory is not None
+        python = Path(os.environ.get("SBX_GATEWAY_MEDIATOR_PYTHON", GATEWAY_MEDIATOR_PYTHON))
+        launcher = Path(os.environ.get("SBX_GATEWAY_MEDIATOR_LAUNCHER", GATEWAY_MEDIATOR_LAUNCHER))
+        if not python.is_file() or not launcher.is_file():
+            raise GatewayLifecycleError("pinned gateway mediator runtime is missing")
+        return [
+            str(python),
+            str(launcher),
+            "--vm-id",
+            self.vm_id,
+            "--incarnation",
+            self.worker_incarnation,
+            "--key-fd",
+            str(key_fd),
+            "--ready-fd",
+            str(ready_fd),
+            "--confdir",
+            str(self.directory),
+        ]
+
+    def _worker_command(self, key_fd: int | None) -> list[str]:
+        assert self.directory is not None
+        worker = Path(os.environ.get("SBX_GATEWAY_BIN", GATEWAY_WORKER))
+        if not worker.is_file():
+            raise GatewayLifecycleError("exact gateway worker artifact is missing")
+        policy = _read_json(self.directory / "policy.json")
+        digest = policy.get("digest")
+        if not isinstance(digest, str):
+            raise GatewayLifecycleError("gateway worker configuration digest is missing")
+        command = [
+            str(worker),
+            "--socket",
+            str(self.qemu_socket),
+            "--config",
+            str((self.directory / "policy.json").resolve()),
+            "--vm-id",
+            self.vm_id,
+            "--generation",
+            self.generation,
+            "--digest",
+            digest,
+        ]
+        if key_fd is not None and self.mediator_address is not None:
+            command.extend(
+                (
+                    "--capability-key-fd",
+                    str(key_fd),
+                    "--worker-incarnation",
+                    self.worker_incarnation,
+                    "--mediator-address",
+                    self.mediator_address,
+                )
+            )
+        return command
+
+    def _read_json_fd(
+        self,
+        fd: int,
+        process: Any,
+        label: str,
+        buffer: bytearray | None = None,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + self.timeout if deadline is None else deadline
+        data = bytearray() if buffer is None else buffer
+        while (remaining := deadline - time.monotonic()) > 0:
+            if b"\n" in data:
+                line, _, remainder = bytes(data).partition(b"\n")
+                data.clear()
+                data.extend(remainder)
+                try:
+                    payload = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise GatewayLifecycleError(f"{label} returned invalid readiness data") from exc
+                if not isinstance(payload, dict):
+                    raise GatewayLifecycleError(f"{label} returned invalid readiness data")
+                return payload
+            if process.poll() is not None:
+                raise GatewayLifecycleError(f"{label} exited before readiness")
+            readable, _, _ = select.select([fd], [], [], min(0.05, remaining))
+            if not readable:
+                continue
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                raise GatewayLifecycleError(f"{label} closed its readiness channel")
+            data.extend(chunk)
+            if len(data) > 4096:
+                raise GatewayLifecycleError(f"{label} returned oversized readiness data")
+        raise GatewayLifecycleError(f"timed out waiting for {label} readiness")
+
+    def _read_worker_status(self, expected: str) -> dict[str, Any]:
+        process = self.processes["worker"]
+        stdout = self._worker_stdout
+        if stdout is None:
+            raise GatewayLifecycleError("worker readiness channel is unavailable")
+        deadline = time.monotonic() + self.timeout
+        while True:
+            payload = self._read_json_fd(
+                stdout.fileno(), process, "worker", self._worker_buffer, deadline
+            )
+            status = payload.get("status")
+            if status == expected:
+                return payload
+            if status != "stats":
+                raise GatewayLifecycleError("worker returned an unexpected readiness status")
+
+    def prepare(self) -> None:
+        """Reserve resources and authenticate mediator/worker readiness before QEMU."""
+        if self.directory is not None:
+            raise GatewayLifecycleError("gateway is already prepared")
+        try:
+            self.directory = create_state(self.config, self.vm_id, self.generation, root=self.root)
+            update_state(self.directory, status="starting")
+            self._reserve_listeners()
+            update_state(self.directory, listeners=self.listener_rules)
+
+            key = secrets.token_bytes(32)
+            mediator_key = self._pipe_with(key)
+            ready_read, ready_write = os.pipe()
+            try:
+                try:
+                    mediator = self.runner(
+                        self._mediator_command(mediator_key, ready_write),
+                        stdin=subprocess.DEVNULL,
+                        stdout=self._open_log("mediator.log"),
+                        stderr=subprocess.STDOUT,
+                        pass_fds=(mediator_key, ready_write),
+                        start_new_session=True,
+                    )
+                    self.processes["mediator"] = mediator
+                finally:
+                    os.close(mediator_key)
+                    os.close(ready_write)
+                ready = self._read_json_fd(ready_read, mediator, "mediator")
+            finally:
+                os.close(ready_read)
+            if (
+                ready.get("status") != "ready"
+                or ready.get("host") != "127.0.0.1"
+                or type(ready.get("port")) is not int
+                or not 1 <= ready["port"] <= 65535
+                or ready.get("pid") != mediator.pid
+                or ready.get("vm_id") != self.vm_id
+                or ready.get("incarnation") != self.worker_incarnation
+            ):
+                raise GatewayLifecycleError("mediator readiness identity mismatch")
+            self.mediator_address = f"127.0.0.1:{ready['port']}"
+
+            has_http = any(rule.protocol == "http" for rule in self.config.rules)
+            worker_key = self._pipe_with(key) if has_http else None
+            try:
+                worker = self.runner(
+                    self._worker_command(worker_key),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=self._open_log("worker.log"),
+                    pass_fds=() if worker_key is None else (worker_key,),
+                    start_new_session=True,
+                )
+                self.processes["worker"] = worker
+                self._worker_stdout = worker.stdout
+            finally:
+                if worker_key is not None:
+                    os.close(worker_key)
+            ready = self._read_worker_status("ready")
+            policy = _read_json(self.directory / "policy.json")
+            if (
+                ready.get("version") != 1
+                or ready.get("vm_id") != self.vm_id
+                or ready.get("generation") != self.generation
+                or ready.get("digest") != policy.get("digest")
+                or ready.get("mediator") is not has_http
+            ):
+                raise GatewayLifecycleError("worker readiness identity mismatch")
+            if not self.qemu_socket.exists() or not stat.S_ISSOCK(self.qemu_socket.lstat().st_mode):
+                raise GatewayLifecycleError("worker did not create its private QEMU socket")
+            update_state(
+                self.directory,
+                pids={name: process.pid for name, process in self.processes.items()},
+                sockets={"qemu": self.qemu_socket},
+            )
+        except BaseException:
+            self.rollback("startup_failed")
+            raise
+
+    def vm_network_ready(self, qemu_pid: int) -> None:
+        """Complete readiness only after QEMU exchanges a valid framed packet."""
+        if self.directory is None:
+            raise GatewayLifecycleError("gateway has not been prepared")
+        try:
+            self._read_worker_status("network-ready")
+            if any(process.poll() is not None for process in self.processes.values()):
+                raise GatewayLifecycleError("gateway component exited during startup")
+            pids = {name: process.pid for name, process in self.processes.items()}
+            pids["qemu"] = qemu_pid
+            update_state(self.directory, status="ready", pids=pids)
+        except BaseException:
+            self.rollback("startup_failed")
+            raise
+
+    def check(self) -> None:
+        failed = next(
+            (name for name, process in self.processes.items() if process.poll() is not None), None
+        )
+        if failed is None:
+            return
+        if self.directory is not None:
+            update_state(self.directory, status="failed", failure=(failed, f"{failed}_failed"))
+        raise GatewayLifecycleError(f"gateway {failed} exited")
+
+    @staticmethod
+    def _terminate(process: Any) -> None:
+        if process.poll() is not None:
+            with suppress(Exception):
+                process.wait(timeout=0)
+            return
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except (OSError, AttributeError):
+            with suppress(Exception):
+                process.terminate()
+        try:
+            process.wait(timeout=3)
+            return
+        except Exception:
+            pass
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except (OSError, AttributeError):
+            with suppress(Exception):
+                process.kill()
+        with suppress(Exception):
+            process.wait(timeout=1)
+
+    def drain(self) -> None:
+        """Stop accepting ingress before QEMU teardown."""
+        for listener in self.listeners:
+            with suppress(Exception):
+                listener.close()
+        self.listeners.clear()
+        if self.directory is not None and not self._closed:
+            with suppress(Exception):
+                update_state(self.directory, status="draining")
+
+    def rollback(self, code: str = "cleanup_failed") -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self.directory is not None:
+            with suppress(Exception):
+                update_state(
+                    self.directory,
+                    status="failed",
+                    pids={name: process.pid for name, process in self.processes.items()},
+                    failure=("controller", code),
+                )
+        self.drain()
+        for process in reversed(tuple(self.processes.values())):
+            self._terminate(process)
+        self.processes.clear()
+        if self._worker_stdout is not None:
+            with suppress(Exception):
+                self._worker_stdout.close()
+            self._worker_stdout = None
+        for stream in self._logs:
+            with suppress(Exception):
+                stream.close()
+        self._logs.clear()
+        if self.directory is not None:
+            with suppress(Exception):
+                _remove_state_directory(self.directory)
+
+    close = rollback
+
+
+def _remove_state_directory(directory: Path) -> None:
+    _private_directory(directory)
+    vm_directory = directory.parent
+    shutil.rmtree(directory)
+    with suppress(OSError):
+        vm_directory.rmdir()
+
+
+def _latest_directory(vm_id: str, root: Path | None = None) -> Path | None:
+    state, error = _latest_state(vm_id, root)
+    if error is not None:
+        raise GatewayStateError("unsafe gateway state")
+    if state is None:
+        return None
+    base = GATEWAY_STATE_DIR if root is None else root
+    return base / vm_id / state["generation"]
+
+
+def _pid_is_running(pid: int) -> bool:
+    if not pid_is_alive(pid):
+        return False
+    try:
+        fields = (Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
+    except (IndexError, OSError):
+        return True
+    return not fields or fields[0] != "Z"
+
+
+def _process_matches(pid: int, component: str, directory: Path) -> bool:
+    if not _pid_is_running(pid):
+        return True
+    try:
+        command = (Path("/proc") / str(pid) / "cmdline").read_bytes().replace(b"\0", b" ")
+    except OSError:
+        return False
+    marker = b"sbx-gateway" if component == "worker" else b"sbx_gateway_mediator.py"
+    return marker in command and os.fsencode(directory) in command
+
+
+def stop(vm_id: str, *, root: Path | None = None) -> None:
+    """Stop a persisted gateway without trusting arbitrary PIDs from stale state."""
+    directory = _latest_directory(vm_id, root)
+    if directory is None:
+        return
+    state = read_state(directory, vm_id=vm_id)
+    for component in ("worker", "mediator"):
+        pid = state["pids"].get(component)
+        if pid is None or not _pid_is_running(pid):
+            continue
+        if not _process_matches(pid, component, directory):
+            raise GatewayStateError(f"refusing unverified gateway {component} process")
+        with suppress(ProcessLookupError):
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and any(
+        _pid_is_running(state["pids"].get(name, 0)) for name in ("worker", "mediator")
+    ):
+        time.sleep(0.05)
+    remaining = []
+    for component in ("worker", "mediator"):
+        pid = state["pids"].get(component)
+        if pid and _pid_is_running(pid):
+            with suppress(ProcessLookupError):
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            remaining.append((component, pid))
+    deadline = time.monotonic() + 1
+    while remaining and time.monotonic() < deadline:
+        remaining = [(name, pid) for name, pid in remaining if _pid_is_running(pid)]
+        if remaining:
+            time.sleep(0.05)
+    if remaining:
+        raise GatewayStateError(f"gateway {remaining[0][0]} did not stop")
+    _remove_state_directory(directory)
+
+
+def active(vm_id: str, *, root: Path | None = None) -> bool:
+    directory = _latest_directory(vm_id, root)
+    if directory is None:
+        return False
+    state = read_state(directory, vm_id=vm_id)
+    return state["status"] == "ready" and all(
+        _pid_is_running(state["pids"].get(name, 0)) for name in ("qemu", "worker", "mediator")
+    )
 
 
 def _latest_state(vm_id: str, root: Path | None = None) -> tuple[dict[str, Any] | None, str | None]:

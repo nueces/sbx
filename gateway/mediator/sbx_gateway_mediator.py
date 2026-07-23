@@ -61,6 +61,10 @@ class CapabilityVerifier:
         self._incarnation = incarnation
         self._used: dict[str, int] = {}
 
+    @property
+    def identity(self) -> tuple[str, str]:
+        return self._vm_id, self._incarnation
+
     def verify(self, username: str, password: str, now: int | None = None) -> Admission | None:
         now = int(time.time()) if now is None else now
         fields = username.split("|")
@@ -240,9 +244,17 @@ class GatewayAddon:
         addresses = proxyserver.listen_addrs()
         if len(addresses) != 1 or addresses[0][0] != "127.0.0.1":
             raise RuntimeError("mediator did not bind exactly one loopback listener")
+        vm_id, incarnation = self._verifier.identity
         payload = (
             json.dumps(
-                {"host": addresses[0][0], "port": addresses[0][1], "pid": os.getpid()}
+                {
+                    "status": "ready",
+                    "host": addresses[0][0],
+                    "port": addresses[0][1],
+                    "pid": os.getpid(),
+                    "vm_id": vm_id,
+                    "incarnation": incarnation,
+                }
             ).encode()
             + b"\n"
         )

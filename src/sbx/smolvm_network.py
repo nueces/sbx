@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import os
+import platform
 import re
 import stat
 import subprocess
+from contextlib import suppress
 from dataclasses import dataclass
 from importlib.metadata import version as package_version
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
-from smolvm.runtime.guest_platforms import GuestPlatformSpec
-from smolvm.runtime.qemu import QEMU_ROOT_NODE_NAME
+from smolvm.exceptions import SmolVMError
+from smolvm.runtime.guest_platforms import GuestPlatformSpec, get_guest_platform
+from smolvm.runtime.qemu import QEMU_ROOT_NODE_NAME, QemuRuntimeAdapter
 from smolvm.runtime.qemu_args import build_qemu_argv as _build_smolvm_qemu_argv
-from smolvm.types import VMInfo
+from smolvm.types import VMInfo, VMState
 
 from sbx.runtime import ConfigError
 
@@ -155,3 +158,91 @@ def build_qemu_argv(
         host_system=host_system,
     )
     return argv if external_network is None else _replace_network(argv, external_network)
+
+
+# ponytail: private SmolVM lifecycle seams; remove when its typed backend API ships.
+def start_vm(
+    vm: Any,
+    backend: ExternalNetworkBackend,
+    *,
+    boot_timeout: float,
+) -> int:
+    """Start one SmolVM facade through its typed stream backend, never SLIRP."""
+    sdk = vm._sdk
+    vm_info = sdk.state.get_vm(vm.vm_id)
+    if vm_info.status not in (VMState.CREATED, VMState.STOPPED):
+        raise SmolVMError(f"Cannot start VM in state '{vm_info.status.value}'")
+    if vm_info.network is None:
+        raise SmolVMError("VM has no network configuration")
+    sdk._check_workspace_mounts(vm_info)
+    context = sdk._runtime_context()
+
+    def start_qemu(
+        info: VMInfo,
+        log_path: Path,
+        *,
+        control_socket_path: Path | None = None,
+        start_paused: bool = False,
+        root_node_name: str = QEMU_ROOT_NODE_NAME,
+        firmware_vars_path: Path | None = None,
+        swtpm_socket: Path | None = None,
+    ) -> subprocess.Popen[bytes]:
+        qemu_bin = sdk._find_qemu_binary()
+        if qemu_bin is None:
+            raise SmolVMError("qemu-system binary is missing")
+        platform_spec = get_guest_platform(
+            info.config.guest_os,
+            host_system=platform.system(),
+            arch=platform.machine(),
+        )
+        argv = build_qemu_argv(
+            info,
+            qemu_bin=qemu_bin,
+            boot_args=sdk._resolve_boot_args(info),
+            platform_spec=platform_spec,
+            external_network=backend,
+            control_socket_path=control_socket_path,
+            firmware_vars_path=firmware_vars_path,
+            swtpm_socket=swtpm_socket,
+            start_paused=start_paused,
+            root_node_name=root_node_name,
+        )
+        log_file = open(log_path, "w")  # noqa: SIM115 - owned until runtime closes.
+        try:
+            process = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except BaseException:
+            log_file.close()
+            raise
+        sdk._log_files[f"qemu:{info.vm_id}"] = log_file
+        sdk._process_handles[process.pid] = process
+        return process
+
+    context.start_qemu = start_qemu
+    adapter = QemuRuntimeAdapter(context)
+    log_path = sdk.data_dir / f"{vm.vm_id}.log"
+    try:
+        launch = adapter.start(vm_info, log_path=log_path, boot_timeout=boot_timeout)
+        vm._info = sdk.state.update_vm(
+            vm.vm_id,
+            status=launch.status,
+            pid=launch.pid,
+            control_socket_path=launch.control_socket_path,
+        )
+        vm._reset_runtime_state(close_ssh=False)
+        return launch.pid
+    except BaseException:
+        sdk.state.update_vm(
+            vm.vm_id,
+            status=VMState.ERROR,
+            clear_pid=True,
+            clear_socket_path=True,
+        )
+        with suppress(Exception):
+            sdk._close_runtime_log(vm.vm_id, "qemu", vm_info.control_socket_path)
+        raise
