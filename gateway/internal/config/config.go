@@ -102,8 +102,14 @@ func (c *Config) normalize() error {
 		if slices.Contains(r.Ports, 0) || len(slices.Compact(r.Ports)) != len(r.Ports) {
 			return fmt.Errorf("rule %q: invalid or duplicate port", r.ID)
 		}
+		if r.Protocol != "http" && (len(r.Methods) != 0 || len(r.Paths) != 0) {
+			return fmt.Errorf("rule %q: request constraints require HTTP", r.ID)
+		}
 		for j := range r.Methods {
 			r.Methods[j] = strings.ToUpper(strings.TrimSpace(r.Methods[j]))
+			if !validToken(r.Methods[j]) {
+				return fmt.Errorf("rule %q: invalid HTTP method", r.ID)
+			}
 		}
 		slices.Sort(r.Methods)
 		r.Methods = slices.Compact(r.Methods)
@@ -128,7 +134,11 @@ func (c *Config) normalize() error {
 			return fmt.Errorf("rule %q: duplicate allowed range", r.ID)
 		}
 		for _, port := range r.Ports {
-			key := fmt.Sprintf("%s|%s|%d", r.Protocol, r.Host, port)
+			transport := r.Protocol
+			if transport == "http" || transport == "tls" {
+				transport = "tcp"
+			}
+			key := fmt.Sprintf("%s|%s|%d", transport, r.Host, port)
 			if prior, ok := seen[key]; ok {
 				return fmt.Errorf("rules %q and %q conflict", prior, r.ID)
 			}
@@ -168,9 +178,14 @@ func (c Config) Match(protocol, host string, port uint16) (Rule, bool) {
 		return Rule{}, false
 	}
 	protocol = strings.ToLower(protocol)
-	for _, rule := range c.Rules {
-		if rule.Protocol == protocol && hostMatches(rule.Host, host) && slices.Contains(rule.Ports, port) {
-			return rule, true
+	for _, wildcard := range []bool{false, true} {
+		for _, rule := range c.Rules {
+			if strings.HasPrefix(rule.Host, "*.") != wildcard {
+				continue
+			}
+			if rule.Protocol == protocol && hostMatches(rule.Host, host) && slices.Contains(rule.Ports, port) {
+				return rule, true
+			}
 		}
 	}
 	return Rule{}, false
@@ -242,6 +257,18 @@ func hostMatches(rule, host string) bool {
 	}
 	suffix := strings.TrimPrefix(rule, "*")
 	return strings.HasSuffix(host, suffix) && len(strings.TrimSuffix(host, suffix)) > 0 && !strings.Contains(strings.TrimSuffix(host, suffix), ".")
+}
+
+func validToken(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, ch := range value {
+		if ch <= 32 || ch >= 127 || strings.ContainsRune("()<>@,;:\\\"/[]?={}", ch) {
+			return false
+		}
+	}
+	return true
 }
 
 func validID(value string) bool {
