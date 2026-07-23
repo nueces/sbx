@@ -7,7 +7,7 @@ This document records how `sbx` currently uses local SmolVM images. It is descri
 `sbx` local image mode uses a ready-to-run image directory containing separate boot artifacts:
 
 ```text
-~/.smolvm/images/debian-sbx/
+~/.smolvm/images/sbx/
 ├── smolvm-image.json
 ├── vmlinux.bin
 └── rootfs.ext4
@@ -20,25 +20,17 @@ The image is not a single self-contained bootable disk. It is a direct-kernel Sm
 The local Debian/Pi image is built with:
 
 ```bash
-sbx image build-debian
+sbx image build
 ```
 
-The build recipe is split into a reusable base OS fragment and an agent/tooling fragment:
-
-```text
-src/sbx/image/resources/Containers/
-├── Debian/
-│   └── Base.Containerfile
-└── Agents/
-    └── Pi.Containerfile
-```
+The build recipe combines packaged Debian, Docker, and Pi fragments.
 
 The build command:
 
-1. combines the base and agent Containerfiles into a temporary Containerfile;
-2. builds that combined Containerfile into a Docker image;
-3. asks SmolVM's `ImageBuilder.build_debian_ssh_key(...)` to create a Debian SSH-capable rootfs from that Docker image;
-4. uses SmolVM's published/base QEMU-compatible kernel;
+1. builds the combined userspace as a Docker image;
+2. adds SSH and a SmolVM-compatible init without the SmolVM guest agent;
+3. exports that userspace into `rootfs.ext4`;
+4. downloads the kernel recipe and checker from immutable commits, verifies each SHA-256, and builds a Docker-capable QEMU kernel from SHA-256-verified Linux source;
 5. writes `smolvm-image.json` next to the generated kernel and rootfs.
 
 The resulting rootfs already contains Pi and related tooling from the packaged `Containers/Agents/Pi.Containerfile`. Therefore, `sbx` does not run SmolVM preset installation for this mode.
@@ -49,13 +41,13 @@ The local image manifest is `smolvm-image.json`:
 
 ```json
 {
-  "name": "debian-sbx",
+  "name": "sbx",
   "kernel": "vmlinux.bin",
   "rootfs": "rootfs.ext4",
   "boot_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init",
   "sbx": {
     "agent": "pi",
-    "features": [],
+    "features": ["docker"],
     "launch_command": "pi"
   }
 }
@@ -70,8 +62,8 @@ A typical `.sbx.toml` uses the local image directory:
 ```toml
 [sbx]
 agent = "pi"
-name = "reviewhero"
-image = "~/.smolvm/images/debian-sbx"
+name = "the-quest"
+image = "~/.smolvm/images/sbx"
 run_user = "agent"
 memory = 8192
 cpus = 4
@@ -86,7 +78,7 @@ When `sbx run` starts a missing VM from this image, `sbx`:
 
 1. loads the image manifest;
 2. resolves `kernel`, `rootfs`, optional `initrd`, and `boot_args`;
-3. creates a SmolVM `VMConfig` using those paths;
+3. creates a SmolVM `VMConfig` using those paths and `comm_channel="ssh"`;
 4. starts the VM through the SmolVM SDK;
 5. waits for SSH readiness;
 6. prepares `run_user`, safe Git config, auth callback forwarding, and project cwd as configured;
@@ -106,7 +98,7 @@ Even in local image mode, `sbx` still uses SmolVM for:
 - SSH readiness checks and SSH command generation;
 - isolated per-VM disk materialization.
 
-The kernel file in the image directory is produced from SmolVM's kernel assets. The rootfs is our built Debian/Pi filesystem.
+The kernel and Debian/Pi/Docker rootfs are built locally. SmolVM still provides lifecycle, QEMU, disk, mount, and SSH integration, but this build does not download SmolVM's published kernel or guest agent.
 
 ## Disk behavior
 
@@ -116,11 +108,10 @@ Conceptually:
 
 ```text
 base image rootfs:
-  ~/.smolvm/images/debian-sbx/rootfs.ext4
+  ~/.smolvm/images/sbx/rootfs.ext4
 
-per-VM materialized disks:
-  ~/.local/state/smolvm/disks/reviewhero.ext4
-  ~/.local/state/smolvm/disks/pi.ext4
+per-VM materialized disk:
+  ~/.local/state/smolvm/disks/the-quest.ext4
 ```
 
 Changing or resizing one VM's materialized disk does not resize the base image or other VMs.
@@ -128,7 +119,7 @@ Changing or resizing one VM's materialized disk does not resize the base image o
 If a base image is rebuilt, existing VMs may continue to use their already-materialized per-VM disks. To force a VM to pick up the rebuilt base image, remove/recreate that VM:
 
 ```bash
-sbx rm reviewhero --force
+sbx rm the-quest --force
 sbx run
 ```
 

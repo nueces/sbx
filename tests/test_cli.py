@@ -131,7 +131,7 @@ def test_doctor_warns_when_config_differs_from_existing_vm(
 ) -> None:
     config = tmp_path / ".sbx.toml"
     config.write_text(
-        '[sbx]\nname = "reviewhero"\ndisk_size = 10240\nmemory = 8192\ncpus = 4\n',
+        '[sbx]\nname = "the-quest"\ndisk_size = 10240\nmemory = 8192\ncpus = 4\n',
         encoding="utf-8",
     )
 
@@ -159,9 +159,9 @@ def test_doctor_warns_when_config_differs_from_existing_vm(
     assert rc == 0
     out = capfd.readouterr().out
     assert "doctor --backend qemu" in out
-    assert "VM 'reviewhero' already exists and differs from .sbx.toml" in out
+    assert "VM 'the-quest' already exists and differs from .sbx.toml" in out
     assert "disk_size: config requests 10240 MiB, existing VM has 81920 MiB" in out
-    assert "sbx recreate reviewhero --force" in out
+    assert "sbx recreate the-quest --force" in out
 
 
 def test_doctor_warns_when_local_image_is_larger_than_requested_disk(
@@ -180,7 +180,7 @@ def test_doctor_warns_when_local_image_is_larger_than_requested_disk(
     (image / "vmlinux.bin").write_text("kernel", encoding="utf-8")
     config = tmp_path / ".sbx.toml"
     config.write_text(
-        f'[sbx]\nname = "reviewhero"\nimage = "{image}"\ndisk_size = 10\n',
+        f'[sbx]\nname = "the-quest"\nimage = "{image}"\ndisk_size = 10\n',
         encoding="utf-8",
     )
 
@@ -852,6 +852,33 @@ def test_create_auto_writes_project_config_for_new_vm(
     assert 'run_user = "agent"' in text
     assert 'env = ["OPENAI_API_KEY"]' in text
     assert "wrote .sbx.toml" in capfd.readouterr().err
+
+
+def test_project_config_values_preserve_curated_image_workflow() -> None:
+    values = cli._project_config_values(
+        SimpleNamespace(
+            image="~/.smolvm/images/sbx",
+            memory=None,
+            cpus=None,
+            disk_size=None,
+            project_path=".",
+            run_user="agent",
+            writable_mounts=True,
+            env=None,
+        ),
+        {},
+        vm_name="the-quest",
+        agent="pi",
+    )
+
+    assert values == {
+        "name": "the-quest",
+        "agent": "pi",
+        "image": "~/.smolvm/images/sbx",
+        "project_path": ".",
+        "run_user": "agent",
+        "writable_mounts": True,
+    }
 
 
 def test_write_config_updates_only_missing_values(
@@ -1556,20 +1583,31 @@ def test_invalid_agent_in_config_returns_usage_error(
     assert "[sbx].agent must be one of" in capsys.readouterr().err
 
 
-def test_image_build_debian_subcommand(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_image_build_subcommand_and_default_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     from sbx.image import build_debian
 
-    captured = {}
+    monkeypatch.chdir(tmp_path)
+    names = []
 
     def fake_main_from_args(args: object) -> int:
-        captured["with_docker"] = args.with_docker
-        captured["name"] = args.name
+        names.append(args.name)
         return 0
 
     monkeypatch.setattr(build_debian, "main_from_args", fake_main_from_args)
 
-    assert cli.main(["image", "build-debian", "--with-docker", "--name", "docker-image"]) == 0
-    assert captured == {"with_docker": True, "name": "docker-image"}
+    assert cli.main(["image", "build"]) == 0
+    assert cli.main(["image", "build", "--name", "custom-image"]) == 0
+    assert names == ["sbx", "custom-image"]
+    assert not (tmp_path / ".sbx.toml").exists()
+
+
+def test_image_build_debian_subcommand_is_removed() -> None:
+    with pytest.raises(SystemExit) as error:
+        cli.main(["image", "build-debian"])
+
+    assert error.value.code == 2
 
 
 def test_image_ls_lists_local_images(
@@ -1577,18 +1615,18 @@ def test_image_ls_lists_local_images(
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     images = tmp_path / ".smolvm" / "images"
-    docker_image = images / "debian-sbx-docker"
-    plain_image = images / "debian-sbx"
+    docker_image = images / "legacy-docker"
+    plain_image = images / "legacy-plain"
     invalid_image = images / "invalid"
     docker_image.mkdir(parents=True)
     plain_image.mkdir()
     invalid_image.mkdir()
     (docker_image / "smolvm-image.json").write_text(
-        '{"name":"debian-sbx-docker","kernel":"vmlinux-docker.bin","rootfs":"rootfs.ext4","sbx":{"agent":"pi","features":["docker"]}}',
+        '{"name":"legacy-docker","kernel":"vmlinux-docker.bin","rootfs":"rootfs.ext4","sbx":{"agent":"pi","features":["docker"]}}',
         encoding="utf-8",
     )
     (plain_image / "smolvm-image.json").write_text(
-        '{"name":"debian-sbx","kernel":"vmlinux.bin","rootfs":"rootfs.ext4","sbx":{"agent":"pi","features":[]}}',
+        '{"name":"legacy-plain","kernel":"vmlinux.bin","rootfs":"rootfs.ext4","sbx":{"agent":"pi","features":[]}}',
         encoding="utf-8",
     )
     (invalid_image / "smolvm-image.json").write_text("not json", encoding="utf-8")
@@ -1598,9 +1636,9 @@ def test_image_ls_lists_local_images(
     out = capsys.readouterr().out
     assert "NAME" in out
     assert "FEATURES" in out
-    assert "debian-sbx-docker" in out
+    assert "legacy-docker" in out
     assert "docker" in out
-    assert "debian-sbx" in out
+    assert "legacy-plain" in out
     assert "invalid" not in out
 
 
@@ -1608,7 +1646,7 @@ def test_image_ls_json(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
-    image = tmp_path / ".smolvm" / "images" / "debian-sbx-docker"
+    image = tmp_path / ".smolvm" / "images" / "legacy-docker"
     image.mkdir(parents=True)
     (image / "smolvm-image.json").write_text(
         '{"kernel":"vmlinux-docker.bin","rootfs":"rootfs.ext4","sbx":{"agent":"pi","features":["docker"]}}',
@@ -1623,7 +1661,7 @@ def test_image_ls_json(
             "agent": "pi",
             "features": ["docker"],
             "kernel": "vmlinux-docker.bin",
-            "name": "debian-sbx-docker",
+            "name": "legacy-docker",
             "path": str(image),
             "rootfs": "rootfs.ext4",
         }

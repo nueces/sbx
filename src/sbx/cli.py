@@ -616,6 +616,7 @@ def _start_local_image(
         "rootfs_path": rootfs_path,
         "boot_args": boot_args,
         "backend": DEFAULT_BACKEND,
+        "comm_channel": "ssh",
         "ssh_capable": True,
         "ssh_public_key": public_key.read_text(encoding="utf-8").strip(),
         "port_forwards": network.port_forwards_from_specs(port_forwards),
@@ -687,7 +688,7 @@ def cmd_completion(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_image_build_debian(args: argparse.Namespace) -> int:
+def cmd_image_build(args: argparse.Namespace) -> int:
     return build_debian.main_from_args(args)
 
 
@@ -1376,11 +1377,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     image = sub.add_parser("image", help="Advanced local image helpers.")
     image_sub = image.add_subparsers(dest="image_action", required=True)
-    build_debian_parser = image_sub.add_parser(
-        "build-debian", help="Build a local Debian Pi image for sbx."
+    build_parser = image_sub.add_parser(
+        "build", help="Build the curated local image for sbx."
     )
-    build_debian.add_arguments(build_debian_parser)
-    build_debian_parser.set_defaults(func=cmd_image_build_debian)
+    build_debian.add_arguments(build_parser)
+    build_parser.set_defaults(func=cmd_image_build)
 
     list_images_parser = image_sub.add_parser("ls", help="List local sbx images.")
     sbx.image.ls.add_arguments(list_images_parser)

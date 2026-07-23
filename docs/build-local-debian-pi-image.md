@@ -1,21 +1,22 @@
 # Build and run a local Debian Pi image
 
-`sbx image build-debian` builds a ready-to-run SmolVM image directory that already contains Pi. `sbx` boots that image directly and attaches to run `pi`; it does not run SmolVM's preset installer.
+`sbx image build` builds the curated ready-to-run SmolVM image under `~/.smolvm/images/sbx`. It contains Pi and rootless Docker. `sbx` boots that image directly; it does not run SmolVM's preset installer.
 
 ## 1. Image build command
 
-The builder is an advanced `sbx` subcommand:
+The builder is an `sbx` subcommand:
 
 ```bash
-sbx image build-debian
+sbx image build
 ```
 
-The image recipe is packaged with `sbx` and split into two Containerfile fragments:
+The image recipe is packaged with `sbx` and split into Debian, Docker, and Pi Containerfile fragments:
 
 ```text
 src/sbx/image/resources/Containers/
 ├── Debian/
-│   └── Base.Containerfile
+│   ├── Base.Containerfile
+│   └── fragments/Docker.Containerfile
 └── Agents/
     └── Pi.Containerfile
 ```
@@ -47,33 +48,32 @@ Install the currently supported tools first:
 
 ```bash
 uv tool install --editable .
-uv tool install 'smolvm==0.0.19'
+uv tool install 'smolvm==0.0.28'
 ```
 
-`sbx` pins SmolVM `0.0.19` for now. Newer SmolVM compatibility is separate work.
+`sbx` pins SmolVM `0.0.28`.
 
 ## 3. Build the image
 
 Run the image build command:
 
 ```bash
-sbx image build-debian
+sbx image build
 ```
 
-Useful options:
+The default image name is `sbx`. Override its size or name only when needed:
 
 ```bash
-sbx image build-debian \
-  --name debian-sbx \
-  --rootfs-size-mb 40960
+sbx image build --rootfs-size-mb 40960
+sbx image build --name custom-image
 ```
 
-The subcommand combines the base/agent Containerfiles, plus Docker when `--with-docker` is set, builds that combined Containerfile first, and passes the resulting Docker image into SmolVM's Debian image builder. If the combined Containerfile ends with `USER agent`, the subcommand wraps it with a tiny `USER root` image so SmolVM's builder can still run its root-level SSH/init setup.
+The subcommand combines the Debian, Docker, and Pi fragments, builds that image, adds SSH and the SmolVM-compatible init, exports `rootfs.ext4`, and builds the Docker-capable QEMU kernel. SmolVM's published kernel and guest agent are not downloaded; local images communicate through SSH.
 
 For local experiments, you can override the packaged fragments with your own files:
 
 ```bash
-sbx image build-debian \
+sbx image build \
   --base-containerfile path/to/Base.Containerfile \
   --agent-containerfile path/to/Pi.Containerfile
 ```
@@ -81,15 +81,15 @@ sbx image build-debian \
 Or pass a fully composed Containerfile directly:
 
 ```bash
-sbx image build-debian --containerfile path/to/Containerfile
+sbx image build --containerfile path/to/Containerfile
 ```
 
-The subcommand prints the built image paths and a minimal `sbx` config snippet.
+The subcommand prints the built image paths, a minimal config snippet, and the recommended `sbx run ... --write-config` command. Image building never modifies the current project configuration.
 
 The subcommand also writes a local image manifest:
 
 ```text
-~/.smolvm/images/debian-sbx/smolvm-image.json
+~/.smolvm/images/sbx/smolvm-image.json
 ```
 
 List built images:
@@ -99,17 +99,16 @@ sbx image ls
 sbx image ls --json
 ```
 
-and uses SmolVM's QEMU-compatible kernel by default. With `--with-docker`, it builds a Docker-capable kernel from pinned SmolVM kernel build inputs and stores it as `vmlinux-docker.bin` in the image directory.
+The builder downloads the reviewed SmolVM kernel recipe and Moby checker from pinned commit URLs, verifies each file's SHA-256 before use, and then compiles a Docker-capable QEMU kernel from a separately SHA-256-verified Linux source tarball. It stores the kernel as `vmlinux.bin`. Builds therefore require access to GitHub, kernel.org, and package repositories.
 
 ## 4. Local image directory layout
 
 After a successful build, the image directory should look like:
 
 ```text
-~/.smolvm/images/debian-sbx/
+~/.smolvm/images/sbx/
 ├── smolvm-image.json
 ├── vmlinux.bin
-├── vmlinux-docker.bin  # only when built with --with-docker
 └── rootfs.ext4
 ```
 
@@ -117,40 +116,42 @@ Example manifest:
 
 ```json
 {
-  "name": "debian-sbx",
+  "name": "sbx",
   "kernel": "vmlinux.bin",
   "rootfs": "rootfs.ext4",
   "boot_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init",
   "sbx": {
     "agent": "pi",
-    "features": [],
+    "features": ["docker"],
     "launch_command": "pi"
   }
 }
 ```
 
-## 5. Configure `sbx`
+## 5. Configure and run `sbx`
 
-Create or update `.sbx.toml`:
+Use the built image and write the selected project settings:
+
+```bash
+sbx run the-quest \
+  --image '~/.smolvm/images/sbx' \
+  --run-user agent \
+  --project-path . \
+  --writable-mounts \
+  --write-config
+```
+
+The suggested `.sbx.toml` is:
 
 ```toml
 [sbx]
+name = "the-quest"
 agent = "pi"
-name = "debian-pi-test"
-image = "~/.smolvm/images/debian-sbx"
-memory = 2048
-cpus = 2
-boot_timeout = 60
-run_user = "agent"
-
+image = "~/.smolvm/images/sbx"
 project_path = "."
+run_user = "agent"
 writable_mounts = true
-
-stop_on_exit = false
 copy_host_credentials = false
-env = []
-
-# True by default. Copies safe Git identity/config only, not credentials.
 git_config = true
 ```
 
@@ -158,27 +159,17 @@ Important: `copy_host_credentials = false` prevents host credential/config copyi
 
 `git_config = true` is the default and only copies a safe subset of host Git identity/workflow settings, such as `user.name` and `user.email`, so commits inside the VM have the expected author. It does not copy Git credentials, SSH keys, GPG/signing keys, credential helpers, includes, or URL rewrite rules.
 
-## 6. Run it
-
-Use the configured name from `.sbx.toml`:
+`--write-config` belongs to `run` and `create`; `image build` never writes `.sbx.toml`. Later runs can use the saved configuration:
 
 ```bash
-sbx --debug run
+sbx run
 ```
-
-Passing a positional argument changes the VM name. For example:
-
-```bash
-sbx --debug run pi
-```
-
-means "run a sandbox named `pi`", not "run the Pi agent".
 
 ## Docker guest usage
 
 ### Host
 
-Install Docker on the host, then build the Docker-capable image and point `.sbx.toml` at it. Kernel compile tools run inside the packaged `Containers/Build/Kernel.Containerfile`; the guest image installs Docker from Docker's official Debian apt repository. No host kernel compiler packages are required.
+Install Docker on the host, then build the image and point `.sbx.toml` at it. Kernel compile tools run inside the packaged `Containers/Build/Kernel.Containerfile`; the guest image installs Docker from Docker's official Debian apt repository. No host kernel compiler packages are required.
 
 Ensure Docker works on the host for the image build:
 
@@ -187,21 +178,18 @@ docker version
 ```
 
 ```bash
-sbx image build-debian \
-  --with-docker \
-  --name debian-sbx-docker \
-  --rootfs-size-mb 81920
+sbx image build --rootfs-size-mb 81920
 ```
 
 ```toml
 [sbx]
-image = "~/.smolvm/images/debian-sbx-docker"
+image = "~/.smolvm/images/sbx"
 run_user = "agent"
 ```
 
 Create or recreate the VM after changing the image. If the rootfs was built with `--rootfs-size-mb 81920`, omit `disk_size` unless you intentionally want SmolVM to grow the per-VM disk.
 
-Rootless Docker starts at VM boot in Docker-capable images. Inside the guest, use Docker normally:
+Rootless Docker starts at VM boot. Inside the guest, use Docker normally:
 
 ```bash
 docker run --rm hello-world
@@ -266,7 +254,7 @@ Rootful Docker data lives under `/var/lib/docker`.
 
 ### `QEMU exited early` / `Error loading uncompressed kernel without PVH ELF Note`
 
-The image was likely built with SmolVM's Firecracker-compatible ELF kernel. Rebuild with the current `sbx image build-debian` command; it selects SmolVM's QEMU-compatible kernel by default.
+The image likely references an incompatible or older kernel. Rebuild it with the current `sbx image build` command to produce the Docker-capable QEMU kernel.
 
 ### VM starts but SSH readiness times out
 
@@ -309,21 +297,14 @@ PATH="$PATH:/usr/sbin:/sbin" sbx run
 
 Alternatively, remove `disk_size` if the image is already large enough, or rebuild the image with the desired size.
 
-Resizing is per VM. SmolVM normally materializes an isolated disk for each sandbox, so growing `reviewhero` does not resize the shared image directory or other VMs that use the same local image. If you rebuilt the base image and want an existing VM to pick it up, remove/recreate that VM.
+Resizing is per VM. SmolVM normally materializes an isolated disk for each sandbox, so growing `the-quest` does not resize the shared image directory or other VMs that use the same local image. If you rebuilt the base image and want an existing VM to pick it up, remove/recreate that VM.
 
 ### Existing VM keeps using old image contents
 
 If you changed and rebuilt the image, remove/recreate the VM:
 
 ```bash
-sbx rm debian-pi-test --force
-sbx run
-```
-
-or, if you created a VM named `pi` by running `sbx run pi`:
-
-```bash
-sbx rm pi --force
+sbx rm the-quest --force
 sbx run
 ```
 
@@ -332,8 +313,8 @@ sbx run
 Inspect or close tracked tunnels:
 
 ```bash
-sbx network status debian-pi-test
-sbx network close-auth-port debian-pi-test
+sbx network status the-quest
+sbx network close-auth-port the-quest
 ```
 
 ## Notes

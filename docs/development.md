@@ -27,3 +27,12 @@ Before making code changes in a fresh environment, first run the full test suite
 once with the command above to verify the checkout and tool environment are
 healthy. After changing CLI behavior, add/update focused tests and run both the
 focused tests and the full suite.
+
+Check whether pinned SmolVM/Moby image-build inputs or their license notices changed:
+
+```bash
+python .github/scripts/check_image_build_inputs.py
+```
+
+A non-zero exit means review is needed. The checker reports new commits and SHA-256
+values but never updates executable pins automatically.

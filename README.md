@@ -144,7 +144,7 @@ sbx run my-sbx --agent claude
 | `network forward [NAME] SPEC...` | Temporarily forward host TCP ports to a running sandbox until Ctrl-C.                    |
 | `network auth-port [NAME]`       | Expert helper: manually expose the OAuth callback port for an already-running sandbox.   |
 | `network close-auth-port [NAME]` | Expert helper: close the tracked OAuth callback tunnel.                                  |
-| `image build-debian`             | Advanced helper: build a local Debian/Pi image, optionally with `--with-docker`.         |
+| `image build`                    | Build the curated local Pi/rootless-Docker image.                                        |
 | `image ls`                       | List local ready-to-run images under `~/.smolvm/images`.                                |
 | `doctor`                         | Run non-sudo SmolVM diagnostics for QEMU.                                                |
 | `completion SHELL`               | Generate shell completion for `bash`, `zsh`, or `fish`.                                  |
@@ -161,19 +161,33 @@ List local ready-to-run images:
 sbx image ls
 ```
 
-Build the default Debian/Pi image:
+Build the curated image and create project configuration while starting it:
 
 ```bash
-sbx image build-debian --name debian-sbx
+sbx image build
+sbx run the-quest \
+  --image '~/.smolvm/images/sbx' \
+  --run-user agent \
+  --project-path . \
+  --writable-mounts \
+  --write-config
 ```
 
-Use it from `.sbx.toml`:
+The suggested project configuration is:
 
 ```toml
 [sbx]
-image = "~/.smolvm/images/debian-sbx"
+name = "the-quest"
+agent = "pi"
+image = "~/.smolvm/images/sbx"
+project_path = "."
 run_user = "agent"
+writable_mounts = true
+copy_host_credentials = false
+git_config = true
 ```
+
+`--write-config` belongs to `run` and `create`; `image build` never changes `.sbx.toml`.
 
 Configure durable TCP forwards applied when the VM starts:
 
@@ -182,21 +196,13 @@ Configure durable TCP forwards applied when the VM starts:
 port_forwards = ["3000", "8080:3000"]
 ```
 
-Build with Docker support:
+The default image includes rootless Docker. For a larger Docker data/build cache, increase its rootfs:
 
 ```bash
-sbx image build-debian --with-docker --name debian-sbx-docker --rootfs-size-mb 81920
+sbx image build --rootfs-size-mb 81920
 ```
 
-Use the Docker-capable image:
-
-```toml
-[sbx]
-image = "~/.smolvm/images/debian-sbx-docker"
-run_user = "agent"
-```
-
-These Debian/Pi images should run as `agent`; Docker rootless also uses that user. Docker-capable images show `docker` in `sbx image ls` and start rootless Docker at boot.
+These Debian/Pi images should run as `agent`; rootless Docker also uses that user. Built images show `docker` in `sbx image ls` and start rootless Docker at boot.
 
 For details, see [`docs/build-local-debian-pi-image.md`](docs/build-local-debian-pi-image.md). For contributor setup and test commands, see [`docs/development.md`](docs/development.md).
 
@@ -220,7 +226,7 @@ Example `.sbx.toml`:
 ```toml
 [sbx]
 agent = "pi" # pi, claude, or codex
-name = "project-sbx"
+name = "the-quest"
 memory = 4096
 cpus = 2
 disk_size = 20480
@@ -298,7 +304,7 @@ See [`docs/environment-forwarding.md`](docs/environment-forwarding.md) for detai
 
 ### Local ready-to-run image directories
 
-When `[sbx].image` is set, `sbx` treats the image as already containing the selected agent. It boots the image directly with the SmolVM SDK and then attaches to run the agent command; it does not run SmolVM's preset installer. If `[sbx].disk_size` is set for a local raw ext4 image, `sbx` asks SmolVM to create an isolated disk of that size and grow the filesystem. For the end-to-end Debian/Pi workflow, including optional Docker support with `--with-docker`, see [`docs/build-local-debian-pi-image.md`](docs/build-local-debian-pi-image.md).
+When `[sbx].image` is set, `sbx` treats the image as already containing the selected agent. It boots the image directly with the SmolVM SDK and then attaches to run the agent command; it does not run SmolVM's preset installer. If `[sbx].disk_size` is set for a local raw ext4 image, `sbx` asks SmolVM to create an isolated disk of that size and grow the filesystem. For the end-to-end Debian/Pi and rootless Docker workflow, see [`docs/build-local-debian-pi-image.md`](docs/build-local-debian-pi-image.md).
 
 Example layout:
 

@@ -2,21 +2,23 @@
 
 Track deliberate use of internal APIs, generated-file assumptions, or other integration seams that should be replaced when upstream support exists.
 
-## SmolVM init injection via protected methods
+## SmolVM local rootfs and init seams
 
-Used for Docker-capable images:
+Used by `src/sbx/image/build_debian.py`:
 
 ```python
-class SbxDockerImageBuilder(ImageBuilder):
+class SbxImageBuilder(ImageBuilder):
     def _default_init_script(self) -> str:
         return self._base_init_script(custom_commands="...")
+
+DockerRootfsBuilder(...)._build_rootfs(...)
 ```
 
-Why: SmolVM has an internal `custom_commands` hook in `_base_init_script()`, but `build_debian_ssh_key()` does not expose it publicly. This lets sbx start rootless Docker at VM boot without SSH post-start orchestration, wrapping Pi, or patching `rootfs.ext4`.
+Why: SmolVM 0.0.28 has no public rootfs-only operation. `build_debian_ssh_key()` injects the guest agent and downloads a kernel; `DockerRootfsBuilder.build_boot_image()` also downloads a kernel. sbx needs only the generated init plus Docker export/ext4 conversion because it builds its own kernel and uses SSH.
 
-Fragility: `_default_init_script()` and `_base_init_script()` are protected SmolVM internals and may change.
+Fragility: `_base_init_script()` and `_build_rootfs()` are private SmolVM internals and may change. The dependency remains pinned to `smolvm==0.0.28`, and focused tests cover the call boundary.
 
-Exit: replace with a public SmolVM boot-hook API, e.g. `/etc/smolvm/boot.d/*.sh` or a public `custom_commands`/`boot_hooks` parameter.
+Exit: use a public SmolVM rootfs-only API that accepts caller-owned Dockerfile/context and init commands without resolving a kernel or injecting a guest agent.
 
 ## SmolVM preset creation through private facade methods
 
