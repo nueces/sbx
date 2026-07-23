@@ -43,6 +43,7 @@ from sbx_gateway_mediator import (  # noqa: E402
     Admission,
     AwsCodeArtifactTokenProvider,
     CapabilityVerifier,
+    CommandTokenProvider,
     CredentialProviderError,
     GatewayAddon,
     HeaderSecret,
@@ -583,6 +584,22 @@ class PackageAuthUnitTests(unittest.TestCase):
             provider.get_token()
         self.assertNotIn(FAKE_TOKEN, str(error.exception))
         self.assertEqual(calls, 2)
+
+    def test_provider_output_is_bounded_and_environment_is_sanitized(self) -> None:
+        captured: dict[str, object] = {}
+
+        def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            captured.update(kwargs)
+            return subprocess.CompletedProcess(argv, 0, "x" * 65537, "")
+
+        provider = CommandTokenProvider(("helper",), runner=runner)
+        with self.assertRaisesRegex(CredentialProviderError, "oversized"):
+            provider.get_token()
+        self.assertEqual(
+            captured["env"],
+            {"HOME": os.environ.get("HOME", ""), "PATH": os.defpath, "TZ": "UTC"},
+        )
+        self.assertEqual(captured["timeout"], 10)
 
     def test_package_redirect_cannot_escape_path_scope(self) -> None:
         addon, client = self._addon()

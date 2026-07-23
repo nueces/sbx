@@ -7,6 +7,7 @@ import platform
 import re
 import stat
 import subprocess
+import sys
 from contextlib import suppress
 from dataclasses import dataclass
 from importlib.metadata import version as package_version
@@ -26,6 +27,7 @@ _SUPPORTED_SMOLVM_VERSIONS = {"0.0.28"}
 _UNIX_SOCKET_PATH_MAX_BYTES = 103
 _MAC_PATTERN = re.compile(r"(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\Z")
 _QEMU_VERSION_PATTERN = re.compile(r"QEMU emulator version (\d+)\.(\d+)(?:\.(\d+))?")
+_QEMU_SANDBOX = "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +38,23 @@ class ExternalNetworkBackend:
     socket_path: Path
     role: Literal["qemu-connects"]
     mac: str
+
+
+def _resolved_executable(path: Path, label: str) -> Path:
+    if not path.is_absolute():
+        raise ConfigError(f"{label} path must be absolute")
+    try:
+        target = path.resolve(strict=True)
+        info = target.stat()
+    except OSError as exc:
+        raise ConfigError(f"{label} is missing: {path}: {exc}") from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_IMODE(info.st_mode) & 0o022
+        or not os.access(target, os.X_OK)
+    ):
+        raise ConfigError(f"{label} is unsafe: {path}")
+    return path
 
 
 def _capture(argv: list[str]) -> subprocess.CompletedProcess[str]:
@@ -56,11 +75,21 @@ def _validate_socket_path(path: Path) -> None:
             f"gateway QEMU socket path exceeds {_UNIX_SOCKET_PATH_MAX_BYTES} filesystem bytes"
         )
     try:
-        mode = path.lstat().st_mode
+        info = path.lstat()
+        parent = path.parent.lstat()
     except OSError as exc:
         raise ConfigError(f"gateway QEMU socket is not ready: {path}: {exc}") from exc
-    if stat.S_ISLNK(mode) or not stat.S_ISSOCK(mode):
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISSOCK(info.st_mode):
         raise ConfigError(f"gateway QEMU socket path is not a Unix socket: {path}")
+    if (
+        info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or not stat.S_ISDIR(parent.st_mode)
+        or stat.S_ISLNK(parent.st_mode)
+        or parent.st_uid != os.getuid()
+        or stat.S_IMODE(parent.st_mode) != 0o700
+    ):
+        raise ConfigError("gateway QEMU socket and directory must be owner-only")
 
 
 def _validate_backend(backend: ExternalNetworkBackend) -> None:
@@ -99,6 +128,11 @@ def require_external_network_support(qemu_bin: Path) -> tuple[int, int, int]:
     if result.returncode != 0 or "stream" not in backends:
         raise ConfigError(f"QEMU does not support the required 'stream' netdev backend: {qemu_bin}")
     return version
+
+
+def _qemu_sandbox_supported(qemu_bin: Path) -> bool:
+    result = _capture([str(qemu_bin), "--help"])
+    return result.returncode == 0 and "-sandbox" in result.stdout
 
 
 def _replace_network(argv: list[str], backend: ExternalNetworkBackend) -> list[str]:
@@ -141,9 +175,17 @@ def build_qemu_argv(
     host_system: str | None = None,
 ) -> list[str]:
     """Build stock SmolVM argv, replacing only its single NIC when requested."""
+    sandbox = False
     if external_network is not None:
         _validate_backend(external_network)
         require_external_network_support(qemu_bin)
+        linux = (host_system or platform.system()) == "Linux"
+        sandbox = linux and _qemu_sandbox_supported(qemu_bin)
+        if linux and not sandbox:
+            print(
+                "sbx: warning: QEMU sandbox support is unavailable; confinement is reduced",
+                file=sys.stderr,
+            )
 
     argv = _build_smolvm_qemu_argv(
         vm_info,
@@ -157,7 +199,12 @@ def build_qemu_argv(
         root_node_name=root_node_name,
         host_system=host_system,
     )
-    return argv if external_network is None else _replace_network(argv, external_network)
+    if external_network is None:
+        return argv
+    argv = _replace_network(argv, external_network)
+    if sandbox:
+        argv[1:1] = ["-sandbox", _QEMU_SANDBOX]
+    return argv
 
 
 # ponytail: private SmolVM lifecycle seams; remove when its typed backend API ships.
@@ -187,9 +234,11 @@ def start_vm(
         firmware_vars_path: Path | None = None,
         swtpm_socket: Path | None = None,
     ) -> subprocess.Popen[bytes]:
-        qemu_bin = sdk._find_qemu_binary()
+        override = os.environ.get("SBX_QEMU_BIN")
+        qemu_bin = Path(override).expanduser() if override else sdk._find_qemu_binary()
         if qemu_bin is None:
             raise SmolVMError("qemu-system binary is missing")
+        qemu_bin = _resolved_executable(qemu_bin, "QEMU executable")
         platform_spec = get_guest_platform(
             info.config.guest_os,
             host_system=platform.system(),
@@ -207,14 +256,22 @@ def start_vm(
             start_paused=start_paused,
             root_node_name=root_node_name,
         )
-        log_file = open(log_path, "w")  # noqa: SIM115 - owned until runtime closes.
+        fd = os.open(
+            log_path,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        os.fchmod(fd, 0o600)
+        log_file = os.fdopen(fd, "w")  # owned until the SmolVM runtime closes it.
         try:
             process = subprocess.Popen(
                 argv,
                 stdin=subprocess.DEVNULL,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
+                close_fds=True,
                 start_new_session=True,
+                env={"HOME": str(sdk.data_dir), "LANG": "C.UTF-8", "PATH": os.defpath, "TZ": "UTC"},
             )
         except BaseException:
             log_file.close()

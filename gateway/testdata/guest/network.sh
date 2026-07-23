@@ -44,6 +44,7 @@ import queue
 import socket
 import ssl
 import threading
+import time
 
 
 def ingress_server(port, expected, body, results, ready):
@@ -51,24 +52,36 @@ def ingress_server(port, expected, body, results, ready):
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("0.0.0.0", port))
     listener.listen()
-    listener.settimeout(30)
+    listener.settimeout(1)
     ready.put(port)
+    deadline = time.monotonic() + 30
     try:
-        conn, _ = listener.accept()
-        with conn:
-            conn.settimeout(10)
-            request = b""
-            while b"\r\n\r\n" not in request:
-                request += conn.recv(4096)
-            target = request.split(b" ", 2)[1].decode()
-            assert target == expected, (target, expected)
-            conn.sendall(
-                b"HTTP/1.0 200 OK\r\nContent-Length: "
-                + str(len(body)).encode()
-                + b"\r\n\r\n"
-                + body
-            )
-            results.put(target)
+        while time.monotonic() < deadline:
+            try:
+                conn, _ = listener.accept()
+            except TimeoutError:
+                continue
+            with conn:
+                conn.settimeout(10)
+                request = b""
+                while b"\r\n\r\n" not in request:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    request += chunk
+                parts = request.split(b" ", 2)
+                target = parts[1].decode() if len(parts) == 3 else ""
+                if target != expected:
+                    continue
+                conn.sendall(
+                    b"HTTP/1.0 200 OK\r\nContent-Length: "
+                    + str(len(body)).encode()
+                    + b"\r\n\r\n"
+                    + body
+                )
+                results.put(target)
+                return
+        raise TimeoutError(f"expected ingress request did not arrive: {expected}")
     finally:
         listener.close()
 

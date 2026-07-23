@@ -3,6 +3,7 @@ import hmac
 import json
 import os
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -110,10 +111,12 @@ class FakeRunner:
         self.calls: list[list[str]] = []
         self.passed_fds: list[int] = []
         self.processes: list[FakeProcess] = []
+        self.kwargs: list[dict[str, Any]] = []
         self.worker_starts = 0
 
     def __call__(self, argv: list[str], **kwargs: Any) -> FakeProcess:
         self.calls.append(argv)
+        self.kwargs.append(kwargs)
         self.passed_fds.extend(kwargs["pass_fds"])
         component = "mediator" if argv[0] == "fake-mediator" else "worker"
         if component == "worker":
@@ -139,6 +142,7 @@ class FakeRunner:
                     "pid": process.pid,
                     "vm_id": argv[-2],
                     "incarnation": argv[-1],
+                    "hardening": "no_new_privs,seccomp,landlock-unavailable,rlimits",
                 }
                 os.write(ready_fd, json.dumps(payload).encode() + b"\n")
         else:
@@ -159,11 +163,13 @@ class FakeRunner:
                 "incarnation_proof": hmac.new(token, message, hashlib.sha256).hexdigest(),
                 "mediator": True,
                 "ingress": 1,
+                "hardening": "no_new_privs,seccomp,landlock-unavailable,rlimits",
             }
-            payload = json.dumps(ready).encode() + b'\n{"status":"network-ready"}\n'
+            network_ready = b'\n{"status":"network-ready","qemu_pid":12345}\n'
+            payload = json.dumps(ready).encode() + network_ready
             if behavior == "worker_stale":
                 ready["incarnation"] = "stale-worker"
-                payload = json.dumps(ready).encode() + b'\n{"status":"network-ready"}\n'
+                payload = json.dumps(ready).encode() + network_ready
             elif behavior == "worker_proof":
                 ready["incarnation_proof"] = "0" * 64
                 payload = json.dumps(ready).encode() + b'\n{"status":"network-ready"}\n'
@@ -340,6 +346,35 @@ def test_readiness_rejects_invalid_exited_closed_and_oversized_channels(
         process.terminate()
 
 
+def test_logs_and_artifact_overrides_are_private_bounded_and_safe(
+    lifecycle_config: gateway.GatewayConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance = gateway.GatewayController(lifecycle_config, "vm1", root=tmp_path / "state")
+    instance.directory = gateway.create_state(
+        lifecycle_config, "vm1", "generation1", root=tmp_path / "state"
+    )
+    log = instance._open_log("worker.log")
+    assert stat.S_IMODE(os.fstat(log.fileno()).st_mode) == 0o600
+    log.close()
+    (instance.directory / "oversized.log").write_bytes(b"")
+    os.truncate(instance.directory / "oversized.log", gateway.MAX_LOG_BYTES)
+    with pytest.raises(gateway.GatewayLifecycleError, match="log limit"):
+        instance._open_log("next.log")
+
+    unsafe = tmp_path / "unsafe-worker"
+    unsafe.write_text("worker")
+    unsafe.chmod(0o777)
+    monkeypatch.setenv("SBX_GATEWAY_BIN", str(unsafe))
+    with pytest.raises(gateway.GatewayLifecycleError, match="missing or unsafe"):
+        instance._worker_command(None, 4)
+    monkeypatch.setenv("SBX_GATEWAY_BIN", "relative-worker")
+    with pytest.raises(gateway.GatewayLifecycleError, match="missing or unsafe"):
+        instance._worker_command(None, 4)
+    instance.close()
+
+
 def test_real_commands_bind_fresh_authentication_and_controller_endpoints(
     lifecycle_config: gateway.GatewayConfig,
     tmp_path: Path,
@@ -350,6 +385,9 @@ def test_real_commands_bind_fresh_authentication_and_controller_endpoints(
     launcher = tmp_path / "launch.py"
     for artifact in (worker, python, launcher):
         artifact.touch()
+    worker.chmod(0o700)
+    python.chmod(0o700)
+    launcher.chmod(0o600)
     monkeypatch.setenv("SBX_GATEWAY_BIN", str(worker))
     monkeypatch.setenv("SBX_GATEWAY_MEDIATOR_PYTHON", str(python))
     monkeypatch.setenv("SBX_GATEWAY_MEDIATOR_LAUNCHER", str(launcher))
@@ -416,6 +454,10 @@ def test_fake_runner_and_socket_normal_lifecycle(
     assert directory is not None and not directory.exists()
     assert listeners[0].closed
     assert all(process.poll() is not None for process in runner.processes)
+    for kwargs in runner.kwargs:
+        assert set(kwargs["env"]) == {"HOME", "LANG", "PATH", "TZ"}
+        assert not set(kwargs["env"]) & {"LD_PRELOAD", "PYTHONPATH", "HTTP_PROXY"}
+        assert kwargs["close_fds"] is not False if "close_fds" in kwargs else True
 
 
 def test_authenticated_replacement_preserves_endpoints_and_discards_every_old_flow(
@@ -604,7 +646,7 @@ def test_supervisor_automatically_replaces_crashed_worker_with_bounded_wait(
 ) -> None:
     instance, runner, _ = controller(lifecycle_config, tmp_path, monkeypatch)
     instance.prepare()
-    instance.vm_network_ready(os.getpid())
+    instance.vm_network_ready(12345)
     runner.processes[-1].crash()
 
     deadline = time.monotonic() + 1
@@ -753,6 +795,22 @@ def test_unprepared_network_readiness_and_stubborn_process_termination_fail_boun
     process = StubbornProcess()
     instance._terminate(process)
     assert process.terminated and process.killed and process.poll() == -9
+
+
+def test_qemu_peer_process_identity_mismatch_fails_closed(
+    lifecycle_config: gateway.GatewayConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance, runner, listeners = controller(lifecycle_config, tmp_path, monkeypatch)
+    instance.prepare()
+
+    with pytest.raises(gateway.GatewayAuthenticationError, match="peer process identity"):
+        instance.vm_network_ready(54321)
+
+    assert instance.directory is not None and not instance.directory.exists()
+    assert listeners[0].closed
+    assert all(process.poll() is not None for process in runner.processes)
 
 
 def test_post_qemu_readiness_failure_rolls_back_everything(
@@ -941,7 +999,8 @@ def test_explicit_stop_cleans_gateway_after_vm_and_on_interrupt(
 MEDIATOR = """
 import json, os, signal, sys
 ready = {'status':'ready','host':'127.0.0.1','port':34567,'pid':os.getpid(),
-         'vm_id':sys.argv[2],'incarnation':sys.argv[3]}
+         'vm_id':sys.argv[2],'incarnation':sys.argv[3],
+         'hardening':'no_new_privs,seccomp,landlock-unavailable,rlimits'}
 os.write(int(sys.argv[1]), (json.dumps(ready)+'\\n').encode())
 signal.pause()
 """
@@ -954,8 +1013,9 @@ print(json.dumps({'status':'ready','version':1,'vm_id':sys.argv[3],
                   'generation':sys.argv[4],'digest':policy['digest'],
                   'incarnation':sys.argv[5],
                   'incarnation_proof':hmac.new(token,message,hashlib.sha256).hexdigest(),
-                  'mediator':True,'ingress':1}), flush=True)
-print('{"status":"network-ready"}', flush=True)
+                  'mediator':True,'ingress':1,
+                  'hardening':'no_new_privs,seccomp,landlock-unavailable,rlimits'}), flush=True)
+print(json.dumps({'status':'network-ready','qemu_pid':os.getppid()}), flush=True)
 signal.pause()
 """
 WORKER_STATS_ONLY = """
@@ -967,7 +1027,8 @@ print(json.dumps({'status':'ready','version':1,'vm_id':sys.argv[3],
                   'generation':sys.argv[4],'digest':policy['digest'],
                   'incarnation':sys.argv[5],
                   'incarnation_proof':hmac.new(token,message,hashlib.sha256).hexdigest(),
-                  'mediator':True,'ingress':1}), flush=True)
+                  'mediator':True,'ingress':1,
+                  'hardening':'no_new_privs,seccomp,landlock-unavailable,rlimits'}), flush=True)
 while True:
     print('{"status":"stats"}', flush=True)
     time.sleep(0.01)

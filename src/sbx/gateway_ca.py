@@ -27,14 +27,23 @@ class GatewayCA:
 
 
 def _owner_file(path: Path) -> bytes:
-    info = path.lstat()
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or info.st_uid != os.getuid()
-        or stat.S_IMODE(info.st_mode) & 0o077
-    ):
-        raise GatewayCAError(f"unsafe gateway CA file: {path}")
-    return path.read_bytes()
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) & 0o077
+                or info.st_size > 1 << 20
+            ):
+                raise GatewayCAError(f"unsafe gateway CA file: {path}")
+            with os.fdopen(fd, "rb", closefd=False) as source:
+                return source.read(1 << 20 | 1)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise GatewayCAError(f"unsafe gateway CA file: {path}") from exc
 
 
 def certificate_fingerprint(certificate: bytes) -> str:

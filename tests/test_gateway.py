@@ -59,6 +59,23 @@ def test_gateway_absence_preserves_disabled_behavior() -> None:
     assert gateway.parse_config({"sbx": {"port_forwards": ["3000"]}}) is None
 
 
+def test_hardening_status_and_portable_artifact_resolution(tmp_path: Path) -> None:
+    artifact = tmp_path / "artifact"
+    artifact.write_text("data")
+    artifact.chmod(0o600)
+    assert gateway._resolve_artifact(
+        "SBX_TEST_MISSING_OVERRIDE",
+        (None, artifact),
+        executable=False,
+        label="test artifact",
+    ) == artifact
+    assert gateway._hardening_ready(
+        "no_new_privs,seccomp,landlock-unavailable,rlimits", "linux"
+    )
+    assert not gateway._hardening_ready("seccomp", "linux")
+    assert gateway._hardening_ready("unverified", "darwin")
+
+
 def test_gateway_defaults_are_deny_and_bounded() -> None:
     config = gateway.parse_config({"network": {}}, platform="linux")
 
@@ -378,6 +395,31 @@ def test_state_rejects_symlinks_at_every_owned_boundary(
     (root / "vm-1").symlink_to(target, target_is_directory=True)
     with pytest.raises(gateway.GatewayStateError, match="unsafe"):
         gateway.create_state(gateway_config, "vm-1", "generation-1", root=root)
+
+
+def test_state_rejects_nested_symlink_ancestor_and_oversized_state(
+    gateway_config: gateway.GatewayConfig, tmp_path: Path
+) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(real, target_is_directory=True)
+    with pytest.raises(gateway.GatewayStateError, match="unsafe"):
+        gateway.create_state(
+            gateway_config,
+            "vm-1",
+            "generation-1",
+            root=linked / "nested" / "gateway",
+        )
+
+    directory = gateway.create_state(
+        gateway_config, "vm-1", "generation-1", root=tmp_path / "gateway"
+    )
+    state = directory / "state.json"
+    with state.open("ab") as destination:
+        destination.truncate((1 << 20) + 1)
+    with pytest.raises(gateway.GatewayStateError, match="unsafe"):
+        gateway.read_state(directory)
 
 
 def test_state_rejects_non_owner_only_permissions(

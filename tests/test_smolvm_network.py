@@ -1,3 +1,4 @@
+import os
 import socket
 import subprocess
 from collections.abc import Iterator
@@ -19,6 +20,7 @@ def unix_socket(tmp_path: Path) -> Iterator[Path]:
     path = tmp_path / "qemu-net.sock"
     listener = socket.socket(socket.AF_UNIX)
     listener.bind(str(path))
+    path.chmod(0o600)
     try:
         yield path
     finally:
@@ -71,6 +73,8 @@ def test_qemu_probe_os_error_and_timeout_are_classified(
 def support_capture(argv: list[str]) -> subprocess.CompletedProcess[str]:
     if argv[-1] == "--version":
         return completed("QEMU emulator version 10.0.11 (Debian)\n")
+    if argv[-1] == "--help":
+        return completed("-sandbox on[,obsolete=deny][,spawn=deny]\n")
     return completed("Available netdev backend types:\nstream\nuser\ntap\n")
 
 
@@ -101,6 +105,8 @@ def test_external_network_builds_exact_single_stream_argv(
 
     assert argv == [
         "/usr/bin/qemu-system-x86_64",
+        "-sandbox",
+        "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny",
         "-smp",
         "2",
         "-m",
@@ -282,6 +288,7 @@ def test_start_vm_uses_external_backend_for_the_runtime_process(
     context = SimpleNamespace(start_qemu=None)
     qemu = tmp_path / "qemu-system-x86_64"
     qemu.touch()
+    qemu.chmod(0o700)
     sdk = SimpleNamespace(
         state=State(),
         data_dir=tmp_path,
@@ -326,10 +333,29 @@ def test_start_vm_uses_external_backend_for_the_runtime_process(
 
     assert smolvm_network.start_vm(vm, external, boot_timeout=12) == 7654
     assert sdk._process_handles[7654].pid == 7654
-    assert any(event[0] == "popen" for event in events if isinstance(event, tuple))
+    popen = next(event for event in events if isinstance(event, tuple) and event[0] == "popen")
+    environment = popen[2]["env"]
+    assert environment == {
+        "HOME": str(tmp_path),
+        "LANG": "C.UTF-8",
+        "PATH": os.defpath,
+        "TZ": "UTC",
+    }
     assert ("reset", {"close_ssh": False}) in events
     for stream in sdk._log_files.values():
         stream.close()
+
+
+def test_qemu_override_must_be_absolute_executable_and_non_writable(
+    tmp_path: Path,
+) -> None:
+    qemu = tmp_path / "qemu"
+    qemu.write_text("#!/bin/sh\n")
+    qemu.chmod(0o777)
+    with pytest.raises(ConfigError, match="unsafe"):
+        smolvm_network._resolved_executable(qemu, "QEMU executable")
+    with pytest.raises(ConfigError, match="absolute"):
+        smolvm_network._resolved_executable(Path("qemu"), "QEMU executable")
 
 
 def test_start_vm_failure_marks_state_error_and_closes_log(
@@ -385,6 +411,21 @@ def test_start_vm_rejects_invalid_state_and_missing_network(
     state.get_vm = lambda _vm_id: vm_info.model_copy(update={"network": None})
     with pytest.raises(Exception, match="no network configuration"):
         smolvm_network.start_vm(vm, backend(unix_socket), boot_timeout=1)
+
+
+def test_socket_and_parent_permissions_must_be_owner_only(
+    tmp_path: Path, vm_info: VMInfo, unix_socket: Path
+) -> None:
+    unix_socket.chmod(0o666)
+    with pytest.raises(ConfigError, match="owner-only"):
+        smolvm_network.build_qemu_argv(
+            vm_info,
+            qemu_bin=Path("/usr/bin/qemu"),
+            boot_args=vm_info.config.boot_args,
+            platform_spec=_LINUX_SPEC,
+            external_network=backend(unix_socket),
+            host_system="Linux",
+        )
 
 
 def test_socket_path_must_name_an_existing_unix_socket(tmp_path: Path, vm_info: VMInfo) -> None:

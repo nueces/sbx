@@ -31,6 +31,8 @@ MAX_RETAINED_TOTAL = 64 * 1024 * 1024
 MAX_WEBSOCKET_MESSAGE = 16 * 1024 * 1024
 MAX_HOOK_OUTPUT = 1024 * 1024
 MAX_HOOK_WORKERS = 8
+MAX_PROVIDER_OUTPUT = 64 * 1024
+PROVIDER_TIMEOUT = 10
 HOOK_TIMEOUT = 1.0
 _IMMUTABLE_HEADERS = frozenset(
     {
@@ -204,9 +206,18 @@ class CommandTokenProvider:
 
     def get_token(self) -> str:
         try:
-            result = self._runner(self._argv, text=True, capture_output=True, check=False)
-        except OSError as exc:
+            result = self._runner(
+                self._argv,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=PROVIDER_TIMEOUT,
+                env={"HOME": os.environ.get("HOME", ""), "PATH": os.defpath, "TZ": "UTC"},
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
             raise CredentialProviderError("credential command could not be started") from exc
+        if len(result.stdout.encode()) > MAX_PROVIDER_OUTPUT:
+            raise CredentialProviderError("credential command returned oversized output")
         if result.returncode != 0:
             raise CredentialProviderError(
                 f"credential command failed{_diagnostic_suffix(result.stderr)}"
@@ -255,9 +266,18 @@ class AwsCodeArtifactTokenProvider:
             if self._cached is not None and self._cached[1] - self._clock() > 60:
                 return self._cached[0]
             try:
-                result = self._runner(self._argv, text=True, capture_output=True, check=False)
-            except OSError as exc:
+                result = self._runner(
+                    self._argv,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=PROVIDER_TIMEOUT,
+                    env={"HOME": os.environ.get("HOME", ""), "PATH": os.defpath, "TZ": "UTC"},
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
                 raise CredentialProviderError("aws CLI could not be started") from exc
+            if len(result.stdout.encode()) > MAX_PROVIDER_OUTPUT:
+                raise CredentialProviderError("aws CLI returned oversized output")
             if result.returncode != 0:
                 raise CredentialProviderError(
                     f"aws CodeArtifact token refresh failed{_diagnostic_suffix(result.stderr)}"
@@ -355,6 +375,7 @@ class GatewayAddon:
                     "pid": os.getpid(),
                     "vm_id": vm_id,
                     "incarnation": incarnation,
+                    "hardening": os.environ.get("SBX_GATEWAY_HARDENING", "unavailable"),
                 }
             ).encode()
             + b"\n"
