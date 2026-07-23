@@ -106,7 +106,8 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$webpage_branch"
           python ../.github/scripts/bump_webpage_version.py "$RELEASE_VERSION" index.html
-          git add index.html
+          python ../.github/scripts/generate_complexity_report.py .. --output complexity.html
+          git add index.html complexity.html
           git diff --cached --quiet && { echo "webpage already matches $RELEASE_VERSION"; exit 0; }
           git commit -m "Update website for $RELEASE_TAG"
           git push origin "$webpage_branch"
