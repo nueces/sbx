@@ -26,3 +26,8 @@ jobs:
 
       - name: Run ruff
         run: uv run --python 3.12 --extra dev ruff check .
+
+      - name: Validate complexity report generation
+        run: |
+          python .github/scripts/generate_complexity_report.py . --output /tmp/complexity.html
+          grep -q "High and superior complexity" /tmp/complexity.html
