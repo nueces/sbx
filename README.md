@@ -1,8 +1,8 @@
 # sbx
 
-`sbx` runs coding agents inside disposable [SmolVM](https://github.com/CelestoAI/smolVM) virtual machines.
+`sbx` runs coding agents in disposable [SmolVM](https://github.com/CelestoAI/smolVM) virtual machines. Your project is mounted into the VM, while the agent, tools, and optional rootless Docker daemon run inside it.
 
-Agents and authentication run in the VM, not on the host. By default `sbx` does **not** copy host credentials into the guest. Set `copy_host_credentials = true` in `.sbx.toml` only when you explicitly want SmolVM presets to forward local agent configs/API keys.
+Host credentials are not copied by default. `sbx` forwards only selected environment variables and a safe subset of Git settings; it never forwards Git credentials or keys.
 
 ## Install
 
@@ -11,170 +11,55 @@ uv tool install git+https://github.com/nueces/sbx.git@v0.2.4
 sbx doctor
 ```
 
-For local development, install from a checkout instead:
+For local development:
 
 ```bash
 git clone https://github.com/nueces/sbx.git
 uv tool install --editable ./sbx
 ```
 
-## Usage
+## Recommended workflow
+
+### 1. Build the curated image
+
+The curated image contains Pi, common development tools, and rootless Docker. Building it requires a working host Docker installation:
 
 ```bash
-# Run an agent session. Creates the sandbox if missing, starts it if stopped,
-# exposes the OAuth callback port, then attaches to Pi.
-sbx run my-sbx
-
-# Create/provision only; do not attach and do not open auth forwarding.
-sbx create my-sbx
-
-# Open a shell in the sandbox. NAME defaults to [sbx].name when configured.
-# If [sbx].run_user is set, the shell opens as that user; use --root to override.
-# If [sbx].project_path is set, the shell starts in that mounted directory.
-sbx shell my-sbx
-sbx shell
-sbx shell --root
-
-# Lifecycle helpers.
-sbx ls
-sbx stop my-sbx
-sbx rm my-sbx --force
-sbx recreate my-sbx --force
+docker version
+sbx image build
 ```
 
-### Shell completion
+The image is written to `~/.smolvm/images/sbx`. The first build compiles a QEMU kernel and can take a while. Later builds reuse Docker layers.
 
-Generate static shell completion scripts with:
-
-```bash
-# bash
-sbx completion bash
-
-# zsh
-sbx completion zsh
-
-# fish
-sbx completion fish
-```
-
-For one-off use, run `eval "$(sbx completion bash)"` or `eval "$(sbx completion zsh)"`; in fish, run `sbx completion fish | source`.
-
-Common options:
-
-```bash
-# Mount a project at the same absolute path in the guest as read-write,
-# place it first in the mount list, and start the attached agent there.
-sbx run my-sbx --project-path .
-
-# Mount extra host directories at their same absolute guest paths.
-sbx run my-sbx --mount /home/me/src/tooling --mount /home/me/src/data
-
-# Or choose an explicit guest path.
-sbx run my-sbx --mount /home/me/src/tooling:/workspace/tooling
-
-# Start or create the VM without attaching an agent.
-sbx run my-sbx --no-attach
-```
-
-Port forwarding lets your host connect to a TCP service running inside the sandbox, such as a dev server or web app. `sbx network forward` runs in the foreground; Ctrl-C stops the forwarding.
-
-A forward `SPEC` maps a host address/port to a guest port:
-
-```text
-GUEST_PORT                 host 127.0.0.1:GUEST_PORT -> guest 127.0.0.1:GUEST_PORT
-HOST_PORT:GUEST_PORT       host 127.0.0.1:HOST_PORT  -> guest 127.0.0.1:GUEST_PORT
-BIND_HOST:HOST_PORT:GUEST_PORT
-                           host BIND_HOST:HOST_PORT  -> guest 127.0.0.1:GUEST_PORT
-```
-
-Examples:
-
-```text
-3000              host 127.0.0.1:3000 -> guest 127.0.0.1:3000
-8080:80           host 127.0.0.1:8080 -> guest 127.0.0.1:80
-0.0.0.0:8080:80   host 0.0.0.0:8080 -> guest 127.0.0.1:80
-```
-
-You can pass multiple specs in one command; one Ctrl-C stops all of them:
-
-```bash
-sbx network forward 3000
-sbx network forward 8080:3000
-sbx network forward 0.0.0.0:3000:3000
-sbx network forward --name my-sbx 3000 8080:80
-```
-
-```bash
-# Keep the VM running after the agent/shell exits.
-sbx run my-sbx --keep-running
-sbx shell my-sbx --keep-running
-
-# Write missing project defaults when reusing an existing VM/config.
-sbx run my-sbx --write-config
-
-# Run the attached agent process as a non-root guest user.
-sbx run my-sbx --run-user agent
-
-# Machine-readable lifecycle and inventory output.
-sbx run my-sbx --no-attach --json
-sbx ls --json
-sbx network status my-sbx --json
-
-# Explicitly forward a selected host environment variable into the guest.
-sbx run my-sbx --env OPENAI_API_KEY
-
-# Choose another agent preset.
-sbx run my-sbx --agent codex
-sbx run my-sbx --agent claude
-```
-
-## Command model
-
-`sbx` uses user-intent commands rather than mirroring SmolVM VM lifecycle names:
-
-| Command                          | Meaning                                                                                  |
-| -------------------------------- | ---------------------------------------------------------------------------------------- |
-| `run [NAME]`                     | Main workflow: create if missing, start if stopped, attach/run the agent.                |
-| `create [NAME]`                  | Create/provision a sandbox without attaching.                                            |
-| `recreate [NAME]`                | Destructively remove and create a fresh sandbox. Confirmation required unless `--force`. |
-| `rm [NAME]`                      | Remove a sandbox. Confirmation required unless `--force`.                                |
-| `stop [NAME]`                    | Stop a sandbox without removing it.                                                      |
-| `shell [NAME]`                   | Open a shell in a sandbox.                                                               |
-| `ls`                             | List all sandboxes. Use `ls --running` to show only running ones.                         |
-| `network status [NAME]`          | Expert helper: show sandbox networking and auth callback tunnel status.                  |
-| `network forward SPEC...`        | Temporarily forward ports for the project VM; use `--name` for another VM.               |
-| `network auth-port [NAME]`       | Expert helper: manually expose the OAuth callback port for an already-running sandbox.   |
-| `network close-auth-port [NAME]` | Expert helper: close the tracked OAuth callback tunnel.                                  |
-| `image build`                    | Build the curated local Pi/rootless-Docker image.                                        |
-| `image ls`                       | List local ready-to-run images under `~/.smolvm/images`.                                |
-| `doctor`                         | Run non-sudo SmolVM diagnostics for QEMU.                                                |
-| `completion SHELL`               | Generate shell completion for `bash`, `zsh`, or `fish`.                                  |
-
-When `NAME` is omitted, commands that operate on one sandbox use `[sbx].name` from configuration.
-
-We intentionally keep `recreate` separate from a possible future `restart`/`reboot`: `recreate` means delete and create a fresh VM, while a soft restart would reuse the same VM disk/state.
-
-## Images and features
-
-List local ready-to-run images:
+Check the result with:
 
 ```bash
 sbx image ls
 ```
 
-Build the curated image and create project configuration while starting it:
+See the [image guide](docs/build-local-debian-pi-image.md) for custom sizes, Docker details, and troubleshooting.
+
+### 2. Create the project sandbox
+
+Run this from the project you want the agent to work on:
 
 ```bash
-sbx image build
+cd ~/code/my-project
 sbx run the-quest \
   --image '~/.smolvm/images/sbx' \
   --run-user agent \
   --project-path . \
-  --writable-mounts \
-  --write-config
+  --writable-mounts
 ```
 
-The suggested project configuration is:
+On first creation, `sbx`:
+
+1. creates and starts the VM;
+2. mounts the project at the same absolute path inside the VM;
+3. writes the project settings to `./.sbx.toml`; and
+4. launches Pi as the `agent` user in the mounted project.
+
+The generated configuration is intentionally small and resembles:
 
 ```toml
 [sbx]
@@ -188,222 +73,139 @@ copy_host_credentials = false
 git_config = true
 ```
 
-`--write-config` belongs to `run` and `create`; `image build` never changes `.sbx.toml`.
-
-Configure durable TCP forwards applied when the VM starts:
-
-```toml
-[sbx]
-port_forwards = ["3000", "8080:3000"]
-```
-
-The default image includes rootless Docker. For a larger Docker data/build cache, increase its rootfs:
+The sandbox name is now stored in the project, so later commands are short:
 
 ```bash
-sbx image build --rootfs-size-mb 81920
+sbx run       # start if needed and launch the agent
+sbx shell     # open a shell in the same project directory
+sbx stop      # stop the VM
+sbx rm        # remove the VM after confirmation
 ```
 
-These Debian/Pi images should run as `agent`; rootless Docker also uses that user. Built images show `docker` in `sbx image ls` and start rootless Docker at boot.
+Run `/login` inside Pi when authentication is needed. `sbx run` automatically forwards the browser callback port to the VM.
 
-For details, see [`docs/build-local-debian-pi-image.md`](docs/build-local-debian-pi-image.md). For contributor setup and test commands, see [`docs/development.md`](docs/development.md).
+### 3. Add another folder later
 
-## Configuration
-
-`sbx` reads TOML configuration from these locations, merging later files over earlier files:
-
-1. `~/.config/sbx/config.toml` — user defaults
-2. `./.sbx.toml` — project defaults from the directory where `sbx` is executed
-3. `--config PATH` — explicit override file
-
-CLI flags always override config values.
-
-Start with the released defaults; add `.sbx.toml` only when you need a named VM, mounts, image, user, or safety defaults.
-
-When `sbx run` or `sbx create` creates a new named VM and `./.sbx.toml` does not exist, `sbx` writes a minimal project config with the VM name and selected options. Existing VMs do not create or update `.sbx.toml` unless `--write-config` is passed.
-Configuration should describe the sandbox, while command choice describes the action. For example, use `sbx run` to attach and `sbx create` to create without attaching, rather than relying on config to change interaction style.
-
-Example `.sbx.toml`:
+Mounts are applied when a VM starts; they cannot be hot-added to an already-running VM. Add the folder to `.sbx.toml` using an absolute host path:
 
 ```toml
 [sbx]
-agent = "pi" # pi, claude, or codex
-name = "the-quest"
-memory = 4096
-cpus = 2
-disk_size = 20480
-# QEMU is the only supported backend for now.
-backend = "qemu"
-os = "ubuntu"
-install_timeout = 600
-boot_timeout = 30
-
-# Optional: use a local ready-to-run image directory with smolvm-image.json.
-# image = "./images/debian-pi"
-
-# Bare mounts use the same absolute guest path.
-# Explicit HOST:GUEST mounts keep the configured guest path.
+# Existing project settings remain here.
 mount = [
-  "/foo/bar",
-  "/foo/cache:/workspace/cache",
+  "/home/me/code/shared-tools",
+  "/home/me/data:/workspace/data",
 ]
-# project_path is mounted first and used as the attached working directory.
-project_path = "."
 writable_mounts = true
-run_user = "agent"
+```
 
-auth_port = true
-auth_host_port = 1455
-auth_guest_port = 1455
+A bare path appears at the same absolute path in the VM. `HOST:GUEST` chooses a different guest path.
 
-# Stop the VM when an sbx run/shell session exits and no other sbx sessions remain.
-stop_on_exit = true
+If the VM is running, restart it through `sbx` to apply the mounts:
 
-# False by default. Keep host credential files out of the guest unless explicitly allowed.
+```bash
+sbx stop
+sbx run
+```
+
+If you try to run with different mounts while the VM is already running, `sbx` keeps the current mounts and prints the same stop-and-run guidance.
+
+### 4. Install more tools inside the sandbox
+
+The curated image includes Pi. For one project, install other tools directly in the VM instead of rebuilding the image:
+
+```bash
+sbx shell
+
+# Inside the VM, as the configured agent user:
+npm install -g opencode-ai
+npm install -g @anthropic-ai/claude-code
+npm install -g @openai/codex
+exit
+```
+
+Claude Code and OpenCode require their npm postinstall scripts to prepare native binaries; do not install either with `--ignore-scripts`.
+
+These commands change the sandbox disk, not the curated image. The disk survives `sbx stop`, so manually installed software remains available on later runs:
+
+```bash
+sbx run --agent claude
+sbx run --agent codex
+
+# OpenCode is not an sbx agent preset; launch it from a sandbox shell.
+sbx shell
+opencode
+```
+
+`sbx recreate` and `sbx rm` delete that VM disk. Install frequently used tools in the curated image if every new or recreated sandbox should contain them.
+
+## Everyday operations
+
+```bash
+# List all sandboxes, including stopped ones.
+sbx ls
+
+# Create or start without launching an agent.
+sbx run --no-attach
+
+# Keep the VM running after the agent exits.
+sbx run --keep-running
+
+# Recreate the VM from the current configuration.
+sbx recreate --force
+
+# Temporarily expose a service from the VM until Ctrl-C.
+sbx network forward 3000
+sbx network forward 8080:3000
+```
+
+Use `sbx --help` or `sbx COMMAND --help` for the complete command and option reference.
+
+## Project configuration
+
+`sbx` reads configuration in this order, with later values winning:
+
+1. `~/.config/sbx/config.toml` — user defaults;
+2. `./.sbx.toml` — project defaults; and
+3. `--config PATH` — an explicit override.
+
+CLI options override configuration. Keep durable project choices such as the image, VM resources, user, mounts, and forwarded environment names in `.sbx.toml`; use commands for actions such as running, stopping, or recreating.
+
+Security-sensitive behavior is configuration-only:
+
+```toml
+[sbx]
+# Disabled by default. Enable only when the VM should receive host agent configs.
 copy_host_credentials = false
 
-# Empty by default. Host environment variables are not forwarded unless listed here
-# or passed with `--env KEY`.
-env = []
-
-# True by default. Copies safe Git identity/config only, not credentials.
+# Copies safe Git identity/workflow settings, never credentials or keys.
 git_config = true
+
+# Forward only named host environment variables.
+env = ["OPENAI_API_KEY"]
 ```
 
-### Config reference
+See [`sbx.toml.example`](sbx.toml.example) for available settings.
 
-| Section | Key                     | CLI flag                                                 | Description                                                                                                                                                |
-| ------- | ----------------------- | -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `[sbx]` | `agent`                 | `--agent`                                                | Default agent: `pi`, `claude`, or `codex`.                                                                                                                 |
-| `[sbx]` | `name`                  | positional `NAME`                                        | VM name.                                                                                                                                                   |
-| `[sbx]` | `memory`                | `--memory`                                               | Memory in MiB.                                                                                                                                             |
-| `[sbx]` | `cpus`                  | `--cpus`                                                 | Number of virtual CPUs.                                                                                                                                    |
-| `[sbx]` | `disk_size`             | `--disk-size`                                            | Disk size in MiB.                                                                                                                                          |
-| `[sbx]` | `backend`               | -                                                        | Must be `qemu` for now. Other backends may be supported later.                                                                                             |
-| `[sbx]` | `os`                    | -                                                        | Guest OS value passed to SmolVM. Ignored when `image` is set.                                                                                              |
-| `[sbx]` | `image`                 | `--image`                                                | Local ready-to-run image directory containing `smolvm-image.json`, kernel, and rootfs.                                                                     |
-| `[sbx]` | `mount`                 | `--mount`                                                | Host mount(s), as a string or array of strings. Bare host paths mount at the same absolute guest path; `HOST:GUEST` keeps the explicit guest path.          |
-| `[sbx]` | `project_path`          | `--project-path`                                         | Mount a path first at the same absolute guest path, force RW mounts, and start the attached agent there.                                                    |
-| `[sbx]` | `writable_mounts`       | `--writable-mounts`                                      | Enable writable mounts.                                                                                                                                    |
-| `[sbx]` | `run_user`              | `--run-user`                                             | Create/use a guest user and run the attached agent/shell as that user.                                                                                     |
-| `[sbx]` | `auth_port`             | -                                                        | Automatically expose the OAuth callback port before attaching. Defaults to `true` for `run`.                                                               |
-| `[sbx]` | `auth_host_port`        | -                                                        | Host localhost port for OAuth callback forwarding. Defaults to `1455`.                                                                                     |
-| `[sbx]` | `auth_guest_port`       | -                                                        | Guest port for OAuth callback forwarding. Defaults to `1455`.                                                                                              |
-| `[sbx]` | `stop_on_exit`          | `--stop-on-exit` / `--keep-running`                      | Stop the VM after run/shell exits if no other sbx sessions remain. Defaults to `true`.                                                                     |
-| `[sbx]` | `copy_host_credentials` | -                                                        | Allow/deny copying host credential files/configs. Defaults to `false`; enabling it prints a provisioning warning.                                         |
-| `[sbx]` | `env`                   | `--env KEY`                                              | Explicit allowlist of host environment variables to forward into the guest. Defaults to empty. See [environment forwarding](docs/environment-forwarding.md). |
-| `[sbx]` | `git_config`            | -                                                        | Copy safe host Git identity/config into the guest. Defaults to `true`; does not copy credentials, SSH keys, signing keys, includes, or credential helpers. |
-| `[sbx]` | `install_timeout`       | `--install-timeout`                                      | Agent install timeout in seconds. Ignored when `image` is set.                                                                                             |
-| `[sbx]` | `boot_timeout`          | `--boot-timeout`                                         | VM boot/SSH readiness timeout in seconds. Defaults to `30`. Increase this if a cold boot leaves the VM running but SSH is not ready yet.                   |
-
-### Environment forwarding
-
-Host environment variables are not forwarded by default. Add selected names to `[sbx].env` or pass `--env KEY` to `sbx run`.
-
-Before `sbx run` or `sbx shell` attaches, `sbx` syncs those names from the current host environment into the VM. Missing host variables are unset in the guest to avoid stale secrets. This affects only new attached processes; already-running agents or shells keep their old environment.
-
-See [`docs/environment-forwarding.md`](docs/environment-forwarding.md) for details and limitations.
-
-### Local ready-to-run image directories
-
-When `[sbx].image` is set, `sbx` treats the image as already containing the selected agent. It boots the image directly with the SmolVM SDK and then attaches to run the agent command; it does not run SmolVM's preset installer. If `[sbx].disk_size` is set for a local raw ext4 image, `sbx` asks SmolVM to create an isolated disk of that size and grow the filesystem. For the end-to-end Debian/Pi and rootless Docker workflow, see [`docs/build-local-debian-pi-image.md`](docs/build-local-debian-pi-image.md).
-
-Example layout:
-
-```text
-images/debian-pi/
-├── smolvm-image.json
-├── vmlinux.bin
-└── rootfs.ext4
-```
-
-Example `smolvm-image.json`:
-
-```json
-{
-    "name": "debian-pi",
-    "kernel": "vmlinux.bin",
-    "rootfs": "rootfs.ext4",
-    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init",
-    "sbx": {
-        "agent": "pi",
-        "launch_command": "pi"
-    }
-}
-```
-
-## Git commits from inside the VM
-
-By default, `sbx run` and `sbx shell` copy a small safe subset of the host's global Git configuration into the guest user before attaching. This is intended to make commits inside the VM use the same author identity as the host. See [`docs/git-config-forwarding.md`](docs/git-config-forwarding.md) for details.
-
-Copied keys are limited to safe identity/workflow settings such as:
-
-```text
-user.name
-user.email
-init.defaultBranch
-pull.rebase
-push.default
-core.autocrlf
-core.eol
-```
-
-`sbx` does not copy Git credentials, SSH keys, GPG/signing keys, credential helpers, includes, or URL rewrite rules. Disable this in project configuration:
-
-```toml
-[sbx]
-git_config = false
-```
-
-## Browser login from inside the VM
-
-When you run `/login` inside Pi in the VM, Pi starts a callback server inside the guest, commonly on port `1455`. Browser approval redirects to:
-
-```text
-http://localhost:1455/auth/callback?code=...
-```
-
-Your browser runs on the host, so `sbx run` opens an SSH local forward by default:
-
-```text
-host localhost:1455 -> VM localhost:1455
-```
-
-For an already-running VM, inspect/open/close the port manually:
+## Shell completion
 
 ```bash
-sbx network status my-sbx
-sbx network auth-port my-sbx
-sbx network close-auth-port my-sbx
+# One-off setup for the current shell.
+eval "$(sbx completion bash)"
+eval "$(sbx completion zsh)"
+
+# fish
+sbx completion fish | source
 ```
 
-Known limitation: only one local process can own `localhost:1455` at a time. If
-multiple VMs are running, `/login` works only for the VM currently receiving that
-host port. Switch the tracked auth tunnel before logging in from another VM:
+The same commands can be redirected into your shell's normal completion directory for permanent installation.
 
-```bash
-sbx network auth-port other-sbx --replace
-```
+## More documentation
 
-If the port is owned by an untracked/non-`sbx` process, stop that process first.
+- [Build and run the curated image](docs/build-local-debian-pi-image.md)
+- [Environment forwarding](docs/environment-forwarding.md)
+- [Safe Git configuration forwarding](docs/git-config-forwarding.md)
+- [Networking commands](docs/network-command-roadmap.md)
+- [CLI ergonomics and behavior](docs/ergonomics.md)
+- [Contributor setup and tests](docs/development.md)
 
-## Releases
-
-Maintainers start a release with the manual `Start release` workflow:
-
-```bash
-gh workflow run start-release.yml --ref main -f version=0.2.1
-```
-
-Leave `version` blank to use the next patch version.
-
-Release workflows:
-
-- `.github/workflows/start-release.yml` (`Start release`): manual entry point; opens the package release PR, including the README install tag.
-- `.github/workflows/release-pr-checks.yml` (`Release PR checks`): validates `release/v*` PRs only change version files.
-- `.github/workflows/publish-release.yml` (`Publish release`): after the release PR is merged, creates the `v0.2.1` tag, GitHub release, website PR, and a PR bumping `main` to the next dev version, for example `0.2.2.dev0`.
-
-## Notes
-
-For the recommended working-directory/worktree layout with project-local Pi resources, see [`docs/project-organization.md`](docs/project-organization.md).
-
-`sbx` defaults to QEMU to avoid per-VM TAP/nftables sudo requirements. See [`docs/qemu-default.md`](docs/qemu-default.md) for the rationale.
+`sbx` uses QEMU by default to avoid per-VM TAP and nftables setup. See [QEMU defaults](docs/qemu-default.md) for the rationale.

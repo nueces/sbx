@@ -19,7 +19,7 @@ sbx network forward 3000
 sbx network forward 8080:3000
 sbx network forward 0.0.0.0:3000:3000
 sbx network forward 3000 8080:80
-sbx network forward --name my-sbx 3000 8080:80
+sbx network forward --name the-quest 3000 8080:80
 ```
 
 `SPEC` is one of:
