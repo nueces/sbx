@@ -70,6 +70,7 @@ def main() -> None:
     parser.add_argument("--key-fd", required=True, type=_fd)
     parser.add_argument("--ready-fd", required=True, type=_fd)
     parser.add_argument("--package-auth-fd", type=_fd)
+    parser.add_argument("--policy-fd", type=_fd)
     parser.add_argument("--confdir", required=True, type=Path)
     parser.add_argument("--upstream-ca", type=Path)
     args = parser.parse_args()
@@ -89,6 +90,8 @@ def main() -> None:
     )
     if args.package_auth_fd is not None:
         environment["SBX_GATEWAY_PACKAGE_AUTH_FD"] = str(args.package_auth_fd)
+    if args.policy_fd is not None:
+        environment["SBX_GATEWAY_POLICY_FD"] = str(args.policy_fd)
     argv = command(confdir, upstream_ca)
     os.execve(argv[0], argv, environment)
 

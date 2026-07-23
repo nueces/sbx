@@ -8,11 +8,12 @@ import hashlib
 import hmac
 import json
 import os
+import queue
 import re
 import subprocess
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any, NamedTuple
 from urllib.parse import unquote, urljoin, urlsplit
@@ -28,6 +29,22 @@ MAX_ACTIVE_REQUESTS = 128
 MAX_RETAINED_BODY = 8 * 1024 * 1024
 MAX_RETAINED_TOTAL = 64 * 1024 * 1024
 MAX_WEBSOCKET_MESSAGE = 16 * 1024 * 1024
+MAX_HOOK_OUTPUT = 1024 * 1024
+MAX_HOOK_WORKERS = 8
+HOOK_TIMEOUT = 1.0
+_IMMUTABLE_HEADERS = frozenset(
+    {
+        "connection",
+        "content-length",
+        "host",
+        "keep-alive",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
 
 
 class Admission(NamedTuple):
@@ -112,6 +129,64 @@ class PackageAuth(NamedTuple):
     path_prefix: str
     username: str
     placeholder: str
+
+
+class HookContext(NamedTuple):
+    vm_id: str
+    incarnation: str
+    flow_id: str
+    rule_id: str
+    host: str
+    port: int
+    scheme: str
+    method: str
+    path: str
+
+
+class Hook(NamedTuple):
+    on_request_headers: Callable[[HookContext, http.Headers], object] | None = None
+    on_request_chunk: Callable[[HookContext, bytes], object] | None = None
+    on_response_headers: Callable[[HookContext, http.Headers], object] | None = None
+    on_response_chunk: Callable[[HookContext, bytes], object] | None = None
+    request_buffer_limit: int = 0
+    response_buffer_limit: int = 0
+
+
+class RequestPolicy(NamedTuple):
+    rule_id: str
+    host: str
+    ports: tuple[int, ...]
+    methods: tuple[str, ...] = ()
+    paths: tuple[str, ...] = ()
+    hooks: tuple[str, ...] = ()
+
+
+class HeaderSecret(NamedTuple):
+    name: str
+    hosts: tuple[str, ...]
+    ports: tuple[int, ...]
+    methods: tuple[str, ...]
+    path_prefix: str | None
+    header_name: str
+    header_template: str
+    placeholder: str
+    value: str
+
+
+class HookFailure(RuntimeError):
+    pass
+
+
+def _package_audit(_context: HookContext, _headers: http.Headers) -> str:
+    return "continue"
+
+
+BUILTIN_HOOKS = {
+    "package-audit": Hook(
+        on_request_headers=_package_audit,
+        on_response_headers=_package_audit,
+    )
+}
 
 
 class CredentialProviderError(RuntimeError):
@@ -204,19 +279,22 @@ class AwsCodeArtifactTokenProvider:
 class RetainedBufferBudget:
     def __init__(self) -> None:
         self._sizes: dict[str, int] = {}
+        self._lock = threading.Lock()
         self.total = 0
 
     def reserve(self, flow_id: str, size: int) -> bool:
-        prior = self._sizes.get(flow_id, 0)
-        total = self.total - prior + size
-        if size < 0 or size > MAX_RETAINED_BODY or total > MAX_RETAINED_TOTAL:
-            return False
-        self._sizes[flow_id] = size
-        self.total = total
-        return True
+        with self._lock:
+            prior = self._sizes.get(flow_id, 0)
+            total = self.total - prior + size
+            if size < 0 or size > MAX_RETAINED_BODY or total > MAX_RETAINED_TOTAL:
+                return False
+            self._sizes[flow_id] = size
+            self.total = total
+            return True
 
     def release(self, flow_id: str) -> None:
-        self.total -= self._sizes.pop(flow_id, 0)
+        with self._lock:
+            self.total -= self._sizes.pop(flow_id, 0)
 
 
 class GatewayAddon:
@@ -226,11 +304,34 @@ class GatewayAddon:
         ready_fd: int | None = None,
         package_auth: PackageAuth | None = None,
         get_real_token: Callable[[], str] | None = None,
+        *,
+        policies: tuple[RequestPolicy, ...] = (),
+        secrets: tuple[HeaderSecret, ...] = (),
+        hooks: Mapping[str, Hook] = BUILTIN_HOOKS,
+        hook_timeout: float = HOOK_TIMEOUT,
     ) -> None:
+        if not 0 < hook_timeout <= HOOK_TIMEOUT:
+            raise ValueError("hook timeout must be positive and at most one second")
+        if len({policy.rule_id for policy in policies}) != len(policies):
+            raise ValueError("duplicate mediator request policy")
+        if any(
+            type(limit) is not int or not 0 <= limit <= MAX_RETAINED_BODY
+            for hook in hooks.values()
+            for limit in (hook.request_buffer_limit, hook.response_buffer_limit)
+        ):
+            raise ValueError("hook body buffer limit is invalid")
+        configured_hooks = {name for policy in policies for name in policy.hooks}
+        if configured_hooks - hooks.keys():
+            raise ValueError("mediator policy names an unavailable hook")
         self._verifier = verifier
         self._ready_fd = ready_fd
         self._package_auth = package_auth
         self._get_real_token = get_real_token
+        self._policies = {policy.rule_id: policy for policy in policies}
+        self._secrets = secrets
+        self._hooks = dict(hooks)
+        self._hook_timeout = hook_timeout
+        self._hook_slots = threading.BoundedSemaphore(MAX_HOOK_WORKERS)
         self._admissions: dict[str, Admission] = {}
         self._invalid_tls: set[str] = set()
         self._active: set[str] = set()
@@ -293,21 +394,20 @@ class GatewayAddon:
 
     def requestheaders(self, flow: http.HTTPFlow) -> None:
         admission = self._admissions.get(flow.client_conn.id)
-        if (
-            admission is None
-            or flow.client_conn.id in self._invalid_tls
-            or not self._request_matches(flow.request, admission)
-        ):
+        policy = self._authorize(flow, admission)
+        if admission is None or policy is None or flow.client_conn.id in self._invalid_tls:
             self._deny(flow, 403, b"sbx gateway denied destination")
             return
-        if (
-            self._header_size(flow.request) > MAX_HEADER_BYTES
-            or self._header_count(flow.request) > MAX_HEADER_FIELDS
-        ):
+        if not self._headers_valid(flow.request):
             self._deny(flow, 431, b"sbx gateway rejected request headers")
             return
         if len(self._active) >= MAX_ACTIVE_REQUESTS and flow.id not in self._active:
             self._deny(flow, 503, b"sbx gateway request capacity exhausted")
+            return
+        if not self._run_header_hooks(flow, admission, policy, request=True):
+            return
+        if self._authorize(flow, admission) is None:
+            self._deny(flow, 403, b"sbx gateway denied destination")
             return
         if self._package_auth is not None and admission.rule_id == self._package_auth.rule_id:
             if not self._package_request_matches(flow.request, admission):
@@ -317,7 +417,7 @@ class GatewayAddon:
             if parsed != (self._package_auth.username, self._package_auth.placeholder):
                 self._deny(flow, 403, b"sbx gateway denied package authorization")
                 return
-            if self._get_real_token is None:
+            if self._get_real_token is None or self._authorize(flow, admission) is None:
                 self._deny(flow, 503, b"sbx gateway credential provider unavailable")
                 return
             try:
@@ -328,31 +428,37 @@ class GatewayAddon:
             flow.request.headers["Authorization"] = _basic_authorization(
                 self._package_auth.username, token
             )
+        if not self._substitute_secrets(flow, admission):
+            return
+        if self._authorize(flow, admission) is None or not self._headers_valid(flow.request):
+            self._deny(flow, 403, b"sbx gateway denied destination")
+            return
         self._active.add(flow.id)
-        flow.request.stream = True
+        flow.request.stream = self._body_stream(flow, admission, policy, request=True)
 
     def responseheaders(self, flow: http.HTTPFlow) -> None:
-        if flow.response is None:
+        if flow.id not in self._active:
             return
-        if (
-            self._header_size(flow.response) > MAX_HEADER_BYTES
-            or self._header_count(flow.response) > MAX_HEADER_FIELDS
-        ):
+        admission = self._admissions.get(flow.client_conn.id)
+        policy = self._authorize(flow, admission)
+        if flow.response is None or admission is None or policy is None:
+            if flow.response is not None:
+                self._deny(flow, 502, b"sbx gateway denied destination")
+            return
+        if not self._headers_valid(flow.response):
             self._deny(flow, 502, b"sbx gateway rejected response headers")
             return
-        if 300 <= flow.response.status_code < 400 and "location" in flow.response.headers:
-            admission = self._admissions.get(flow.client_conn.id)
-            if admission is None or not self._redirect_matches(flow, admission):
-                self._deny(flow, 502, b"sbx gateway denied redirect")
-                return
-            if (
-                self._package_auth is not None
-                and admission.rule_id == self._package_auth.rule_id
-                and not self._package_redirect_matches(flow)
-            ):
-                self._deny(flow, 502, b"sbx gateway denied package redirect")
-                return
-        flow.response.stream = True
+        if not self._response_destination_allowed(flow, admission):
+            self._deny(flow, 502, b"sbx gateway denied redirect")
+            return
+        if not self._run_header_hooks(flow, admission, policy, request=False):
+            return
+        if self._authorize(flow, admission) is None or not self._response_destination_allowed(
+            flow, admission
+        ):
+            self._deny(flow, 502, b"sbx gateway denied destination")
+            return
+        flow.response.stream = self._body_stream(flow, admission, policy, request=False)
 
     def websocket_message(self, flow: http.HTTPFlow) -> None:
         admission = self._admissions.get(flow.client_conn.id)
@@ -381,9 +487,254 @@ class GatewayAddon:
         if hasattr(client, "sbx_admission"):
             del client.sbx_admission
 
+    def _authorize(self, flow: http.HTTPFlow, admission: Admission | None) -> RequestPolicy | None:
+        if admission is None or not self._request_matches(flow.request, admission):
+            return None
+        if not self._policies:
+            return RequestPolicy(admission.rule_id, admission.host, (admission.port,))
+        policy = self._policies.get(admission.rule_id)
+        if (
+            policy is None
+            or not _host_matches(policy.host, admission.host)
+            or admission.port not in policy.ports
+            or (policy.methods and flow.request.method.upper() not in policy.methods)
+            or (
+                policy.paths
+                and not any(_path_is_scoped(flow.request.path, path) for path in policy.paths)
+            )
+        ):
+            return None
+        return policy
+
+    def _context(self, flow: http.HTTPFlow, admission: Admission) -> HookContext:
+        return HookContext(
+            admission.vm_id,
+            admission.incarnation,
+            flow.id,
+            admission.rule_id,
+            admission.host,
+            admission.port,
+            flow.request.scheme,
+            flow.request.method,
+            _normalized_path(flow.request.path),
+        )
+
+    def _invoke(self, callback: Callable[..., object], *args: object) -> object:
+        if not self._hook_slots.acquire(blocking=False):
+            raise HookFailure("hook capacity exhausted")
+        results: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
+
+        def call() -> None:
+            try:
+                results.put((True, callback(*args)))
+            except BaseException as exc:
+                results.put((False, exc))
+            finally:
+                self._hook_slots.release()
+
+        threading.Thread(target=call, daemon=True, name="sbx-hook").start()
+        try:
+            succeeded, result = results.get(timeout=self._hook_timeout)
+        except queue.Empty as exc:
+            raise HookFailure("hook timed out") from exc
+        if not succeeded:
+            raise HookFailure("hook crashed")
+        return result
+
+    def _run_header_hooks(
+        self,
+        flow: http.HTTPFlow,
+        admission: Admission,
+        policy: RequestPolicy,
+        *,
+        request: bool,
+    ) -> bool:
+        message = flow.request if request else flow.response
+        assert message is not None
+        attribute = "on_request_headers" if request else "on_response_headers"
+        allowed = {"allow", "continue", "deny"} if request else {"continue", "deny"}
+        for name in policy.hooks:
+            callback = getattr(self._hooks[name], attribute)
+            if callback is None:
+                continue
+            if self._authorize(flow, admission) is None:
+                self._deny(flow, 403 if request else 502, b"sbx gateway denied destination")
+                return False
+            headers = message.headers.copy()
+            immutable = self._immutable_headers(headers)
+            try:
+                action = self._invoke(callback, self._context(flow, admission), headers)
+            except HookFailure:
+                self._deny(flow, 403 if request else 502, b"sbx gateway hook failed")
+                return False
+            if (
+                type(action) is not str
+                or action not in allowed
+                or action == "deny"
+                or immutable != self._immutable_headers(headers)
+            ):
+                self._deny(flow, 403 if request else 502, b"sbx gateway hook denied request")
+                return False
+            message.headers = headers.copy()
+            if (
+                self._authorize(flow, admission) is None
+                or not self._headers_valid(message)
+                or (not request and not self._response_destination_allowed(flow, admission))
+            ):
+                self._deny(flow, 403 if request else 502, b"sbx gateway denied hook output")
+                return False
+        return True
+
+    def _body_stream(
+        self,
+        flow: http.HTTPFlow,
+        admission: Admission,
+        policy: RequestPolicy,
+        *,
+        request: bool,
+    ) -> bool | Callable[[bytes], bytes]:
+        attribute = "on_request_chunk" if request else "on_response_chunk"
+        callbacks = [
+            (self._hooks[name], getattr(self._hooks[name], attribute))
+            for name in policy.hooks
+            if getattr(self._hooks[name], attribute) is not None
+        ]
+        if not callbacks:
+            return True
+        limits = [
+            hook.request_buffer_limit if request else hook.response_buffer_limit
+            for hook, _ in callbacks
+            if (hook.request_buffer_limit if request else hook.response_buffer_limit)
+        ]
+        if request:
+            flow.request.headers.pop("content-length", None)
+        else:
+            assert flow.response is not None
+            flow.response.headers.pop("content-length", None)
+        buffer = bytearray()
+        key = f"{flow.id}:{'request' if request else 'response'}"
+        limit = min(limits) if limits else 0
+        failed = False
+
+        def transform(chunk: bytes) -> bytes:
+            nonlocal failed
+            if failed:
+                return b""
+            if self._authorize(flow, admission) is None:
+                failed = True
+                self.retained.release(key)
+                self._deny(flow, 403 if request else 502, b"sbx gateway denied destination")
+                return b""
+            if limit and chunk:
+                buffer.extend(chunk)
+                if len(buffer) > limit or not self.retained.reserve(key, len(buffer)):
+                    failed = True
+                    self.retained.release(key)
+                    buffer.clear()
+                    self._deny(flow, 413 if request else 502, b"sbx gateway hook body limit")
+                return b""
+            if limit:
+                chunk = bytes(buffer)
+                buffer.clear()
+                self.retained.release(key)
+            output = self._run_chunk_hooks(flow, admission, callbacks, chunk, request=request)
+            failed = output is None
+            return b"" if output is None else output
+
+        return transform
+
+    def _run_chunk_hooks(
+        self,
+        flow: http.HTTPFlow,
+        admission: Admission,
+        callbacks: list[tuple[Hook, Callable[[HookContext, bytes], object] | None]],
+        chunk: bytes,
+        *,
+        request: bool,
+    ) -> bytes | None:
+        output = chunk
+        for _, callback in callbacks:
+            assert callback is not None
+            if self._authorize(flow, admission) is None:
+                self._deny(flow, 403 if request else 502, b"sbx gateway denied destination")
+                return None
+            try:
+                result = self._invoke(callback, self._context(flow, admission), output)
+            except HookFailure:
+                self._deny(flow, 403 if request else 502, b"sbx gateway hook failed")
+                return None
+            if result == "deny" or type(result) is not bytes or len(result) > MAX_HOOK_OUTPUT:
+                self._deny(flow, 403 if request else 502, b"sbx gateway denied hook output")
+                return None
+            output = result
+            if self._authorize(flow, admission) is None:
+                self._deny(flow, 403 if request else 502, b"sbx gateway denied destination")
+                return None
+        return output
+
+    def _substitute_secrets(self, flow: http.HTTPFlow, admission: Admission) -> bool:
+        matches = [
+            secret
+            for secret in self._secrets
+            if flow.request.scheme == "https"
+            and admission.host in secret.hosts
+            and admission.port in secret.ports
+            and (not secret.methods or flow.request.method.upper() in secret.methods)
+            and (
+                secret.path_prefix is None or _path_is_scoped(flow.request.path, secret.path_prefix)
+            )
+        ]
+        if len({secret.header_name.lower() for secret in matches}) != len(matches):
+            self._deny(flow, 403, b"sbx gateway denied ambiguous secret binding")
+            return False
+        for secret in matches:
+            if self._authorize(flow, admission) is None:
+                self._deny(flow, 403, b"sbx gateway denied destination")
+                return False
+            expected = secret.header_template.replace("{placeholder}", secret.placeholder)
+            if flow.request.headers.get(secret.header_name) != expected:
+                self._deny(flow, 403, b"sbx gateway denied secret substitution")
+                return False
+            replacement = secret.header_template.replace("{placeholder}", secret.value)
+            if not _valid_header_value(replacement):
+                self._deny(flow, 503, b"sbx gateway credential provider failed")
+                return False
+            flow.request.headers[secret.header_name] = replacement
+        return True
+
+    def _response_destination_allowed(self, flow: http.HTTPFlow, admission: Admission) -> bool:
+        if (
+            flow.response is None
+            or not 300 <= flow.response.status_code < 400
+            or "location" not in flow.response.headers
+        ):
+            return True
+        if not self._redirect_matches(flow, admission):
+            return False
+        return not (
+            self._package_auth is not None
+            and admission.rule_id == self._package_auth.rule_id
+            and not self._package_redirect_matches(flow)
+        )
+
+    @staticmethod
+    def _immutable_headers(headers: http.Headers) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        return tuple((name, tuple(headers.get_all(name))) for name in sorted(_IMMUTABLE_HEADERS))
+
+    def _headers_valid(self, message: http.Request | http.Response) -> bool:
+        return (
+            self._header_size(message) <= MAX_HEADER_BYTES
+            and self._header_count(message) <= MAX_HEADER_FIELDS
+            and all(
+                _valid_header_name(name) and _valid_header_bytes(value)
+                for name, value in message.headers.fields
+            )
+        )
+
     def _finish(self, flow: http.HTTPFlow) -> None:
         self._active.discard(flow.id)
-        self.retained.release(flow.id)
+        self.retained.release(f"{flow.id}:request")
+        self.retained.release(f"{flow.id}:response")
 
     @staticmethod
     def _deny(flow: http.HTTPFlow, status: int, body: bytes) -> None:
@@ -398,7 +749,23 @@ class GatewayAddon:
 
     @staticmethod
     def _request_matches(request: http.Request, admission: Admission) -> bool:
-        if _normalize_host(request.host) != admission.host or request.port != admission.port:
+        if (
+            request.scheme not in {"http", "https"}
+            or _normalize_host(request.host) != admission.host
+            or request.port != admission.port
+        ):
+            return False
+        try:
+            target = urlsplit(request.pretty_url)
+            target_port = target.port or (443 if target.scheme == "https" else 80)
+        except ValueError:
+            return False
+        if (
+            target.username is not None
+            or target.password is not None
+            or _normalize_host(target.hostname or "") != admission.host
+            or target_port != admission.port
+        ):
             return False
         authorities = {value for value in (request.authority, request.host_header) if value}
         for authority in authorities:
@@ -476,9 +843,51 @@ class GatewayAddon:
         return size
 
 
+def _normalized_path(value: str) -> str:
+    try:
+        path = urlsplit(value).path
+        for _ in range(4):
+            decoded = unquote(path)
+            if decoded == path:
+                break
+            path = decoded
+        else:
+            return ""
+    except ValueError:
+        return ""
+    return path if not any(part in {".", ".."} for part in path.split("/")) else ""
+
+
 def _path_is_scoped(value: str, prefix: str) -> bool:
-    path = unquote(urlsplit(value).path)
-    return path.startswith(prefix) and not any(part in {".", ".."} for part in path.split("/"))
+    path = _normalized_path(value)
+    base = prefix.rstrip("/") or "/"
+    return bool(path) and (base == "/" or path == base or path.startswith(base + "/"))
+
+
+def _host_matches(rule: str, host: str) -> bool:
+    if not rule.startswith("*."):
+        return rule == host
+    suffix = rule[1:]
+    prefix = host.removesuffix(suffix)
+    return host.endswith(suffix) and bool(prefix) and "." not in prefix
+
+
+def _valid_header_name(value: bytes) -> bool:
+    try:
+        return bool(re.fullmatch(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+", value))
+    except TypeError:
+        return False
+
+
+def _valid_header_bytes(value: bytes) -> bool:
+    return all(byte == 9 or 32 <= byte < 127 for byte in value)
+
+
+def _valid_header_value(value: str) -> bool:
+    try:
+        return _valid_header_bytes(value.encode("latin1"))
+    except UnicodeEncodeError:
+        return False
 
 
 def _basic_authorization(username: str, password: str) -> str:
@@ -518,6 +927,162 @@ def _diagnostic_suffix(stderr: str) -> str:
     text = re.sub(r"(?i)(authorization(?:token)?\s*[=:]\s*)\S+", r"\1REDACTED", stderr.strip())
     text = re.sub(r"(https://[^\s:]+:)[^@\s]+@", r"\1REDACTED@", text)
     return f": {text[:1000]}" if text else ""
+
+
+def load_policy(fd: int) -> tuple[tuple[RequestPolicy, ...], tuple[HeaderSecret, ...]]:
+    with os.fdopen(fd, "rb") as source:
+        raw = source.read(65537)
+    if len(raw) > 65536:
+        raise ValueError("mediator policy is too large")
+    try:
+        payload = json.loads(raw)
+        if set(payload) != {"version", "rules", "secrets"} or payload["version"] != 1:
+            raise ValueError
+        if not isinstance(payload["rules"], list) or not isinstance(payload["secrets"], list):
+            raise ValueError
+        policies = []
+        for item in payload["rules"]:
+            if not isinstance(item, dict) or set(item) != {
+                "id",
+                "host",
+                "ports",
+                "methods",
+                "paths",
+                "hooks",
+            }:
+                raise ValueError
+            host = _normalize_policy_host(item["host"])
+            ports = _policy_ports(item["ports"])
+            methods = _policy_methods(item["methods"])
+            paths = _policy_paths(item["paths"])
+            hooks = item["hooks"]
+            if (
+                not _valid_field(item["id"])
+                or not isinstance(hooks, list)
+                or len(set(hooks)) != len(hooks)
+                or not all(name in BUILTIN_HOOKS for name in hooks)
+            ):
+                raise ValueError
+            policies.append(RequestPolicy(item["id"], host, ports, methods, paths, tuple(hooks)))
+        secrets = []
+        for item in payload["secrets"]:
+            if not isinstance(item, dict) or set(item) != {
+                "name",
+                "hosts",
+                "ports",
+                "methods",
+                "path_prefix",
+                "header",
+                "placeholder",
+                "value",
+            }:
+                raise ValueError
+            hosts = tuple(_normalize_policy_host(host, exact=True) for host in item["hosts"])
+            ports = _policy_ports(item["ports"])
+            methods = _policy_methods(item["methods"])
+            path_prefix = item["path_prefix"]
+            if path_prefix is not None:
+                path_prefix = _policy_paths([path_prefix])[0]
+            header = item["header"]
+            placeholder = item["placeholder"]
+            value = item["value"]
+            if (
+                not _valid_field(item["name"])
+                or not isinstance(header, str)
+                or header.count("{placeholder}") != 1
+                or ":" not in header
+                or not isinstance(placeholder, str)
+                or not placeholder.startswith("SBX_SECRET_")
+                or len(placeholder) < 32
+                or not _valid_field(placeholder)
+                or not isinstance(value, str)
+                or not value
+            ):
+                raise ValueError
+            header_name, template = (part.strip() for part in header.split(":", 1))
+            if (
+                re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", header_name) is None
+                or not _valid_header_value(template.replace("{placeholder}", placeholder))
+                or not _valid_header_value(template.replace("{placeholder}", value))
+            ):
+                raise ValueError
+            secrets.append(
+                HeaderSecret(
+                    item["name"],
+                    hosts,
+                    ports,
+                    methods,
+                    path_prefix,
+                    header_name,
+                    template,
+                    placeholder,
+                    value,
+                )
+            )
+        if len({policy.rule_id for policy in policies}) != len(policies) or len(
+            {secret.name for secret in secrets}
+        ) != len(secrets):
+            raise ValueError
+        return tuple(policies), tuple(secrets)
+    except (AttributeError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid mediator policy") from exc
+
+
+def _normalize_policy_host(value: object, *, exact: bool = False) -> str:
+    if not isinstance(value, str):
+        raise ValueError
+    wildcard = value.startswith("*.")
+    normalized = _normalize_host(value[2:] if wildcard else value)
+    if (
+        normalized is None
+        or normalized != (value[2:] if wildcard else value)
+        or (wildcard and (exact or "." not in normalized))
+    ):
+        raise ValueError
+    return f"*.{normalized}" if wildcard else normalized
+
+
+def _policy_ports(value: object) -> tuple[int, ...]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(type(port) is not int or not 0 < port <= 65535 for port in value)
+        or len(set(value)) != len(value)
+    ):
+        raise ValueError
+    return tuple(value)
+
+
+def _policy_methods(value: object) -> tuple[str, ...]:
+    if (
+        not isinstance(value, list)
+        or len(set(value)) != len(value)
+        or not all(
+            isinstance(method, str)
+            and method == method.upper()
+            and re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", method)
+            for method in value
+        )
+    ):
+        raise ValueError
+    return tuple(value)
+
+
+def _policy_paths(value: object) -> tuple[str, ...]:
+    if (
+        not isinstance(value, list)
+        or len(set(value)) != len(value)
+        or not all(
+            isinstance(path, str)
+            and path.startswith("/")
+            and "?" not in path
+            and "#" not in path
+            and _normalized_path(path) == path
+            for path in value
+        )
+    ):
+        raise ValueError
+    return tuple(value)
 
 
 def load_package_auth(fd: int) -> tuple[PackageAuth, Callable[[], str]]:
@@ -623,11 +1188,13 @@ def _load() -> GatewayAddon:
     fd = int(os.environ.pop("SBX_GATEWAY_KEY_FD"))
     ready = os.environ.pop("SBX_GATEWAY_READY_FD", None)
     package_auth_fd = os.environ.pop("SBX_GATEWAY_PACKAGE_AUTH_FD", None)
+    policy_fd = os.environ.pop("SBX_GATEWAY_POLICY_FD", None)
     with os.fdopen(fd, "rb") as source:
         key = source.read(33)
     package_auth, get_real_token = (
         load_package_auth(int(package_auth_fd)) if package_auth_fd is not None else (None, None)
     )
+    policies, secrets = load_policy(int(policy_fd)) if policy_fd is not None else ((), ())
     return GatewayAddon(
         CapabilityVerifier(
             key,
@@ -637,6 +1204,8 @@ def _load() -> GatewayAddon:
         int(ready) if ready is not None else None,
         package_auth,
         get_real_token,
+        policies=policies,
+        secrets=secrets,
     )
 
 

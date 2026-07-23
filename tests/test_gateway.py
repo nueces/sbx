@@ -227,6 +227,86 @@ def test_invalid_gateway_config_stops_before_command_mutation(
     assert called is False
 
 
+def test_mediator_policy_uses_ephemeral_placeholders_and_inherited_secret_payload(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fake_secret = "fake-real-secret-task14"
+    monkeypatch.setenv("TASK14_TOKEN", fake_secret)
+    config = gateway.parse_config(
+        {
+            "network": {
+                "http": [
+                    {
+                        "id": "api",
+                        "host": "api.example.com",
+                        "ports": [443],
+                        "methods": ["GET"],
+                        "paths": ["/v1"],
+                        "hooks": ["package-audit"],
+                    }
+                ],
+                "secret": [
+                    {
+                        "name": "TOKEN",
+                        "provider": "env:TASK14_TOKEN",
+                        "hosts": ["api.example.com"],
+                        "ports": [443],
+                        "methods": ["GET"],
+                        "path_prefix": "/v1",
+                        "header": "Authorization: Bearer {placeholder}",
+                    }
+                ],
+            }
+        },
+        platform="linux",
+    )
+    assert config is not None
+    controller = gateway.GatewayController(config, "vm1", root=tmp_path / "state")
+
+    payload = json.loads(controller._mediator_policy())
+
+    placeholder = controller.secret_placeholders["TOKEN"]
+    assert placeholder.startswith("SBX_SECRET_TOKEN_")
+    assert len(placeholder) >= 32
+    assert payload["rules"][0]["hooks"] == ["package-audit"]
+    assert payload["secrets"][0]["placeholder"] == placeholder
+    assert payload["secrets"][0]["value"] == fake_secret
+    directory = gateway.create_state(config, "vm1", "generation1", root=tmp_path / "state")
+    persisted = b"".join(path.read_bytes() for path in directory.rglob("*") if path.is_file())
+    assert fake_secret.encode() not in persisted
+    assert placeholder.encode() not in persisted
+
+
+def test_missing_secret_provider_fails_before_state_mutation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("TASK14_MISSING", raising=False)
+    config = gateway.parse_config(
+        {
+            "network": {
+                "http": [{"host": "api.example.com", "ports": [443]}],
+                "secret": [
+                    {
+                        "name": "TOKEN",
+                        "provider": "env:TASK14_MISSING",
+                        "hosts": ["api.example.com"],
+                        "ports": [443],
+                        "header": "Authorization: Bearer {placeholder}",
+                    }
+                ],
+            }
+        },
+        platform="linux",
+    )
+    assert config is not None
+    controller = gateway.GatewayController(config, "vm1", root=tmp_path / "state")
+
+    with pytest.raises(gateway.GatewayLifecycleError, match="provider is unavailable"):
+        controller.prepare()
+
+    assert not (tmp_path / "state").exists()
+
+
 def test_state_is_owner_only_atomic_and_secret_free(
     gateway_config: gateway.GatewayConfig, tmp_path: Path
 ) -> None:
