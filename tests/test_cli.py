@@ -263,16 +263,49 @@ def test_list_does_not_require_name(
     )
 
 
-def test_list_all_aliases_include_stopped_vms(
+def test_list_defaults_to_all_and_can_filter_running(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[bool] = []
     monkeypatch.setattr(vm_state, "smolvm_vms", lambda all_vms=False: calls.append(all_vms) or [])
 
-    assert cli.main(["ls", "--all"]) == 0
-    assert cli.main(["ls", "-a"]) == 0
+    assert cli.main(["ls"]) == 0
+    assert cli.main(["list", "--running"]) == 0
 
-    assert calls == [True, True]
+    assert calls == [True, False]
+
+
+def test_list_json_uses_null_for_missing_values(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    vm = SimpleNamespace(vm_id="vm1", status="stopped", config=None, network=None)
+    monkeypatch.setattr(vm_state, "smolvm_vms", lambda all_vms=False: [vm])
+
+    assert cli.main(["ls", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == [
+        {
+            "name": "vm1",
+            "status": "stopped",
+            "project": None,
+            "image": None,
+            "ssh_port": None,
+        }
+    ]
+
+
+def test_run_help_groups_supported_options(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["run", "--help"])
+
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    for heading in ("Session:", "Workspace:", "VM resources:", "Configuration and output:"):
+        assert heading in out
+    assert "--no-attach" in out
+    assert "--write-config" in out
 
 
 def test_shell_uses_configured_default_name(
@@ -471,7 +504,7 @@ mount = [".:/workspace"]
     captured: dict[str, object] = {}
     capture_preset(monkeypatch, captured, vm_id="demo")
 
-    rc = cli.main(["run", "--no-auth-port"])
+    rc = cli.main(["run"])
 
     assert rc == 0
     preset_name, preset_kwargs = captured["preset"]
@@ -516,7 +549,7 @@ port_forwards = ["8080:80"]
     captured: dict[str, object] = {}
     capture_preset(monkeypatch, captured, vm_id="configured")
 
-    rc = cli.main(["--config", str(config), "run", "--no-auth-port", "--no-attach"])
+    rc = cli.main(["--config", str(config), "run", "--no-attach"])
 
     assert rc == 0
     preset_name, preset_kwargs = captured["preset"]
@@ -537,12 +570,13 @@ port_forwards = ["8080:80"]
     assert preset_kwargs["port_forwards"] == [
         {"host_address": "127.0.0.1", "host_port": 8080, "guest_port": 80}
     ]
-    assert capfd.readouterr().out == "Started 'configured'.\n"
+    assert "Created sandbox 'configured'." in capfd.readouterr().out
 
 
 def test_run_uses_local_image_directory(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     install_fake_smolvm(monkeypatch, tmp_path)
     image_dir = tmp_path / "debian-pi"
@@ -560,6 +594,7 @@ def test_run_uses_local_image_directory(
 [sbx]
 name = "vm1"
 image = "{image_dir}"
+copy_host_credentials = true
 mount = [".:/workspace"]
 '''.strip(),
         encoding="utf-8",
@@ -579,13 +614,14 @@ mount = [".:/workspace"]
         ),
     )
 
-    rc = cli.main(["--config", str(config), "run", "--no-auth-port"])
+    rc = cli.main(["--config", str(config), "run"])
 
     assert rc == 0
     assert captured["image_dir"] == image_dir
     assert captured["agent"] == "pi"
     assert captured["mounts"] == [".:/workspace"]
     assert captured["attach"] is True
+    assert "copy_host_credentials=true" not in capsys.readouterr().err
 
 
 def test_run_user_from_config_starts_then_attaches_as_user(
@@ -616,9 +652,9 @@ def test_run_user_from_config_starts_then_attaches_as_user(
     assert captured["preset_closed"] is True
     assert captured["prepare"] == ("vm1", "agent")
     assert captured["attach"] == ("vm1", "agent", "pi", None)
-    assert capfd.readouterr().out == (
-        "Started 'vm1'. Launching pi as user agent...\nsandbox stop vm1\n"
-    )
+    out = capfd.readouterr().out
+    assert "Created sandbox 'vm1'." in out
+    assert "sandbox stop vm1" in out
 
 
 def test_host_git_config_copies_only_safe_global_values(
@@ -675,11 +711,12 @@ def test_git_config_defaults_on_for_managed_run(
     assert captured["git"] == ("vm1", None, "[user]\n\tname = Test\n")
 
 
-def test_no_git_config_disables_forwarding(
+def test_config_disables_git_forwarding(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     install_fake_smolvm(monkeypatch, tmp_path)
+    (tmp_path / ".sbx.toml").write_text("[sbx]\ngit_config = false\n", encoding="utf-8")
     captured: dict[str, object] = {}
     monkeypatch.setattr(
         guest_setup, "host_git_config", lambda project_root=None: "[user]\n\tname = Test\n"
@@ -694,8 +731,33 @@ def test_no_git_config_disables_forwarding(
 
     capture_preset(monkeypatch, captured)
 
-    assert cli.main(["run", "--no-git-config"]) == 0
+    assert cli.main(["run"]) == 0
     assert captured["git"] == ("vm1", None, None)
+
+
+def test_shell_uses_configured_git_forwarding_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[sbx]\nname = "vm1"\nrun_user = "agent"\ngit_config = false\n', encoding="utf-8"
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        guest_setup, "host_git_config", lambda project_root=None: "must not be read"
+    )
+    monkeypatch.setattr(
+        guest_setup,
+        "install_git_config",
+        lambda vm_id, user, text, **kwargs: captured.update({"git": text}),
+    )
+    monkeypatch.setattr(guest_setup, "prepare_run_user", lambda *args, **kwargs: None)
+    monkeypatch.setattr(guest_setup, "attach", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(cli, "_get_existing_vm_status", lambda vm_id: "running")
+
+    assert cli.main(["--config", str(config), "shell", "--keep-running"]) == 0
+    assert captured["git"] is None
 
 
 def test_credential_free_env_preserves_real_smolvm_state(
@@ -728,7 +790,7 @@ def test_run_does_not_copy_host_credentials_by_default(
     monkeypatch.setattr(guest_setup, "credential_free_env", fake_credential_free_env)
     capture_preset(monkeypatch, captured, vm_id="pi-sbx")
 
-    rc = cli.main(["run", "--no-attach", "--no-auth-port"])
+    rc = cli.main(["run", "--no-attach"])
 
     assert rc == 0
     _, preset_kwargs = captured["preset"]
@@ -744,12 +806,13 @@ def test_env_vars_are_not_forwarded_by_default_with_host_credentials(
     tmp_path: Path,
 ) -> None:
     install_fake_smolvm(monkeypatch, tmp_path)
+    (tmp_path / ".sbx.toml").write_text("[sbx]\ncopy_host_credentials = true\n", encoding="utf-8")
     monkeypatch.setenv("OPENAI_API_KEY", "secret")
     captured: dict[str, object] = {}
 
     capture_preset(monkeypatch, captured, vm_id="pi-sbx")
 
-    rc = cli.main(["run", "--no-attach", "--copy-host-credentials", "--no-auth-port"])
+    rc = cli.main(["run", "--no-attach"])
 
     assert rc == 0
     _, preset_kwargs = captured["preset"]
@@ -761,32 +824,26 @@ def test_env_flag_explicitly_forwards_selected_env_var(
     tmp_path: Path,
 ) -> None:
     install_fake_smolvm(monkeypatch, tmp_path)
+    (tmp_path / ".sbx.toml").write_text("[sbx]\ncopy_host_credentials = true\n", encoding="utf-8")
     monkeypatch.setenv("OPENAI_API_KEY", "secret")
     captured: dict[str, object] = {}
 
     capture_preset(monkeypatch, captured, vm_id="pi-sbx")
 
-    rc = cli.main(
-        [
-            "run",
-            "--no-attach",
-            "--copy-host-credentials",
-            "--env",
-            "OPENAI_API_KEY",
-            "--no-auth-port",
-        ]
-    )
+    rc = cli.main(["run", "--no-attach", "--env", "OPENAI_API_KEY"])
 
     assert rc == 0
     _, preset_kwargs = captured["preset"]
     assert preset_kwargs["host_env"]["OPENAI_API_KEY"] == "secret"
 
 
-def test_copy_host_credentials_flag_uses_current_environment(
+def test_copy_host_credentials_config_uses_current_environment(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     install_fake_smolvm(monkeypatch, tmp_path)
+    (tmp_path / ".sbx.toml").write_text("[sbx]\ncopy_host_credentials = true\n", encoding="utf-8")
     captured: dict[str, object] = {}
 
     def fail_credential_free_env(temp_home: Path, *, forward_env: list[str]) -> dict[str, str]:
@@ -795,11 +852,27 @@ def test_copy_host_credentials_flag_uses_current_environment(
     monkeypatch.setattr(guest_setup, "credential_free_env", fail_credential_free_env)
     capture_preset(monkeypatch, captured, vm_id="pi-sbx")
 
-    rc = cli.main(["run", "--no-attach", "--copy-host-credentials", "--no-auth-port"])
+    rc = cli.main(["run", "--no-attach"])
 
     assert rc == 0
     _, preset_kwargs = captured["preset"]
     assert preset_kwargs["host_env"]["HOME"] == os.environ["HOME"]
+    assert "copy_host_credentials=true" in capsys.readouterr().err
+
+
+def test_existing_vm_does_not_warn_about_credential_copy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / ".sbx.toml").write_text(
+        '[sbx]\nname = "vm1"\ncopy_host_credentials = true\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(cli, "_get_existing_vm_status", lambda name: "running")
+    monkeypatch.setattr(cli, "_post_start_actions", lambda **kwargs: 0)
+
+    assert cli.main(["run", "--no-attach"]) == 0
+    assert "copy_host_credentials=true" not in capsys.readouterr().err
 
 
 def test_destroy_deletes_vm(
@@ -825,7 +898,6 @@ def test_create_auto_writes_project_config_for_new_vm(
     rc = cli.main(
         [
             "create",
-            "--name",
             "vm1",
             "--agent",
             "codex",
@@ -851,7 +923,12 @@ def test_create_auto_writes_project_config_for_new_vm(
     assert 'project_path = "."' in text
     assert 'run_user = "agent"' in text
     assert 'env = ["OPENAI_API_KEY"]' in text
-    assert "wrote .sbx.toml" in capfd.readouterr().err
+    assert "copy_host_credentials = false" in text
+    assert "git_config = true" in text
+    output = capfd.readouterr()
+    assert "Created sandbox 'vm1'." in output.out
+    assert "Wrote .sbx.toml." in output.out
+    assert "Run agent:  sbx run" in output.out
 
 
 def test_project_config_values_preserve_curated_image_workflow() -> None:
@@ -889,9 +966,7 @@ def test_write_config_updates_only_missing_values(
     (tmp_path / ".sbx.toml").write_text('[sbx]\nname = "vm1"\nmemory = 4096\n', encoding="utf-8")
     install_fake_smolvm(monkeypatch, tmp_path)
 
-    rc = cli.main(
-        ["create", "--name", "vm2", "--memory", "8192", "--disk-size", "40960", "--write-config"]
-    )
+    rc = cli.main(["create", "vm2", "--memory", "8192", "--disk-size", "40960", "--write-config"])
 
     assert rc == 0
     text = (tmp_path / ".sbx.toml").read_text(encoding="utf-8")
@@ -928,24 +1003,12 @@ def test_reusing_existing_vm_writes_config_only_when_requested(
     monkeypatch.setattr(cli.runtime, "smolvm_argv", lambda args: ["smolvm", *args])
     monkeypatch.setattr(guest_setup, "sync_guest_clock", lambda vm_id, **kwargs: None)
 
-    assert cli.main(["run", "vm1", "--no-attach", "--no-auth-port"]) == 0
+    assert cli.main(["run", "vm1", "--no-attach"]) == 0
     assert not (tmp_path / ".sbx.toml").exists()
 
-    assert cli.main(["run", "vm1", "--no-attach", "--no-auth-port", "--write-config"]) == 0
+    assert cli.main(["run", "vm1", "--no-attach", "--write-config"]) == 0
     assert 'name = "vm1"' in (tmp_path / ".sbx.toml").read_text(encoding="utf-8")
     assert "wrote .sbx.toml" in capfd.readouterr().err
-
-
-def test_no_write_config_disables_auto_write(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    install_fake_smolvm(monkeypatch, tmp_path)
-
-    rc = cli.main(["create", "--name", "vm1", "--no-write-config"])
-
-    assert rc == 0
-    assert not (tmp_path / ".sbx.toml").exists()
 
 
 def test_lifecycle_commands_default_to_configured_name(
@@ -979,16 +1042,9 @@ def test_run_with_project_path_attaches_from_mounted_project_cwd(
         return 0
 
     monkeypatch.setattr(guest_setup, "attach", fake_attach)
+    monkeypatch.setattr(cli.network, "expose_auth_port", lambda *args: 0)
 
-    rc = cli.main(
-        [
-            "run",
-            "--copy-host-credentials",
-            "--no-auth-port",
-            "--project-path",
-            str(project),
-        ]
-    )
+    rc = cli.main(["run", "--project-path", str(project)])
 
     assert rc == 0
     _, preset_kwargs = captured["preset"]
@@ -997,11 +1053,15 @@ def test_run_with_project_path_attaches_from_mounted_project_cwd(
     assert captured["attach"] == ("vm1", "pi", str(project))
 
 
-def test_run_exposes_auth_port_by_default_before_attach(
+def test_run_uses_configured_auth_ports_before_attach(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     install_fake_smolvm(monkeypatch, tmp_path)
+    (tmp_path / ".sbx.toml").write_text(
+        "[sbx]\nauth_port = true\nauth_host_port = 1555\nauth_guest_port = 1666\n",
+        encoding="utf-8",
+    )
     captured: dict[str, object] = {}
     capture_preset(monkeypatch, captured)
 
@@ -1016,9 +1076,9 @@ def test_run_exposes_auth_port_by_default_before_attach(
     monkeypatch.setattr(cli.network, "expose_auth_port", fake_expose)
     monkeypatch.setattr(guest_setup, "attach", fake_attach)
 
-    assert cli.main(["run", "--copy-host-credentials"]) == 0
+    assert cli.main(["run"]) == 0
     assert captured["preset_closed"] is True
-    assert captured["expose"] == ("vm1", 1455, 1455)
+    assert captured["expose"] == ("vm1", 1555, 1666)
     assert captured["attach"] == ("vm1", "pi", None)
 
 
@@ -1060,7 +1120,7 @@ def test_run_existing_vm_starts_without_creating(
     monkeypatch.setattr(cli.network, "expose_auth_port", lambda vm_id, host_port, guest_port: 0)
     monkeypatch.setattr(guest_setup, "attach", lambda *args, **kwargs: 0)
 
-    rc = cli.main(["run", "--name", "vm1"])
+    rc = cli.main(["run", "vm1"])
 
     assert rc == 0
     assert calls == [
@@ -1092,7 +1152,7 @@ def test_run_existing_error_vm_suggests_recreate(
 
     monkeypatch.setattr(cli.runtime, "run_capture", fake_run_capture)
 
-    rc = cli.main(["run", "--name", "vm1"])
+    rc = cli.main(["run", "vm1"])
 
     assert rc == 1
     assert "sbx recreate vm1 --force" in capsys.readouterr().err
@@ -1113,7 +1173,7 @@ def test_failed_managed_run_hides_json_and_prints_hint(
         ),
     )
 
-    rc = cli.main(["run", "--name", "vm1"])
+    rc = cli.main(["run", "vm1"])
 
     output = capsys.readouterr()
     assert rc == 1
@@ -1146,7 +1206,7 @@ def test_preset_failure_cleans_temporary_home(
         lambda *args, **kwargs: (_ for _ in ()).throw(error),
     )
 
-    assert cli.main(["create", "vm1", "--no-auth-port"]) == expected_rc
+    assert cli.main(["create", "vm1"]) == expected_rc
     assert not captured["temp_home"].exists()
 
 
@@ -1175,10 +1235,9 @@ def test_run_missing_vm_creates_it(
     capture_preset(monkeypatch, captured)
     monkeypatch.setattr(cli.network, "expose_auth_port", lambda *args: 0)
 
-    assert cli.main(["run", "--name", "vm1", "--copy-host-credentials"]) == 0
+    assert cli.main(["run", "vm1", "--no-attach"]) == 0
     _, preset_kwargs = captured["preset"]
     assert preset_kwargs["vm_name"] == "vm1"
-    assert preset_kwargs["host_env"]["HOME"] == os.environ["HOME"]
 
 
 def test_create_is_run_no_attach_alias(
@@ -1194,26 +1253,63 @@ def test_create_is_run_no_attach_alias(
         lambda **kwargs: captured.setdefault("post", kwargs) and 0,
     )
 
-    assert (
-        cli.main(["create", "--name", "vm1", "--copy-host-credentials", "--no-auth-port"])
-        == 0
-    )
+    assert cli.main(["create", "vm1"]) == 0
     assert captured["post"]["attach"] is False
 
 
-def test_preset_creation_json_is_sbx_owned(
+def test_run_json_requires_no_attach(capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["run", "vm1", "--json"]) == 2
+    assert "requires --no-attach" in capsys.readouterr().err
+
+
+def test_existing_vm_json_suppresses_start_output(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(cli, "_get_existing_vm_status", lambda name: "stopped")
+    monkeypatch.setattr(cli, "_sync_existing_vm_start_config", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        cli.runtime,
+        "run_smolvm_capture",
+        lambda argv: subprocess.CompletedProcess(
+            argv, 0, stdout="Started upstream VM\n", stderr=""
+        ),
+    )
+    monkeypatch.setattr(cli, "_post_start_actions", lambda **kwargs: 0)
+
+    assert cli.main(["create", "vm1", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"vm": {"name": "vm1", "status": "running"}}
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["create", "vm1", "--json"],
+        ["run", "vm1", "--no-attach", "--json"],
+    ],
+)
+def test_preset_lifecycle_json(
+    argv: list[str],
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     install_fake_smolvm(monkeypatch, tmp_path)
-    captured: dict[str, object] = {}
-    capture_preset(monkeypatch, captured)
 
-    assert cli.main(["create", "vm1", "--json", "--no-auth-port"]) == 0
-    assert json.loads(capsys.readouterr().out) == {
-        "vm": {"name": "vm1", "status": "running"}
-    }
+    assert cli.main(argv) == 0
+    assert json.loads(capsys.readouterr().out) == {"vm": {"name": "vm1", "status": "running"}}
+
+
+def test_recreate_json_suppresses_delete_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    install_fake_smolvm(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "_delete_vm", lambda name, *, quiet=False: 0)
+
+    assert cli.main(["recreate", "vm1", "--force", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"vm": {"name": "vm1", "status": "running"}}
 
 
 def test_expose_auth_port_warns_when_port_already_listening(
@@ -1322,6 +1418,13 @@ def test_network_forward_defaults_to_configured_name(
     }
 
 
+def test_network_forward_requires_name_or_project_config(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert cli.main(["network", "forward", "3000"]) == 2
+    assert "requires a VM name" in capsys.readouterr().err
+
+
 def test_network_forward_accepts_explicit_name(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
     monkeypatch.setattr(
@@ -1330,9 +1433,9 @@ def test_network_forward_accepts_explicit_name(monkeypatch: pytest.MonkeyPatch) 
         lambda vm_id, forwards: captured.update({"vm_id": vm_id, "forwards": forwards}) or 0,
     )
 
-    assert cli.main(["network", "forward", "vm2", "0.0.0.0:3000:3000"]) == 0
+    assert cli.main(["network", "forward", "--name", "3000", "0.0.0.0:3000:3000"]) == 0
     assert captured == {
-        "vm_id": "vm2",
+        "vm_id": "3000",
         "forwards": [("0.0.0.0", 3000, 3000)],
     }
 
@@ -1367,7 +1470,7 @@ def test_network_forward_accepts_explicit_name_with_multiple_specs(
         lambda vm_id, forwards: captured.update({"vm_id": vm_id, "forwards": forwards}) or 0,
     )
 
-    assert cli.main(["network", "forward", "vm2", "3000", "8080:80"]) == 0
+    assert cli.main(["network", "forward", "--name", "vm2", "3000", "8080:80"]) == 0
     assert captured == {
         "vm_id": "vm2",
         "forwards": [("127.0.0.1", 3000, 3000), ("127.0.0.1", 8080, 80)],
@@ -1380,7 +1483,7 @@ def test_network_forward_ctrl_c_returns_130(monkeypatch: pytest.MonkeyPatch) -> 
 
     monkeypatch.setattr(cli.network, "_foreground_port_forward", interrupted)
 
-    assert cli.main(["network", "forward", "vm2", "3005"]) == 130
+    assert cli.main(["network", "forward", "--name", "vm2", "3005"]) == 130
 
 
 def test_network_commands_default_to_configured_name(
@@ -1429,6 +1532,34 @@ def test_network_commands_default_to_configured_name(
     assert "No tracked auth port tunnel for 'vm1'." in capfd.readouterr().out
 
 
+def test_network_status_json(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    payload = (
+        '{"data":{"vm":{"name":"vm1","status":"running","backend":"qemu",'
+        '"ip_address":"10.0.2.15","ssh_port":2201}}}'
+    )
+    monkeypatch.setattr(
+        cli.network,
+        "run_smolvm_capture",
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout=payload),
+    )
+    monkeypatch.setattr(cli.network, "_tracked_auth_tunnel", lambda vm_id: None)
+    monkeypatch.setattr(cli.network, "_localhost_port_is_listening", lambda port: False)
+
+    assert cli.main(["network", "status", "vm1", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "name": "vm1",
+        "status": "running",
+        "backend": "qemu",
+        "guest_ip": "10.0.2.15",
+        "ssh_port": 2201,
+        "port_forwards": [],
+        "auth_callback": {"status": "inactive", "detail": None},
+    }
+
+
 def test_network_close_auth_port_without_tracked_tunnel(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1471,17 +1602,7 @@ def test_recreate_deletes_then_starts_vm(
     monkeypatch.setattr(cli, "_delete_vm", fake_delete)
     capture_preset(monkeypatch, captured)
 
-    rc = cli.main(
-        [
-            "recreate",
-            "--force",
-            "--name",
-            "vm1",
-            "--no-attach",
-            "--copy-host-credentials",
-            "--no-auth-port",
-        ]
-    )
+    rc = cli.main(["recreate", "vm1", "--force", "--no-attach"])
 
     assert rc == 0
     assert calls == [("delete", "vm1")]
@@ -1518,7 +1639,6 @@ project_path = "{config_project}"
             "run",
             "--project-path",
             str(cli_project),
-            "--no-auth-port",
             "--no-attach",
         ]
     )
@@ -1527,7 +1647,7 @@ project_path = "{config_project}"
     _, preset_kwargs = captured["preset"]
     assert preset_kwargs["mounts"] == [f"{cli_project}:{cli_project}"]
     assert preset_kwargs["writable_mounts"] is True
-    assert capfd.readouterr().out == "Started 'pi-sbx'.\n"
+    assert "Created sandbox 'pi-sbx'." in capfd.readouterr().out
 
 
 def test_cli_flags_override_config(
@@ -1550,24 +1670,13 @@ name = "from-config"
     capture_preset(monkeypatch, captured, vm_id="from-cli")
     monkeypatch.setattr(cli, "_post_start_actions", lambda **kwargs: 0)
 
-    rc = cli.main(
-        [
-            "--config",
-            str(config),
-            "run",
-            "--agent",
-            "claude",
-            "--name",
-            "from-cli",
-            "--no-auth-port",
-        ]
-    )
+    rc = cli.main(["--config", str(config), "run", "from-cli", "--agent", "claude"])
 
     assert rc == 0
     preset_name, preset_kwargs = captured["preset"]
     assert preset_name == "claude"
     assert preset_kwargs["vm_name"] == "from-cli"
-    assert capfd.readouterr().out == "Started 'from-cli'. Launching claude...\n"
+    assert "Created sandbox 'from-cli'." in capfd.readouterr().out
 
 
 def test_invalid_agent_in_config_returns_usage_error(
@@ -1712,5 +1821,5 @@ def test_existing_vm_start_does_not_reset_hostname(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(cli, "_start_existing_vm_if_needed", lambda *args, **kwargs: 0)
     monkeypatch.setattr(cli, "_post_start_actions", lambda **kwargs: 0)
 
-    assert cli.main(["run", "vm1", "--no-attach", "--no-auth-port"]) == 0
+    assert cli.main(["run", "vm1", "--no-attach"]) == 0
     assert hostnames == []

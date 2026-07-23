@@ -258,7 +258,7 @@ The image likely references an incompatible or older kernel. Rebuild it with the
 
 ### VM starts but SSH readiness times out
 
-If a cold boot reports that `wait_for_ssh` timed out, but `sbx ls -a` shows the VM as `running`, the guest may simply need more time before SSH is ready. Retry:
+If a cold boot reports that `wait_for_ssh` timed out, but `sbx ls` shows the VM as `running`, the guest may simply need more time before SSH is ready. Retry:
 
 ```bash
 sbx run

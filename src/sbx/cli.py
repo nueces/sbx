@@ -304,23 +304,38 @@ def _print_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> None:
 def cmd_list(args: argparse.Namespace) -> int:
     metadata = vm_metadata.load_vm_metadata()
     rows = []
-    for vm in vm_state.smolvm_vms(all_vms=bool(getattr(args, "all", False))):
+    for vm in vm_state.smolvm_vms(all_vms=not args.running):
         name = str(getattr(vm, "vm_id", "-"))
         status = getattr(getattr(vm, "status", "-"), "value", getattr(vm, "status", "-"))
         rootfs = getattr(getattr(vm, "config", None), "rootfs_path", None)
         image_path = Path(rootfs) if rootfs is not None else None
-        image = "-" if image_path is None else image_path.parent.name or image_path.name or "-"
-        ssh_port = getattr(getattr(vm, "network", None), "ssh_host_port", None)
         rows.append(
-            [
-                name,
-                str(status),
-                metadata.get(name, {}).get("project_root", "-"),
-                image,
-                str(ssh_port) if ssh_port is not None else "-",
-            ]
+            {
+                "name": name,
+                "status": str(status),
+                "project": metadata.get(name, {}).get("project_root"),
+                "image": (
+                    image_path.parent.name or image_path.name if image_path is not None else None
+                ),
+                "ssh_port": getattr(getattr(vm, "network", None), "ssh_host_port", None),
+            }
         )
-    _print_table(("NAME", "STATUS", "PROJECT", "IMAGE", "SSH"), rows)
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+    else:
+        _print_table(
+            ("NAME", "STATUS", "PROJECT", "IMAGE", "SSH"),
+            [
+                [
+                    row["name"],
+                    row["status"],
+                    row["project"] or "-",
+                    row["image"] or "-",
+                    str(row["ssh_port"]) if row["ssh_port"] is not None else "-",
+                ]
+                for row in rows
+            ],
+        )
     return 0
 
 
@@ -351,7 +366,9 @@ def _maybe_print_boot_timeout_running_hint(vm_id: str | None, boot_timeout: floa
     return True
 
 
-def _start_existing_vm_if_needed(vm_id: str, status: str, boot_timeout: float) -> int:
+def _start_existing_vm_if_needed(
+    vm_id: str, status: str, boot_timeout: float, *, json_output: bool = False
+) -> int:
     if status == "running":
         return 0
     if status == "error":
@@ -363,7 +380,15 @@ def _start_existing_vm_if_needed(vm_id: str, status: str, boot_timeout: float) -
         )
         print(f"sbx: If it still fails, run `sbx recreate {vm_id} --force`.", file=sys.stderr)
         return 1
-    rc = runtime.run_smolvm(["sandbox", "start", vm_id, "--boot-timeout", f"{boot_timeout:g}"])
+    command = ["sandbox", "start", vm_id, "--boot-timeout", f"{boot_timeout:g}"]
+    completed = runtime.run_smolvm_capture(command)
+    if completed is None:
+        return 127
+    if completed.stderr:
+        print(completed.stderr, end="", file=sys.stderr)
+    if completed.stdout and (not json_output or completed.returncode != 0):
+        print(completed.stdout, end="", file=sys.stderr if json_output else sys.stdout)
+    rc = completed.returncode
     if rc != 0:
         _maybe_print_boot_timeout_running_hint(vm_id, boot_timeout)
     return rc
@@ -518,33 +543,61 @@ def _maybe_write_project_config(
     vm_name: str,
     agent: str,
     created: bool,
-) -> None:
+) -> bool:
     if getattr(args, "action", None) not in {"run", "create"}:
-        return
+        return False
     write_config = getattr(args, "write_config", None)
     path = _project_config_path()
     exists = path.exists()
     if exists and write_config is not True:
-        return
-    if not exists and write_config is False:
-        return
+        return False
     if not exists and not created and write_config is not True:
-        return
+        return False
 
     values = _project_config_values(args, config, vm_name=vm_name, agent=agent)
-    added = _write_project_config_values(path, values)
     if not exists:
+        values.update(
+            {
+                "copy_host_credentials": bool(_cfg(config, "sbx", "copy_host_credentials", False)),
+                "git_config": bool(_cfg(config, "sbx", "git_config", True)),
+            }
+        )
+    added = _write_project_config_values(path, values)
+    if not exists and not created:
         print(f"sbx: wrote {path.name} for project defaults", file=sys.stderr)
-    elif added:
+    elif added and exists:
         print(
             f"sbx: updated {path.name} with missing project defaults: {', '.join(added)}",
             file=sys.stderr,
         )
-    else:
+    elif exists:
         print(
             f"sbx: {path.name} already contains project defaults; no changes made",
             file=sys.stderr,
         )
+    return not exists and created
+
+
+def _print_created(
+    vm_name: str,
+    *,
+    config_created: bool,
+    agent: str,
+    attach: bool,
+    run_user: str | None = None,
+) -> None:
+    if config_created:
+        print(f"Created sandbox '{vm_name}'.")
+        print("Wrote .sbx.toml.\n")
+        print("Run agent:  sbx run")
+        print("Open shell: sbx shell")
+        print("Stop:       sbx stop")
+        print("Remove:     sbx rm")
+    elif attach:
+        user = f" as user {run_user}" if run_user else ""
+        print(f"Started '{vm_name}'. Launching {agent}{user}...")
+    else:
+        print(f"Started '{vm_name}'.")
 
 
 def _start_local_image(
@@ -652,16 +705,23 @@ def _start_local_image(
         raise
     vm.close()
 
-    _maybe_write_project_config(args, config, vm_name=str(vm_name), agent=agent, created=True)
+    config_created = _maybe_write_project_config(
+        args, config, vm_name=str(vm_name), agent=agent, created=True
+    )
     vm_metadata.record_vm_project(str(vm_name), _project_identity(args, config))
 
-    if attach:
-        print(f"Started '{vm_name}'. Launching {agent}...")
-        if not _sync_forwarded_env_or_error(str(vm_name), forward_env or []):
-            return 1
-    else:
-        print(f"Started '{vm_name}'.")
-    return _post_start_actions(
+    json_output = bool(getattr(args, "json", False))
+    if not json_output:
+        _print_created(
+            str(vm_name),
+            config_created=config_created,
+            agent=agent,
+            attach=attach,
+            run_user=run_user,
+        )
+    if attach and not _sync_forwarded_env_or_error(str(vm_name), forward_env or []):
+        return 1
+    rc = _post_start_actions(
         vm_name=vm_name,
         command=launch_command or LAUNCH_COMMANDS[agent],
         attach=attach,
@@ -673,6 +733,9 @@ def _start_local_image(
         cwd=cwd,
         git_config_text=git_config_text,
     )
+    if rc == 0 and json_output:
+        print(json.dumps({"vm": {"name": str(vm_name), "status": "running"}}))
+    return rc
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -701,8 +764,10 @@ def cmd_start(args: argparse.Namespace) -> int:
     sbx_cfg = _sbx_config(config)
     project_identity = _project_identity(args, config)
     project_root = Path(project_identity["project_root"])
-    if args.name is None and args.name_arg is not None:
-        args.name = args.name_arg
+    attach = True if args.attach is None else bool(args.attach)
+    if args.json and attach:
+        print("sbx: run --json requires --no-attach", file=sys.stderr)
+        return 2
 
     agent = args.agent or _cfg_agent(config)
     if agent not in AGENTS:
@@ -747,7 +812,6 @@ def cmd_start(args: argparse.Namespace) -> int:
     if project_path is not None:
         writable_mounts = True
 
-    attach = True if args.attach is None else bool(args.attach)
     run_user = _arg_or_config(args, "run_user", config, "sbx")
     if run_user is not None:
         run_user = guest_setup.validate_run_user(str(run_user))
@@ -764,7 +828,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         f"forward_env={forward_env!r}"
     )
 
-    auth_port = bool(_arg_or_config(args, "auth_port", config, "sbx", default=True))
+    auth_port = attach and bool(_arg_or_config(args, "auth_port", config, "sbx", default=True))
     auth_host_port = int(_arg_or_config(args, "auth_host_port", config, "sbx", default=1455))
     auth_guest_port = int(_arg_or_config(args, "auth_guest_port", config, "sbx", default=1455))
     stop_on_exit = bool(_arg_or_config(args, "stop_on_exit", config, "sbx", default=True))
@@ -805,6 +869,7 @@ def cmd_start(args: argparse.Namespace) -> int:
                 str(requested_name),
                 existing_status,
                 boot_timeout,
+                json_output=bool(args.json),
             )
             if start_rc != 0:
                 return start_rc
@@ -814,7 +879,7 @@ def cmd_start(args: argparse.Namespace) -> int:
                 args, config, vm_name=str(requested_name), agent=str(agent), created=False
             )
             vm_metadata.record_vm_project(str(requested_name), project_identity)
-            return _post_start_actions(
+            rc = _post_start_actions(
                 vm_name=str(requested_name),
                 command=LAUNCH_COMMANDS[str(agent)],
                 attach=attach,
@@ -826,6 +891,9 @@ def cmd_start(args: argparse.Namespace) -> int:
                 cwd=project_guest_cwd,
                 git_config_text=git_config_text,
             )
+            if rc == 0 and args.json:
+                print(json.dumps({"vm": {"name": str(requested_name), "status": "running"}}))
+            return rc
 
     image = lifecycle_warnings.path_from_config(_arg_or_config(args, "image", config, "sbx"))
     if image is not None:
@@ -863,7 +931,14 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     temp_home_ctx = None
     host_env = guest_setup.sanitize_forwarded_env(dict(os.environ), forward_env)
-    if not copy_host_credentials:
+    if copy_host_credentials:
+        target = f" VM '{requested_name}'" if requested_name else " the new VM"
+        print(
+            f"sbx: warning: [sbx].copy_host_credentials=true; "
+            f"host agent credentials may be copied into{target}.",
+            file=sys.stderr,
+        )
+    else:
         temp_home_ctx = tempfile.TemporaryDirectory(prefix="sbx-no-credentials-")
         host_env = guest_setup.credential_free_env(
             Path(temp_home_ctx.name), forward_env=forward_env
@@ -902,18 +977,21 @@ def cmd_start(args: argparse.Namespace) -> int:
         if temp_home_ctx is not None:
             temp_home_ctx.cleanup()
 
-    _maybe_write_project_config(args, config, vm_name=vm_name, agent=str(agent), created=True)
+    config_created = _maybe_write_project_config(
+        args, config, vm_name=vm_name, agent=str(agent), created=True
+    )
     vm_metadata.record_vm_project(vm_name, project_identity)
 
-    if args.json:
-        print(json.dumps({"vm": {"name": vm_name, "status": "running"}}))
-    elif attach:
-        user_msg = f" as user {run_user}" if run_user is not None else ""
-        print(f"Started '{vm_name}'. Launching {agent}{user_msg}...")
-    else:
-        print(f"Started '{vm_name}'.")
+    if not args.json:
+        _print_created(
+            vm_name,
+            config_created=config_created,
+            agent=str(agent),
+            attach=attach,
+            run_user=str(run_user) if run_user is not None else None,
+        )
 
-    return _post_start_actions(
+    rc = _post_start_actions(
         vm_name=vm_name,
         command=LAUNCH_COMMANDS[str(agent)],
         attach=attach,
@@ -925,6 +1003,9 @@ def cmd_start(args: argparse.Namespace) -> int:
         cwd=project_guest_cwd,
         git_config_text=git_config_text,
     )
+    if rc == 0 and args.json:
+        print(json.dumps({"vm": {"name": vm_name, "status": "running"}}))
+    return rc
 
 
 def _confirm_destructive_action(message: str, *, force: bool) -> bool:
@@ -958,9 +1039,7 @@ def cmd_shell(args: argparse.Namespace) -> int:
     smolvm_command = ["sandbox", "ssh", name]
     keep_running = bool(getattr(args, "keep_running", False))
     stop_on_exit = bool(_cfg(config, "sbx", "stop_on_exit", True)) and not keep_running
-    git_config = bool(
-        args.git_config if args.git_config is not None else _cfg(config, "sbx", "git_config", True)
-    )
+    git_config = bool(_cfg(config, "sbx", "git_config", True))
     git_config_text = (
         guest_setup.host_git_config(Path(project_identity["project_root"])) if git_config else None
     )
@@ -1052,7 +1131,7 @@ def cmd_remove(args: argparse.Namespace) -> int:
     return _delete_vm(name)
 
 
-def _delete_vm(vm_id: str, extra_args: Sequence[str] | None = None) -> int:
+def _delete_vm(vm_id: str, extra_args: Sequence[str] | None = None, *, quiet: bool = False) -> int:
     extra = list(extra_args or [])
     completed = runtime.run_smolvm_capture(["sandbox", "delete", vm_id, *extra, "--json"])
     if completed is None:
@@ -1072,11 +1151,13 @@ def _delete_vm(vm_id: str, extra_args: Sequence[str] | None = None) -> int:
             if vm_id in metadata:
                 metadata.pop(vm_id, None)
                 vm_metadata.save_vm_metadata(metadata)
-        print(f"Destroyed VM '{vm_id}'.")
+        if not quiet:
+            print(f"Destroyed VM '{vm_id}'.")
         return 0
 
     if any(item.get("error") == f"VM '{vm_id}' not found" for item in failed):
-        print(f"VM '{vm_id}' not found; nothing to destroy.")
+        if not quiet:
+            print(f"VM '{vm_id}' not found; nothing to destroy.")
         return 0
 
     if completed.stdout:
@@ -1086,112 +1167,55 @@ def _delete_vm(vm_id: str, extra_args: Sequence[str] | None = None) -> int:
 
 def cmd_create(args: argparse.Namespace) -> int:
     args.attach = False
-    if args.auth_port is None:
-        args.auth_port = False
+    args.auth_port = False
     return cmd_start(args)
 
 
 def cmd_recreate(args: argparse.Namespace) -> int:
     config = args.config_data
     force = args.force
-    name = args.name or args.name_arg or _cfg(config, "sbx", "name")
+    name = args.name or _cfg(config, "sbx", "name")
     if not name:
-        print("sbx: recreate requires a VM name argument, --name, or [sbx].name", file=sys.stderr)
+        print("sbx: recreate requires a VM name argument or [sbx].name", file=sys.stderr)
         return 2
 
     if not _confirm_destructive_action(f"Destroy and recreate VM '{name}'?", force=force):
         return 2
 
-    destroy_rc = _delete_vm(str(name))
+    json_output = bool(getattr(args, "json", False))
+    destroy_rc = _delete_vm(str(name), quiet=True) if json_output else _delete_vm(str(name))
     if destroy_rc != 0:
         return destroy_rc
     args.name = str(name)
     args.attach = False
-    if args.auth_port is None:
-        args.auth_port = False
+    args.auth_port = False
     return cmd_start(args)
 
 
 def _add_start_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
+    session = parser.add_argument_group("Session")
+    session.add_argument(
         "--agent", choices=AGENTS, help="Agent preset to run (default: [sbx].agent or pi)."
     )
-    parser.add_argument("--name")
-    parser.add_argument("--memory", type=int, metavar="MIB")
-    parser.add_argument("--cpus", type=int, metavar="COUNT", help="Number of virtual CPUs.")
-    parser.add_argument("--disk-size", type=int, metavar="MIB")
-    parser.add_argument("--os")
-    parser.add_argument("--image", help="Local ready-to-run image directory.")
-    parser.add_argument("--mount", action="append", metavar="HOST_PATH[:GUEST_PATH]")
-    parser.add_argument(
-        "--project-path",
-        help="Mount this host path at the same absolute guest path as read-write.",
-    )
-    parser.add_argument(
+    session.add_argument(
         "--run-user",
         help="When attaching, create/use this guest user and run the agent as that user.",
     )
-    parser.add_argument(
+    session.add_argument(
         "--env",
         action="append",
         default=None,
         metavar="KEY",
         help="Forward this host environment variable into the guest. Can be repeated.",
     )
-    auth_port = parser.add_mutually_exclusive_group()
-    auth_port.add_argument(
-        "--auth-port",
-        dest="auth_port",
-        action="store_true",
-        default=None,
-        help="Expose the agent OAuth callback port before attaching (default).",
-    )
-    auth_port.add_argument(
-        "--no-auth-port",
-        dest="auth_port",
-        action="store_false",
-        help="Do not expose the agent OAuth callback port automatically.",
-    )
-    parser.add_argument("--auth-host-port", type=int, help="Host OAuth callback port.")
-    parser.add_argument("--auth-guest-port", type=int, help="Guest OAuth callback port.")
-    credential_copy = parser.add_mutually_exclusive_group()
-    credential_copy.add_argument(
-        "--copy-host-credentials",
-        dest="copy_host_credentials",
-        action="store_true",
-        default=None,
-        help="Allow SmolVM presets to copy host CLI config files.",
-    )
-    credential_copy.add_argument(
-        "--no-copy-host-credentials",
-        dest="copy_host_credentials",
-        action="store_false",
-        help="Do not copy host CLI config files (default).",
-    )
-    git_config = parser.add_mutually_exclusive_group()
-    git_config.add_argument(
-        "--git-config",
-        dest="git_config",
-        action="store_true",
-        default=None,
-        help="Copy safe host Git identity/config into the guest (default).",
-    )
-    git_config.add_argument(
-        "--no-git-config",
-        dest="git_config",
-        action="store_false",
-        help="Do not copy host Git identity/config into the guest.",
-    )
-    parser.add_argument("--writable-mounts", action="store_true", default=None)
-    attach = parser.add_mutually_exclusive_group()
-    attach.add_argument("--attach", dest="attach", action="store_true", default=None)
-    attach.add_argument(
+    session.add_argument(
         "--no-attach",
         dest="attach",
         action="store_false",
-        help="Create VM but do not launch the agent.",
+        default=None,
+        help="Create or start the VM but do not launch the agent.",
     )
-    stop_on_exit = parser.add_mutually_exclusive_group()
+    stop_on_exit = session.add_mutually_exclusive_group()
     stop_on_exit.add_argument(
         "--stop-on-exit",
         dest="stop_on_exit",
@@ -1205,28 +1229,36 @@ def _add_start_options(parser: argparse.ArgumentParser) -> None:
         action="store_false",
         help="Keep the VM running after this sbx session exits.",
     )
-    parser.add_argument(
+
+    workspace = parser.add_argument_group("Workspace")
+    workspace.add_argument("--mount", action="append", metavar="HOST_PATH[:GUEST_PATH]")
+    workspace.add_argument(
+        "--project-path",
+        help="Mount this host path at the same absolute guest path as read-write.",
+    )
+    workspace.add_argument("--writable-mounts", action="store_true", default=None)
+
+    resources = parser.add_argument_group("VM resources")
+    resources.add_argument("--memory", type=int, metavar="MIB")
+    resources.add_argument("--cpus", type=int, metavar="COUNT", help="Number of virtual CPUs.")
+    resources.add_argument("--disk-size", type=int, metavar="MIB")
+    resources.add_argument("--image", help="Local ready-to-run image directory.")
+    resources.add_argument(
         "--boot-timeout",
         type=float,
         help="Seconds to wait for VM boot/SSH readiness (default: [sbx].boot_timeout or 60).",
     )
-    parser.add_argument("--install-timeout", type=float)
-    write_config = parser.add_mutually_exclusive_group()
-    write_config.add_argument(
+    resources.add_argument("--install-timeout", type=float)
+
+    output = parser.add_argument_group("Configuration and output")
+    output.add_argument(
         "--write-config",
-        dest="write_config",
         action="store_true",
         default=None,
         help="Create or update .sbx.toml with missing project defaults.",
     )
-    write_config.add_argument(
-        "--no-write-config",
-        dest="write_config",
-        action="store_false",
-        help="Do not create .sbx.toml automatically for this invocation.",
-    )
-    parser.add_argument("--json", action="store_true", default=None)
-    parser.add_argument("name_arg", nargs="?", metavar="NAME", help="Sandbox name.")
+    output.add_argument("--json", action="store_true", default=None)
+    parser.add_argument("name", nargs="?", metavar="NAME", help="Sandbox name.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1281,20 +1313,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--project-path",
         help="Start the shell in this mounted project path (default: [sbx].project_path).",
     )
-    git_config_shell = shell.add_mutually_exclusive_group()
-    git_config_shell.add_argument(
-        "--git-config",
-        dest="git_config",
-        action="store_true",
-        default=None,
-        help="Copy safe host Git identity/config into the guest (default).",
-    )
-    git_config_shell.add_argument(
-        "--no-git-config",
-        dest="git_config",
-        action="store_false",
-        help="Do not copy host Git identity/config into the guest.",
-    )
     shell.add_argument(
         "--root",
         action="store_true",
@@ -1306,11 +1324,9 @@ def build_parser() -> argparse.ArgumentParser:
     for list_name in ("list", "ls"):
         list_parser = sub.add_parser(list_name, help="List sandboxes.")
         list_parser.add_argument(
-            "-a",
-            "--all",
-            action="store_true",
-            help="List all sandboxes, including stopped ones.",
+            "--running", action="store_true", help="List only running sandboxes."
         )
+        list_parser.add_argument("--json", action="store_true", help="Print JSON.")
         list_parser.set_defaults(func=cmd_list)
 
     network_parser = sub.add_parser("network", help="Expert networking helpers.")
@@ -1320,11 +1336,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Forward a host TCP port to a running sandbox until Ctrl-C.",
     )
     forward.add_argument(
-        "forward_args",
+        "specs",
         nargs="+",
-        metavar="[NAME] SPEC...",
-        help="Forward specs: GUEST_PORT, HOST_PORT:GUEST_PORT, or BIND_HOST:HOST_PORT:GUEST_PORT.",
+        metavar="SPEC",
+        help="GUEST_PORT, HOST_PORT:GUEST_PORT, or BIND_HOST:HOST_PORT:GUEST_PORT.",
     )
+    forward.add_argument("--name", help="Sandbox name or ID. Defaults to [sbx].name.")
     forward.set_defaults(func=network.cmd_forward)
 
     auth_port = network_sub.add_parser(
@@ -1373,6 +1390,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=1455,
         help="Host auth callback port to inspect (default: 1455).",
     )
+    network_status.add_argument("--json", action="store_true", help="Print JSON.")
     network_status.set_defaults(func=network.cmd_status)
 
     image = sub.add_parser("image", help="Advanced local image helpers.")

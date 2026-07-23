@@ -44,6 +44,7 @@ If a command needs a sandbox name and neither a positional name nor `[sbx].name`
 | `shell` | Open an interactive shell for inspection/debugging. |
 | `stop` | Stop without deleting VM state. |
 | `rm` | Delete VM state. |
+| `ls` / `list` | List all sandboxes; `--running` filters to running VMs. |
 | `doctor` | Diagnose host backend and project/config state. |
 | `network ...` | Expert helpers for auth callback tunnels and network status. |
 
@@ -76,7 +77,7 @@ Examples of command/action concerns that should generally not be required in con
 - `--force`
 - `--debug`
 
-Some session defaults, such as `stop_on_exit`, `auth_port`, or `git_config`, can live in config because they affect repeated project workflow behavior.
+Security and forwarding policy such as `auth_port`, `copy_host_credentials`, and `git_config` lives only in config so recreation is reproducible. `copy_host_credentials` remains false by default.
 
 ## Existing VM reuse
 
@@ -126,12 +127,11 @@ Behavior:
 - If `./.sbx.toml` exists, never modify it by default.
 - If `./.sbx.toml` exists and `--write-config` is passed, add missing durable keys only.
 - Never overwrite existing values.
-- `--no-write-config` disables automatic config creation for that invocation.
 
 Example:
 
 ```bash
-sbx run --name the-quest --image ~/.smolvm/images/sbx --memory 8192 --cpus 4 --disk-size 40960 --project-path . --run-user agent
+sbx run the-quest --image ~/.smolvm/images/sbx --memory 8192 --cpus 4 --disk-size 40960 --project-path . --run-user agent
 ```
 
 could create:
@@ -147,7 +147,7 @@ project_path = "."
 run_user = "agent"
 ```
 
-After that, project workflows become:
+On initial creation, `sbx` prints the generated config and the next `run`, `shell`, `stop`, and `rm` commands. After that, project workflows become:
 
 ```bash
 sbx run

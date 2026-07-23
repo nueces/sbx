@@ -2,7 +2,7 @@
 
 `sbx` runs coding agents inside disposable [SmolVM](https://github.com/CelestoAI/smolVM) virtual machines.
 
-Agents and authentication run in the VM, not on the host. By default `sbx` does **not** copy host credentials into the guest. Use `--copy-host-credentials` only when you explicitly want SmolVM presets to forward local agent configs/API keys.
+Agents and authentication run in the VM, not on the host. By default `sbx` does **not** copy host credentials into the guest. Set `copy_host_credentials = true` in `.sbx.toml` only when you explicitly want SmolVM presets to forward local agent configs/API keys.
 
 ## Install
 
@@ -72,8 +72,8 @@ sbx run my-sbx --mount /home/me/src/tooling --mount /home/me/src/data
 # Or choose an explicit guest path.
 sbx run my-sbx --mount /home/me/src/tooling:/workspace/tooling
 
-# Disable automatic OAuth callback forwarding.
-sbx run my-sbx --no-auth-port
+# Start or create the VM without attaching an agent.
+sbx run my-sbx --no-attach
 ```
 
 Port forwarding lets your host connect to a TCP service running inside the sandbox, such as a dev server or web app. `sbx network forward` runs in the foreground; Ctrl-C stops the forwarding.
@@ -98,10 +98,10 @@ Examples:
 You can pass multiple specs in one command; one Ctrl-C stops all of them:
 
 ```bash
-sbx network forward my-sbx 3000
+sbx network forward 3000
 sbx network forward 8080:3000
 sbx network forward 0.0.0.0:3000:3000
-sbx network forward my-sbx 3000 8080:80
+sbx network forward --name my-sbx 3000 8080:80
 ```
 
 ```bash
@@ -109,15 +109,16 @@ sbx network forward my-sbx 3000 8080:80
 sbx run my-sbx --keep-running
 sbx shell my-sbx --keep-running
 
-# Control project config bootstrap.
+# Write missing project defaults when reusing an existing VM/config.
 sbx run my-sbx --write-config
-sbx create my-sbx --no-write-config
 
 # Run the attached agent process as a non-root guest user.
 sbx run my-sbx --run-user agent
 
-# Explicitly allow copying host agent credentials/configs into the guest.
-sbx run my-sbx --copy-host-credentials
+# Machine-readable lifecycle and inventory output.
+sbx run my-sbx --no-attach --json
+sbx ls --json
+sbx network status my-sbx --json
 
 # Explicitly forward a selected host environment variable into the guest.
 sbx run my-sbx --env OPENAI_API_KEY
@@ -139,9 +140,9 @@ sbx run my-sbx --agent claude
 | `rm [NAME]`                      | Remove a sandbox. Confirmation required unless `--force`.                                |
 | `stop [NAME]`                    | Stop a sandbox without removing it.                                                      |
 | `shell [NAME]`                   | Open a shell in a sandbox.                                                               |
-| `ls`                             | List running sandboxes. Use `ls -a` / `ls --all` to include stopped ones.                |
+| `ls`                             | List all sandboxes. Use `ls --running` to show only running ones.                         |
 | `network status [NAME]`          | Expert helper: show sandbox networking and auth callback tunnel status.                  |
-| `network forward [NAME] SPEC...` | Temporarily forward host TCP ports to a running sandbox until Ctrl-C.                    |
+| `network forward SPEC...`        | Temporarily forward ports for the project VM; use `--name` for another VM.               |
 | `network auth-port [NAME]`       | Expert helper: manually expose the OAuth callback port for an already-running sandbox.   |
 | `network close-auth-port [NAME]` | Expert helper: close the tracked OAuth callback tunnel.                                  |
 | `image build`                    | Build the curated local Pi/rootless-Docker image.                                        |
@@ -218,7 +219,7 @@ CLI flags always override config values.
 
 Start with the released defaults; add `.sbx.toml` only when you need a named VM, mounts, image, user, or safety defaults.
 
-When `sbx run` or `sbx create` creates a new named VM and `./.sbx.toml` does not exist, `sbx` writes a minimal project config with the VM name and selected options. Existing VMs do not create or update `.sbx.toml` unless `--write-config` is passed. Use `--no-write-config` to skip this bootstrap.
+When `sbx run` or `sbx create` creates a new named VM and `./.sbx.toml` does not exist, `sbx` writes a minimal project config with the VM name and selected options. Existing VMs do not create or update `.sbx.toml` unless `--write-config` is passed.
 Configuration should describe the sandbox, while command choice describes the action. For example, use `sbx run` to attach and `sbx create` to create without attaching, rather than relying on config to change interaction style.
 
 Example `.sbx.toml`:
@@ -273,24 +274,24 @@ git_config = true
 | Section | Key                     | CLI flag                                                 | Description                                                                                                                                                |
 | ------- | ----------------------- | -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `[sbx]` | `agent`                 | `--agent`                                                | Default agent: `pi`, `claude`, or `codex`.                                                                                                                 |
-| `[sbx]` | `name`                  | `--name` or positional `NAME`                            | VM name.                                                                                                                                                   |
+| `[sbx]` | `name`                  | positional `NAME`                                        | VM name.                                                                                                                                                   |
 | `[sbx]` | `memory`                | `--memory`                                               | Memory in MiB.                                                                                                                                             |
 | `[sbx]` | `cpus`                  | `--cpus`                                                 | Number of virtual CPUs.                                                                                                                                    |
 | `[sbx]` | `disk_size`             | `--disk-size`                                            | Disk size in MiB.                                                                                                                                          |
 | `[sbx]` | `backend`               | -                                                        | Must be `qemu` for now. Other backends may be supported later.                                                                                             |
-| `[sbx]` | `os`                    | `--os`                                                   | Guest OS value passed to SmolVM. Ignored when `image` is set.                                                                                              |
+| `[sbx]` | `os`                    | -                                                        | Guest OS value passed to SmolVM. Ignored when `image` is set.                                                                                              |
 | `[sbx]` | `image`                 | `--image`                                                | Local ready-to-run image directory containing `smolvm-image.json`, kernel, and rootfs.                                                                     |
 | `[sbx]` | `mount`                 | `--mount`                                                | Host mount(s), as a string or array of strings. Bare host paths mount at the same absolute guest path; `HOST:GUEST` keeps the explicit guest path.          |
 | `[sbx]` | `project_path`          | `--project-path`                                         | Mount a path first at the same absolute guest path, force RW mounts, and start the attached agent there.                                                    |
 | `[sbx]` | `writable_mounts`       | `--writable-mounts`                                      | Enable writable mounts.                                                                                                                                    |
 | `[sbx]` | `run_user`              | `--run-user`                                             | Create/use a guest user and run the attached agent/shell as that user.                                                                                     |
-| `[sbx]` | `auth_port`             | `--auth-port` / `--no-auth-port`                         | Automatically expose the OAuth callback port before attaching. Defaults to `true` for `run`.                                                               |
-| `[sbx]` | `auth_host_port`        | `--auth-host-port`                                       | Host localhost port for OAuth callback forwarding. Defaults to `1455`.                                                                                     |
-| `[sbx]` | `auth_guest_port`       | `--auth-guest-port`                                      | Guest port for OAuth callback forwarding. Defaults to `1455`.                                                                                              |
+| `[sbx]` | `auth_port`             | -                                                        | Automatically expose the OAuth callback port before attaching. Defaults to `true` for `run`.                                                               |
+| `[sbx]` | `auth_host_port`        | -                                                        | Host localhost port for OAuth callback forwarding. Defaults to `1455`.                                                                                     |
+| `[sbx]` | `auth_guest_port`       | -                                                        | Guest port for OAuth callback forwarding. Defaults to `1455`.                                                                                              |
 | `[sbx]` | `stop_on_exit`          | `--stop-on-exit` / `--keep-running`                      | Stop the VM after run/shell exits if no other sbx sessions remain. Defaults to `true`.                                                                     |
-| `[sbx]` | `copy_host_credentials` | `--copy-host-credentials` / `--no-copy-host-credentials` | Allow/deny copying host credential files/configs. Defaults to `false`.                                                                                     |
+| `[sbx]` | `copy_host_credentials` | -                                                        | Allow/deny copying host credential files/configs. Defaults to `false`; enabling it prints a provisioning warning.                                         |
 | `[sbx]` | `env`                   | `--env KEY`                                              | Explicit allowlist of host environment variables to forward into the guest. Defaults to empty. See [environment forwarding](docs/environment-forwarding.md). |
-| `[sbx]` | `git_config`            | `--git-config` / `--no-git-config`                       | Copy safe host Git identity/config into the guest. Defaults to `true`; does not copy credentials, SSH keys, signing keys, includes, or credential helpers. |
+| `[sbx]` | `git_config`            | -                                                        | Copy safe host Git identity/config into the guest. Defaults to `true`; does not copy credentials, SSH keys, signing keys, includes, or credential helpers. |
 | `[sbx]` | `install_timeout`       | `--install-timeout`                                      | Agent install timeout in seconds. Ignored when `image` is set.                                                                                             |
 | `[sbx]` | `boot_timeout`          | `--boot-timeout`                                         | VM boot/SSH readiness timeout in seconds. Defaults to `30`. Increase this if a cold boot leaves the VM running but SSH is not ready yet.                   |
 
@@ -346,13 +347,7 @@ core.autocrlf
 core.eol
 ```
 
-`sbx` does not copy Git credentials, SSH keys, GPG/signing keys, credential helpers, includes, or URL rewrite rules. Disable this with:
-
-```bash
-sbx run --no-git-config
-```
-
-or:
+`sbx` does not copy Git credentials, SSH keys, GPG/signing keys, credential helpers, includes, or URL rewrite rules. Disable this in project configuration:
 
 ```toml
 [sbx]

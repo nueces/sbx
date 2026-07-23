@@ -230,22 +230,13 @@ def _foreground_port_forward(vm_id: str, forwards: Sequence[tuple[str, int, int]
 
 
 def cmd_forward(args: argparse.Namespace) -> int:
-    name = None
-    specs = args.forward_args
-    if len(specs) > 1:
-        try:
-            parse_port_forward(specs[0])
-        except ConfigError:
-            name = specs[0]
-            specs = specs[1:]
-    if name is None:
-        name = vm_name_from_arg_or_config(
-            args, getattr(args, "config_data", None), "network forward"
-        )
+    name = vm_name_from_arg_or_config(args, getattr(args, "config_data", None), "network forward")
     if name is None:
         return 2
     try:
-        return _foreground_port_forward(str(name), [parse_port_forward(spec) for spec in specs])
+        return _foreground_port_forward(
+            str(name), [parse_port_forward(spec) for spec in args.specs]
+        )
     except ConfigError as exc:
         print(f"sbx: {exc}", file=sys.stderr)
         return 2
@@ -326,13 +317,28 @@ def cmd_status(args: argparse.Namespace) -> int:
         auth_status = "busy/untracked"
         auth_detail = f"localhost:{args.host_port} is listening but is not tracked by sbx"
 
-    print(f"Sandbox: {vm['name']}")
-    print(f"Status: {vm['status']}")
-    print(f"Backend: {vm['backend']}")
-    print(f"Guest IP: {vm['ip_address']}")
-    print(f"SSH Port: {vm['ssh_port']}")
     port_forwards = _vm_port_forward_details(vm)
-    print("Port forwards: " + (", ".join(port_forwards) if port_forwards else "-"))
-    print(f"Auth callback: {auth_status}")
-    print(f"Auth detail: {auth_detail}")
+    result = {
+        "name": vm["name"],
+        "status": vm["status"],
+        "backend": vm["backend"],
+        "guest_ip": vm["ip_address"],
+        "ssh_port": vm["ssh_port"],
+        "port_forwards": port_forwards,
+        "auth_callback": {
+            "status": auth_status,
+            "detail": None if auth_detail == "-" else auth_detail,
+        },
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(f"Sandbox: {result['name']}")
+        print(f"Status: {result['status']}")
+        print(f"Backend: {result['backend']}")
+        print(f"Guest IP: {result['guest_ip']}")
+        print(f"SSH Port: {result['ssh_port']}")
+        print("Port forwards: " + (", ".join(port_forwards) if port_forwards else "-"))
+        print(f"Auth callback: {auth_status}")
+        print(f"Auth detail: {auth_detail}")
     return 0

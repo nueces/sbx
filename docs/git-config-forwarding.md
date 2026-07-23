@@ -11,18 +11,11 @@ Git config forwarding is enabled by default:
 git_config = true
 ```
 
-Disable it with:
+Disable it reproducibly in project configuration:
 
 ```toml
 [sbx]
 git_config = false
-```
-
-or per command:
-
-```bash
-sbx run --no-git-config
-sbx shell --no-git-config
 ```
 
 ## Copied keys

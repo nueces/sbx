@@ -10,16 +10,16 @@ sbx network ...
 
 ## Current commands
 
-### `sbx network forward [NAME] SPEC...`
+### `sbx network forward [--name NAME] SPEC...`
 
-Forwards host TCP ports to a running sandbox in the foreground. Press Ctrl-C to stop all forwards.
+Forwards host TCP ports to a running sandbox in the foreground. It uses `[sbx].name` unless `--name` selects another VM. Press Ctrl-C to stop all forwards.
 
 ```bash
 sbx network forward 3000
 sbx network forward 8080:3000
 sbx network forward 0.0.0.0:3000:3000
 sbx network forward 3000 8080:80
-sbx network forward my-sbx 3000 8080:80
+sbx network forward --name my-sbx 3000 8080:80
 ```
 
 `SPEC` is one of:
@@ -53,7 +53,7 @@ Auth callback: active
 Auth detail: pid 12345, localhost:1455 -> guest:1455
 ```
 
-If the auth callback port is listening but the process is not tracked by `sbx`, status reports:
+Use `sbx network status --json` for machine-readable status. If the auth callback port is listening but the process is not tracked by `sbx`, status reports:
 
 ```text
 Auth callback: busy/untracked

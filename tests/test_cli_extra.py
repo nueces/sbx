@@ -1599,7 +1599,11 @@ def test_recreate_success_deletes_then_starts(monkeypatch: pytest.MonkeyPatch) -
 
 def test_start_existing_vm_if_needed_variants(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[list[str]] = []
-    monkeypatch.setattr(cli.runtime, "run_smolvm", lambda argv: calls.append(list(argv)) or 0)
+    monkeypatch.setattr(
+        cli.runtime,
+        "run_smolvm_capture",
+        lambda argv: subprocess.CompletedProcess(calls.append(list(argv)) or argv, 0, "", ""),
+    )
 
     assert cli._start_existing_vm_if_needed("vm1", "running", 60) == 0
     assert calls == []
@@ -1628,24 +1632,15 @@ def test_mark_error_vm_stopped_for_restart_clears_stale_runtime_fields() -> None
     assert row == ("stopped", None, None)
 
 
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ["run", "vm1", "--force-start", "--no-attach"],
-        ["shell", "--force-start", "--keep-running", "--no-git-config", "vm1"],
-    ],
-)
-def test_force_start_is_rejected(argv: list[str]) -> None:
-    with pytest.raises(SystemExit) as exc:
-        cli.main(argv)
-    assert exc.value.code == 2
-
-
 def test_start_existing_vm_timeout_hint_when_vm_is_running(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setattr(cli.runtime, "run", lambda argv, **kwargs: 1)
+    monkeypatch.setattr(
+        cli.runtime,
+        "run_smolvm_capture",
+        lambda argv: subprocess.CompletedProcess(argv, 1, "", ""),
+    )
     monkeypatch.setattr(cli, "_get_existing_vm_status", lambda vm_id: "running")
 
     assert cli._start_existing_vm_if_needed("vm1", "stopped", 60) == 1

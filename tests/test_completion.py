@@ -38,6 +38,9 @@ def test_completion_scripts_include_all_command_option_groups() -> None:
             "guest-port",
             "replace",
             "rootfs-size-mb",
+            "running",
+            "json",
+            "name",
         ):
             assert value in script
         assert "build-debian" not in script

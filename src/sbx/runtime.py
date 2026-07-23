@@ -119,7 +119,7 @@ def run_smolvm_capture(
 def missing_vm_message(vm_id: str) -> str:
     return (
         f"VM {vm_id!r} not found. `sbx shell` attaches to an existing sandbox; "
-        f"create it with `sbx run {vm_id}` or list VMs with `sbx ls -a`."
+        f"create it with `sbx run {vm_id}` or list VMs with `sbx ls`."
     )
 
 
