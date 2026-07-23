@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
 import os
 import select
 import socket
@@ -40,12 +41,31 @@ from sbx_gateway_mediator import (  # noqa: E402
     MAX_RETAINED_BODY,
     MAX_RETAINED_TOTAL,
     Admission,
+    AwsCodeArtifactTokenProvider,
     CapabilityVerifier,
+    CredentialProviderError,
     GatewayAddon,
+    PackageAuth,
     RetainedBufferBudget,
+    _basic_authorization,
 )
 
 KEY = b"k" * 32
+PLACEHOLDER = "SBX_SECRET_package_" + "p" * 43
+FAKE_TOKEN = "fake-real-token-task10"
+
+
+def package_auth_config(port: int, helper: Path) -> dict[str, object]:
+    return {
+        "version": 1,
+        "rule_id": "rule1",
+        "host": "localhost",
+        "port": port,
+        "path_prefix": "/pypi/repo/",
+        "username": "aws",
+        "placeholder": PLACEHOLDER,
+        "provider": {"type": "command", "argv": [str(helper)]},
+    }
 
 
 def credential(
@@ -154,6 +174,7 @@ class ProtocolFixture:
         self.listener.settimeout(0.2)
         self.port = self.listener.getsockname()[1]
         self.paths: list[str] = []
+        self.authorizations: list[tuple[str, str]] = []
         self._lock = threading.Lock()
         self._stopped = threading.Event()
         self._thread = threading.Thread(target=self._serve, daemon=True)
@@ -168,9 +189,10 @@ class ProtocolFixture:
         with self._lock:
             return self.paths.count(path)
 
-    def _record(self, path: str) -> None:
+    def _record(self, path: str, authorization: str = "") -> None:
         with self._lock:
             self.paths.append(path)
+            self.authorizations.append((path, authorization))
 
     def _serve(self) -> None:
         while not self._stopped.is_set():
@@ -222,7 +244,7 @@ class ProtocolFixture:
                         return
             elif "content-length" in headers:
                 body = reader.exact(int(headers["content-length"]))
-            self._record(path)
+            self._record(path, headers.get("authorization", ""))
             if path == "/websocket":
                 self._websocket(conn, reader, headers)
                 return
@@ -230,6 +252,8 @@ class ProtocolFixture:
                 self._response(conn, 302, b"", {"Location": "/ok"})
             elif path == "/redirect-bad":
                 self._response(conn, 302, b"", {"Location": "https://other.example/"})
+            elif path == "/pypi/repo/redirect-escape":
+                self._response(conn, 302, b"", {"Location": "/outside/"})
             elif path == "/many-response":
                 extra = {f"X-Test-{index}": "x" for index in range(101)}
                 self._response(conn, 200, b"upstream-limit-bypassed", extra)
@@ -302,7 +326,7 @@ class ProtocolFixture:
                     h2.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
                 elif isinstance(event, StreamEnded):
                     path = requests[event.stream_id][":path"]
-                    self._record(path)
+                    self._record(path, requests[event.stream_id].get("authorization", ""))
                     body = b"h2-ok"
                     h2.send_headers(
                         event.stream_id,
@@ -315,8 +339,15 @@ class ProtocolFixture:
 
 
 class MediatorProcess:
-    def __init__(self, directory: Path, upstream_ca: Path) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        upstream_ca: Path,
+        package_auth: dict[str, object] | None = None,
+    ) -> None:
         self.confdir = Path(tempfile.mkdtemp(prefix="mitmproxy-", dir=directory))
+        self.stdout = ""
+        self.stderr = ""
         key_read, key_write = os.pipe()
         ready_read, ready_write = os.pipe()
         os.write(key_write, KEY)
@@ -337,23 +368,30 @@ class MediatorProcess:
             "--upstream-ca",
             str(upstream_ca),
         ]
+        pass_fds = [key_read, ready_write]
+        if package_auth is not None:
+            auth_read, auth_write = os.pipe()
+            os.write(auth_write, json.dumps(package_auth).encode())
+            os.close(auth_write)
+            argv.extend(("--package-auth-fd", str(auth_read)))
+            pass_fds.append(auth_read)
         self.process = subprocess.Popen(
             argv,
-            pass_fds=(key_read, ready_write),
+            pass_fds=tuple(pass_fds),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
         os.close(key_read)
         os.close(ready_write)
+        if package_auth is not None:
+            os.close(auth_read)
         readable, _, _ = select.select([ready_read], [], [], 10)
         payload = os.read(ready_read, 4096) if readable else b""
         os.close(ready_read)
         if not payload:
             self.close()
             raise RuntimeError("mediator failed readiness")
-        import json
-
         ready = json.loads(payload)
         self.address = (ready["host"], ready["port"])
         self.ca = self.confdir / "mitmproxy-ca-cert.pem"
@@ -365,12 +403,12 @@ class MediatorProcess:
         if self.process.poll() is None:
             self.process.terminate()
         try:
-            _, stderr = self.process.communicate(timeout=5)
+            self.stdout, self.stderr = self.process.communicate(timeout=5)
         except subprocess.TimeoutExpired:
             self.process.kill()
-            _, stderr = self.process.communicate(timeout=5)
+            self.stdout, self.stderr = self.process.communicate(timeout=5)
         if self.process.returncode not in {0, -15}:
-            raise RuntimeError(f"mediator exited {self.process.returncode}: {stderr}")
+            raise RuntimeError(f"mediator exited {self.process.returncode}: {self.stderr}")
 
 
 class CapabilityTests(unittest.TestCase):
@@ -403,6 +441,144 @@ class CapabilityTests(unittest.TestCase):
         ]
         for user, secret in invalid:
             self.assertIsNone(verifier.verify(user, secret, now=now))
+
+
+class PackageAuthUnitTests(unittest.TestCase):
+    def _addon(self, get_token=lambda: FAKE_TOKEN) -> tuple[GatewayAddon, object]:
+        addon = GatewayAddon(
+            CapabilityVerifier(KEY, "vm1", "worker1"),
+            package_auth=PackageAuth("rule1", "localhost", 443, "/pypi/repo/", "aws", PLACEHOLDER),
+            get_real_token=get_token,
+        )
+        client = tflow.tclient_conn()
+        addon._admissions[client.id] = Admission(
+            "vm1", "worker1", "flow", "rule1", "localhost", 443, 1, 2
+        )
+        return addon, client
+
+    def _flow(
+        self,
+        client: object,
+        path: str = "/pypi/repo/simple/demo/",
+        authorization: str | None = None,
+        scheme: str = "https",
+    ) -> http.HTTPFlow:
+        headers = {"Authorization": authorization} if authorization is not None else {}
+        return tflow.tflow(
+            client_conn=client,
+            req=http.Request.make("GET", f"{scheme}://localhost{path}", headers=headers),
+        )
+
+    def test_exact_structural_placeholder_replacement(self) -> None:
+        addon, client = self._addon()
+        flow = self._flow(client, authorization=_basic_authorization("aws", PLACEHOLDER))
+
+        addon.requestheaders(flow)
+
+        self.assertIsNone(flow.response)
+        self.assertEqual(
+            flow.request.headers["Authorization"],
+            _basic_authorization("aws", FAKE_TOKEN),
+        )
+
+    def test_negative_package_authorization_matrix(self) -> None:
+        for name, path, authorization, scheme in (
+            ("missing", "/pypi/repo/simple/demo/", None, "https"),
+            ("wrong", "/pypi/repo/simple/demo/", _basic_authorization("aws", "wrong"), "https"),
+            ("bearer", "/pypi/repo/simple/demo/", "Bearer guest", "https"),
+            ("wrong-path", "/outside/", _basic_authorization("aws", PLACEHOLDER), "https"),
+            (
+                "encoded-traversal",
+                "/pypi/repo/%2e%2e/outside/",
+                _basic_authorization("aws", PLACEHOLDER),
+                "https",
+            ),
+            (
+                "http-downgrade",
+                "/pypi/repo/simple/demo/",
+                _basic_authorization("aws", PLACEHOLDER),
+                "http",
+            ),
+        ):
+            with self.subTest(name):
+                addon, client = self._addon()
+                flow = self._flow(client, path, authorization, scheme)
+                addon.requestheaders(flow)
+                self.assertEqual(flow.response.status_code, 403)
+                self.assertNotIn(FAKE_TOKEN.encode(), flow.response.content)
+                self.assertNotIn(PLACEHOLDER.encode(), flow.response.content)
+
+    def test_placeholder_is_not_replaced_for_another_destination_rule(self) -> None:
+        addon, client = self._addon()
+        addon._admissions[client.id] = Admission(
+            "vm1", "worker1", "flow", "other-rule", "localhost", 443, 1, 2
+        )
+        authorization = _basic_authorization("aws", PLACEHOLDER)
+        flow = self._flow(client, authorization=authorization)
+
+        addon.requestheaders(flow)
+
+        self.assertIsNone(flow.response)
+        self.assertEqual(flow.request.headers["Authorization"], authorization)
+
+    def test_provider_and_refresh_failure_are_secret_safe(self) -> None:
+        def failed() -> str:
+            raise CredentialProviderError("authorizationToken=should-not-be-rendered-to-the-guest")
+
+        addon, client = self._addon(failed)
+        flow = self._flow(client, authorization=_basic_authorization("aws", PLACEHOLDER))
+        addon.requestheaders(flow)
+        self.assertEqual(flow.response.status_code, 503)
+        self.assertNotIn(b"authorizationToken", flow.response.content)
+
+        now = [1_700_000_000.0]
+        calls = 0
+
+        def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    json.dumps(
+                        {
+                            "authorizationToken": FAKE_TOKEN,
+                            "expiration": now[0] + 120,
+                        }
+                    ),
+                    "",
+                )
+            return subprocess.CompletedProcess(argv, 1, "", f"authorizationToken={FAKE_TOKEN}")
+
+        provider = AwsCodeArtifactTokenProvider(
+            domain="domain",
+            domain_owner="123456789012",
+            region="us-east-1",
+            runner=runner,
+            clock=lambda: now[0],
+        )
+        self.assertEqual(provider.get_token(), FAKE_TOKEN)
+        self.assertEqual(provider.get_token(), FAKE_TOKEN)
+        now[0] += 61
+        with self.assertRaises(CredentialProviderError) as error:
+            provider.get_token()
+        self.assertNotIn(FAKE_TOKEN, str(error.exception))
+        self.assertEqual(calls, 2)
+
+    def test_package_redirect_cannot_escape_path_scope(self) -> None:
+        addon, client = self._addon()
+        flow = self._flow(
+            client,
+            "/pypi/repo/redirect-escape",
+            _basic_authorization("aws", PLACEHOLDER),
+        )
+        addon.requestheaders(flow)
+        flow.response = http.Response.make(302, b"", {"Location": "/outside/"})
+
+        addon.responseheaders(flow)
+
+        self.assertEqual(flow.response.status_code, 502)
 
 
 class LimitTests(unittest.TestCase):
@@ -618,10 +794,7 @@ class MediatorIntegrationTests(unittest.TestCase):
         sock = self._tls()
         status, _, body = self._request(
             sock,
-            (
-                f"GET /http10 HTTP/1.0\r\nHost: {authority}\r\n"
-                "Connection: close\r\n\r\n"
-            ).encode(),
+            (f"GET /http10 HTTP/1.0\r\nHost: {authority}\r\nConnection: close\r\n\r\n").encode(),
         )
         self.assertEqual((status, body), (200, b"ok:GET"))
         sock.close()
@@ -640,8 +813,7 @@ class MediatorIntegrationTests(unittest.TestCase):
         status, _, _ = self._request(
             sock,
             (
-                f"GET /reuse-denied HTTP/1.1\r\n"
-                f"Host: other.example:{self.fixture.port}\r\n\r\n"
+                f"GET /reuse-denied HTTP/1.1\r\nHost: other.example:{self.fixture.port}\r\n\r\n"
             ).encode(),
         )
         self.assertEqual(status, 403)
@@ -668,8 +840,7 @@ class MediatorIntegrationTests(unittest.TestCase):
         status, _, body = self._request(
             sock,
             (
-                f"POST /stream HTTP/1.1\r\nHost: {authority}\r\n"
-                "Transfer-Encoding: chunked\r\n\r\n"
+                f"POST /stream HTTP/1.1\r\nHost: {authority}\r\nTransfer-Encoding: chunked\r\n\r\n"
             ).encode()
             + chunks
             + b"0\r\n\r\n",
@@ -783,6 +954,137 @@ class MediatorIntegrationTests(unittest.TestCase):
             self.assertEqual(status, 502)
             self.assertNotIn(b"upstream-limit-bypassed", body)
             sock.close()
+
+    def test_package_auth_workload_and_negative_cases(self) -> None:
+        directory = Path(self.temp.name)
+        helper = directory / "package-token-helper"
+        helper.write_text(
+            "#!/bin/sh\nprintf '%s%s%s\\n' 'fake-' 'real-token-' 'task10'\n",
+            encoding="utf-8",
+        )
+        helper.chmod(0o700)
+        mediator = MediatorProcess(
+            directory,
+            self.fixture.root_ca,
+            package_auth_config(self.fixture.port, helper),
+        )
+        authority = f"localhost:{self.fixture.port}"
+        before = len(self.fixture.paths)
+        try:
+            sock = ssl.create_default_context(cafile=str(mediator.ca)).wrap_socket(
+                self._socks_to(mediator), server_hostname="localhost"
+            )
+            status, _, body = self._request(
+                sock,
+                (
+                    f"GET /pypi/repo/simple/demo/ HTTP/1.1\r\nHost: {authority}\r\n"
+                    f"Authorization: {_basic_authorization('aws', PLACEHOLDER)}\r\n\r\n"
+                ).encode(),
+            )
+            self.assertEqual((status, body), (200, b"ok:GET"))
+            self.assertEqual(
+                self.fixture.authorizations[-1],
+                (
+                    "/pypi/repo/simple/demo/",
+                    _basic_authorization("aws", FAKE_TOKEN),
+                ),
+            )
+            sock.close()
+
+            for name, path, authorization, tls_enabled in (
+                ("missing", "/pypi/repo/simple/missing/", None, True),
+                ("wrong", "/pypi/repo/simple/wrong/", _basic_authorization("aws", "wrong"), True),
+                ("wrong-path", "/outside/", _basic_authorization("aws", PLACEHOLDER), True),
+                (
+                    "http-downgrade",
+                    "/pypi/repo/simple/http/",
+                    _basic_authorization("aws", PLACEHOLDER),
+                    False,
+                ),
+            ):
+                with self.subTest(name):
+                    raw = self._socks_to(mediator)
+                    conn = (
+                        ssl.create_default_context(cafile=str(mediator.ca)).wrap_socket(
+                            raw, server_hostname="localhost"
+                        )
+                        if tls_enabled
+                        else raw
+                    )
+                    header = f"Authorization: {authorization}\r\n" if authorization else ""
+                    status, _, _ = self._request(
+                        conn,
+                        (f"GET {path} HTTP/1.1\r\nHost: {authority}\r\n{header}\r\n").encode(),
+                    )
+                    self.assertEqual(status, 403)
+                    conn.close()
+            self.assertEqual(len(self.fixture.paths), before + 1)
+
+            conn = ssl.create_default_context(cafile=str(mediator.ca)).wrap_socket(
+                self._socks_to(mediator), server_hostname="localhost"
+            )
+            status, _, _ = self._request(
+                conn,
+                (
+                    f"GET /pypi/repo/redirect-escape HTTP/1.1\r\nHost: {authority}\r\n"
+                    f"Authorization: {_basic_authorization('aws', PLACEHOLDER)}\r\n\r\n"
+                ).encode(),
+            )
+            self.assertEqual(status, 502)
+            conn.close()
+        finally:
+            mediator.close()
+        combined = (mediator.stdout + mediator.stderr).encode()
+        state = b"".join(
+            path.read_bytes() for path in mediator.confdir.rglob("*") if path.is_file()
+        )
+        for secret in (FAKE_TOKEN.encode(), PLACEHOLDER.encode()):
+            self.assertNotIn(secret, combined)
+            self.assertNotIn(secret, state)
+
+    def _socks_to(self, mediator: MediatorProcess) -> socket.socket:
+        original = self.mediator
+        self.mediator = mediator
+        try:
+            return self._socks()
+        finally:
+            self.mediator = original
+
+    def test_provider_failure_blocks_before_upstream(self) -> None:
+        directory = Path(self.temp.name)
+        helper = directory / "failed-package-token-helper"
+        helper.write_text(
+            "#!/bin/sh\n"
+            "printf '%s%s%s\\n' 'authorizationToken=' 'fake-real-' "
+            "'token-task10' >&2\nexit 1\n",
+            encoding="utf-8",
+        )
+        helper.chmod(0o700)
+        mediator = MediatorProcess(
+            directory,
+            self.fixture.root_ca,
+            package_auth_config(self.fixture.port, helper),
+        )
+        before = len(self.fixture.paths)
+        try:
+            conn = ssl.create_default_context(cafile=str(mediator.ca)).wrap_socket(
+                self._socks_to(mediator), server_hostname="localhost"
+            )
+            status, _, body = self._request(
+                conn,
+                (
+                    f"GET /pypi/repo/simple/failure/ HTTP/1.1\r\n"
+                    f"Host: localhost:{self.fixture.port}\r\n"
+                    f"Authorization: {_basic_authorization('aws', PLACEHOLDER)}\r\n\r\n"
+                ).encode(),
+            )
+            self.assertEqual(status, 503)
+            self.assertNotIn(FAKE_TOKEN.encode(), body)
+            self.assertEqual(len(self.fixture.paths), before)
+            conn.close()
+        finally:
+            mediator.close()
+        self.assertNotIn(FAKE_TOKEN, mediator.stdout + mediator.stderr)
 
     def test_mediator_crash_has_no_listener_or_direct_fallback(self) -> None:
         directory = Path(self.temp.name)

@@ -8,9 +8,14 @@ import hashlib
 import hmac
 import json
 import os
+import re
+import subprocess
+import threading
 import time
+from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any, NamedTuple
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 
 from mitmproxy import ctx, http, tls
 from mitmproxy.net.http import url
@@ -82,16 +87,114 @@ class CapabilityVerifier:
             or host != fields[8]
         ):
             return None
-        expected = base64.urlsafe_b64encode(
-            hmac.new(self._key, username.encode(), hashlib.sha256).digest()
-        ).rstrip(b"=").decode()
+        expected = (
+            base64.urlsafe_b64encode(
+                hmac.new(self._key, username.encode(), hashlib.sha256).digest()
+            )
+            .rstrip(b"=")
+            .decode()
+        )
         if not hmac.compare_digest(expected, password) or username in self._used:
             return None
         self._used = {token: expiry for token, expiry in self._used.items() if expiry >= now}
         self._used[username] = expires
-        return Admission(
-            fields[1], fields[2], fields[3], fields[4], host, port, issued, expires
+        return Admission(fields[1], fields[2], fields[3], fields[4], host, port, issued, expires)
+
+
+class PackageAuth(NamedTuple):
+    rule_id: str
+    host: str
+    port: int
+    path_prefix: str
+    username: str
+    placeholder: str
+
+
+class CredentialProviderError(RuntimeError):
+    pass
+
+
+class CommandTokenProvider:
+    def __init__(
+        self,
+        argv: tuple[str, ...],
+        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    ) -> None:
+        self._argv = argv
+        self._runner = runner
+
+    def get_token(self) -> str:
+        try:
+            result = self._runner(self._argv, text=True, capture_output=True, check=False)
+        except OSError as exc:
+            raise CredentialProviderError("credential command could not be started") from exc
+        if result.returncode != 0:
+            raise CredentialProviderError(
+                f"credential command failed{_diagnostic_suffix(result.stderr)}"
+            )
+        token = result.stdout.strip()
+        if not token:
+            raise CredentialProviderError("credential command returned an empty token")
+        return token
+
+
+class AwsCodeArtifactTokenProvider:
+    def __init__(
+        self,
+        *,
+        domain: str,
+        domain_owner: str,
+        region: str,
+        profile: str | None = None,
+        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self._argv = ["aws"]
+        if profile:
+            self._argv.extend(("--profile", profile))
+        self._argv.extend(
+            (
+                "codeartifact",
+                "get-authorization-token",
+                "--domain",
+                domain,
+                "--domain-owner",
+                domain_owner,
+                "--region",
+                region,
+                "--output",
+                "json",
+            )
         )
+        self._runner = runner
+        self._clock = clock
+        self._cached: tuple[str, float] | None = None
+        self._lock = threading.Lock()
+
+    def get_token(self) -> str:
+        with self._lock:
+            if self._cached is not None and self._cached[1] - self._clock() > 60:
+                return self._cached[0]
+            try:
+                result = self._runner(self._argv, text=True, capture_output=True, check=False)
+            except OSError as exc:
+                raise CredentialProviderError("aws CLI could not be started") from exc
+            if result.returncode != 0:
+                raise CredentialProviderError(
+                    f"aws CodeArtifact token refresh failed{_diagnostic_suffix(result.stderr)}"
+                )
+            try:
+                payload = json.loads(result.stdout)
+                token = payload["authorizationToken"].strip()
+                expires = _expiration(payload["expiration"])
+            except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise CredentialProviderError(
+                    "aws CodeArtifact returned an invalid response"
+                ) from exc
+            if not token or expires is None:
+                raise CredentialProviderError("aws CodeArtifact returned an invalid response")
+            self._cached = token, expires
+            return token
 
 
 class RetainedBufferBudget:
@@ -113,9 +216,17 @@ class RetainedBufferBudget:
 
 
 class GatewayAddon:
-    def __init__(self, verifier: CapabilityVerifier, ready_fd: int | None = None) -> None:
+    def __init__(
+        self,
+        verifier: CapabilityVerifier,
+        ready_fd: int | None = None,
+        package_auth: PackageAuth | None = None,
+        get_real_token: Callable[[], str] | None = None,
+    ) -> None:
         self._verifier = verifier
         self._ready_fd = ready_fd
+        self._package_auth = package_auth
+        self._get_real_token = get_real_token
         self._admissions: dict[str, Admission] = {}
         self._invalid_tls: set[str] = set()
         self._active: set[str] = set()
@@ -129,9 +240,12 @@ class GatewayAddon:
         addresses = proxyserver.listen_addrs()
         if len(addresses) != 1 or addresses[0][0] != "127.0.0.1":
             raise RuntimeError("mediator did not bind exactly one loopback listener")
-        payload = json.dumps(
-            {"host": addresses[0][0], "port": addresses[0][1], "pid": os.getpid()}
-        ).encode() + b"\n"
+        payload = (
+            json.dumps(
+                {"host": addresses[0][0], "port": addresses[0][1], "pid": os.getpid()}
+            ).encode()
+            + b"\n"
+        )
         try:
             os.write(self._ready_fd, payload)
         finally:
@@ -183,6 +297,25 @@ class GatewayAddon:
         if len(self._active) >= MAX_ACTIVE_REQUESTS and flow.id not in self._active:
             self._deny(flow, 503, b"sbx gateway request capacity exhausted")
             return
+        if self._package_auth is not None and admission.rule_id == self._package_auth.rule_id:
+            if not self._package_request_matches(flow.request, admission):
+                self._deny(flow, 403, b"sbx gateway denied package authorization")
+                return
+            parsed = _parse_basic_authorization(flow.request.headers.get("Authorization"))
+            if parsed != (self._package_auth.username, self._package_auth.placeholder):
+                self._deny(flow, 403, b"sbx gateway denied package authorization")
+                return
+            if self._get_real_token is None:
+                self._deny(flow, 503, b"sbx gateway credential provider unavailable")
+                return
+            try:
+                token = self._get_real_token()
+            except CredentialProviderError:
+                self._deny(flow, 503, b"sbx gateway credential provider failed")
+                return
+            flow.request.headers["Authorization"] = _basic_authorization(
+                self._package_auth.username, token
+            )
         self._active.add(flow.id)
         flow.request.stream = True
 
@@ -200,14 +333,19 @@ class GatewayAddon:
             if admission is None or not self._redirect_matches(flow, admission):
                 self._deny(flow, 502, b"sbx gateway denied redirect")
                 return
+            if (
+                self._package_auth is not None
+                and admission.rule_id == self._package_auth.rule_id
+                and not self._package_redirect_matches(flow)
+            ):
+                self._deny(flow, 502, b"sbx gateway denied package redirect")
+                return
         flow.response.stream = True
 
     def websocket_message(self, flow: http.HTTPFlow) -> None:
         admission = self._admissions.get(flow.client_conn.id)
         message = (
-            flow.websocket.messages[-1]
-            if flow.websocket and flow.websocket.messages
-            else None
+            flow.websocket.messages[-1] if flow.websocket and flow.websocket.messages else None
         )
         if (
             admission is None
@@ -238,9 +376,7 @@ class GatewayAddon:
     @staticmethod
     def _deny(flow: http.HTTPFlow, status: int, body: bytes) -> None:
         if flow.response is None:
-            flow.response = http.Response.make(
-                status, body, {"content-type": "text/plain"}
-            )
+            flow.response = http.Response.make(status, body, {"content-type": "text/plain"})
             return
         flow.response.status_code = status
         flow.response.reason = ""
@@ -264,6 +400,31 @@ class GatewayAddon:
             if authority_port != admission.port:
                 return False
         return True
+
+    def _package_request_matches(self, request: http.Request, admission: Admission) -> bool:
+        package_auth = self._package_auth
+        assert package_auth is not None
+        return (
+            admission.host == package_auth.host
+            and admission.port == package_auth.port
+            and request.scheme == "https"
+            and _path_is_scoped(request.path, package_auth.path_prefix)
+        )
+
+    def _package_redirect_matches(self, flow: http.HTTPFlow) -> bool:
+        package_auth = self._package_auth
+        assert package_auth is not None and flow.response is not None
+        try:
+            target = urlsplit(urljoin(flow.request.pretty_url, flow.response.headers["location"]))
+            port = target.port or (443 if target.scheme == "https" else 80)
+        except ValueError:
+            return False
+        return (
+            target.scheme == "https"
+            and _normalize_host(target.hostname or "") == package_auth.host
+            and port == package_auth.port
+            and _path_is_scoped(target.path, package_auth.path_prefix)
+        )
 
     @staticmethod
     def _redirect_matches(flow: http.HTTPFlow, admission: Admission) -> bool:
@@ -298,19 +459,163 @@ class GatewayAddon:
                 size += len(message.scheme) + len(message.authority) + 32
         else:
             size += (
-                len(message.http_version)
-                + len(str(message.status_code))
-                + len(message.reason)
-                + 4
+                len(message.http_version) + len(str(message.status_code)) + len(message.reason) + 4
             )
         return size
+
+
+def _path_is_scoped(value: str, prefix: str) -> bool:
+    path = unquote(urlsplit(value).path)
+    return path.startswith(prefix) and not any(part in {".", ".."} for part in path.split("/"))
+
+
+def _basic_authorization(username: str, password: str) -> str:
+    encoded = base64.b64encode(f"{username}:{password}".encode()).decode()
+    return f"Basic {encoded}"
+
+
+def _parse_basic_authorization(value: str | None) -> tuple[str, str] | None:
+    if value is None:
+        return None
+    scheme, separator, encoded = value.partition(" ")
+    if scheme.lower() != "basic" or not separator or not encoded:
+        return None
+    try:
+        decoded = base64.b64decode(encoded, validate=True).decode()
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        return None
+    username, separator, password = decoded.partition(":")
+    return (username, password) if separator else None
+
+
+def _expiration(value: Any) -> float | None:
+    if isinstance(value, int | float):
+        return float(value)
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.timestamp()
+
+
+def _diagnostic_suffix(stderr: str) -> str:
+    text = re.sub(r"(?i)(authorization(?:token)?\s*[=:]\s*)\S+", r"\1REDACTED", stderr.strip())
+    text = re.sub(r"(https://[^\s:]+:)[^@\s]+@", r"\1REDACTED@", text)
+    return f": {text[:1000]}" if text else ""
+
+
+def load_package_auth(fd: int) -> tuple[PackageAuth, Callable[[], str]]:
+    with os.fdopen(fd, "rb") as source:
+        raw = source.read(65537)
+    if len(raw) > 65536:
+        raise ValueError("package-auth configuration is too large")
+    try:
+        payload = json.loads(raw)
+        if (
+            set(payload)
+            != {
+                "version",
+                "rule_id",
+                "host",
+                "port",
+                "path_prefix",
+                "username",
+                "placeholder",
+                "provider",
+            }
+            or payload["version"] != 1
+        ):
+            raise ValueError
+        host = _normalize_host(payload["host"])
+        port = payload["port"]
+        path_prefix = payload["path_prefix"]
+        placeholder = payload["placeholder"]
+        if (
+            host is None
+            or host != payload["host"]
+            or type(port) is not int
+            or not 0 < port <= 65535
+            or not isinstance(path_prefix, str)
+            or path_prefix == "/"
+            or not path_prefix.startswith("/")
+            or not path_prefix.endswith("/")
+            or ".." in path_prefix.split("/")
+            or "?" in path_prefix
+            or "#" in path_prefix
+            or not isinstance(placeholder, str)
+            or not placeholder.startswith("SBX_SECRET_")
+            or len(placeholder) < 32
+            or not _valid_field(placeholder)
+        ):
+            raise ValueError
+        for name in ("rule_id", "username"):
+            if not isinstance(payload[name], str) or not _valid_field(payload[name]):
+                raise ValueError
+        provider = payload["provider"]
+        if not isinstance(provider, dict) or "type" not in provider:
+            raise ValueError
+        if provider["type"] == "command" and set(provider) == {"type", "argv"}:
+            argv = provider["argv"]
+            if (
+                not isinstance(argv, list)
+                or not argv
+                or not all(isinstance(item, str) and item for item in argv)
+            ):
+                raise ValueError
+            token_provider: CommandTokenProvider | AwsCodeArtifactTokenProvider = (
+                CommandTokenProvider(tuple(argv))
+            )
+        elif (
+            provider["type"] == "aws-codeartifact"
+            and set(provider)
+            <= {
+                "type",
+                "domain",
+                "domain_owner",
+                "region",
+                "profile",
+            }
+            and set(provider) >= {"type", "domain", "domain_owner", "region"}
+        ):
+            if not all(
+                isinstance(provider[name], str) and provider[name]
+                for name in ("domain", "domain_owner", "region")
+            ) or ("profile" in provider and not isinstance(provider["profile"], str)):
+                raise ValueError
+            token_provider = AwsCodeArtifactTokenProvider(
+                domain=provider["domain"],
+                domain_owner=provider["domain_owner"],
+                region=provider["region"],
+                profile=provider.get("profile"),
+            )
+        else:
+            raise ValueError
+    except (AttributeError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid package-auth configuration") from exc
+    package_auth = PackageAuth(
+        payload["rule_id"],
+        host,
+        port,
+        path_prefix,
+        payload["username"],
+        placeholder,
+    )
+    return package_auth, token_provider.get_token
 
 
 def _load() -> GatewayAddon:
     fd = int(os.environ.pop("SBX_GATEWAY_KEY_FD"))
     ready = os.environ.pop("SBX_GATEWAY_READY_FD", None)
+    package_auth_fd = os.environ.pop("SBX_GATEWAY_PACKAGE_AUTH_FD", None)
     with os.fdopen(fd, "rb") as source:
         key = source.read(33)
+    package_auth, get_real_token = (
+        load_package_auth(int(package_auth_fd)) if package_auth_fd is not None else (None, None)
+    )
     return GatewayAddon(
         CapabilityVerifier(
             key,
@@ -318,6 +623,8 @@ def _load() -> GatewayAddon:
             os.environ.pop("SBX_GATEWAY_INCARNATION"),
         ),
         int(ready) if ready is not None else None,
+        package_auth,
+        get_real_token,
     )
 
 

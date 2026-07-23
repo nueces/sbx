@@ -7,6 +7,7 @@ key=$cache/guest_ed25519
 mkdir -p "$cache"
 [ -f "$key.pub" ] || ssh-keygen -q -t ed25519 -N '' -f "$key"
 cd "$root"
+rm -f "$HOME/.smolvm/images/rootless-gateway-test/rootfs.ext4"
 uv run sbx image build-debian \
   --name rootless-gateway-test \
   --containerfile "$root/gateway/testdata/guest/Containerfile" \
