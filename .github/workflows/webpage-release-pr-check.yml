@@ -28,11 +28,17 @@ jobs:
           git fetch origin "${{ github.base_ref }}" --tags
 
           changed="$(git diff --name-only "$BASE_REF...HEAD")"
-          test "$changed" = "index.html" || {
-            echo "webpage release PR may only change index.html" >&2
-            echo "$changed" >&2
+          bad_files="$(echo "$changed" | grep -Ev '^(complexity.html|index.html)$' || true)"
+          if [ -n "$bad_files" ]; then
+            echo "webpage release PR may only change complexity.html and index.html" >&2
+            echo "$bad_files" >&2
+            exit 1
+          fi
+          echo "$changed" | grep -qx "complexity.html" || {
+            echo "webpage release PR must regenerate complexity.html" >&2
             exit 1
           }
+          grep -q "High and superior complexity" complexity.html
 
           count="$(grep -o "<!-- sbx-release-version -->$tag<!-- /sbx-release-version -->" index.html | wc -l)"
           test "$count" = "2" || {
