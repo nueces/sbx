@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/nueces/sbx/gateway/internal/capability"
 	"github.com/nueces/sbx/gateway/internal/config"
 	gatewaynet "github.com/nueces/sbx/gateway/internal/netstack"
 	"github.com/nueces/sbx/gateway/internal/qemustream"
@@ -43,6 +44,9 @@ func run() error {
 	vmID := flag.String("vm-id", "", "expected VM identity")
 	generation := flag.String("generation", "", "expected VM generation")
 	digest := flag.String("digest", "", "expected immutable config digest")
+	mediatorAddress := flag.String("mediator-address", "", "per-VM mediator loopback endpoint")
+	capabilityKeyFD := flag.Int("capability-key-fd", -1, "inherited mediator capability key descriptor")
+	workerIncarnation := flag.String("worker-incarnation", "", "worker incarnation bound to mediator capabilities")
 	flag.Parse()
 	if *configPath == "" || !filepath.IsAbs(*configPath) {
 		return errors.New("--config must be an absolute path")
@@ -86,6 +90,29 @@ func run() error {
 	}
 	defer network.Close()
 	resolver := syntheticdns.New(cfg)
+	var mediator *gatewaynet.Mediator
+	for _, rule := range cfg.Rules {
+		if rule.Protocol != "http" {
+			continue
+		}
+		if *capabilityKeyFD < 3 || *workerIncarnation == "" || *mediatorAddress == "" {
+			return errors.New("HTTP policy requires mediator endpoint, incarnation, and inherited capability key")
+		}
+		keyFile := os.NewFile(uintptr(*capabilityKeyFD), "mediator-capability-key")
+		if keyFile == nil {
+			return errors.New("invalid mediator capability key descriptor")
+		}
+		key, keyErr := capability.ReadKey(keyFile)
+		keyFile.Close()
+		if keyErr != nil {
+			return keyErr
+		}
+		mediator, err = gatewaynet.NewMediator(*mediatorAddress, key, cfg.VMID, *workerIncarnation)
+		if err != nil {
+			return fmt.Errorf("mediator: %w", err)
+		}
+		break
+	}
 	dhcp, err := network.ServeDHCP()
 	if err != nil {
 		return fmt.Errorf("DHCP: %w", err)
@@ -96,7 +123,7 @@ func run() error {
 		return fmt.Errorf("DNS: %w", err)
 	}
 	defer dns.Close()
-	network.ForwardTCP(cfg, resolver)
+	network.ForwardTCP(cfg, resolver, mediator)
 	fmt.Fprintln(os.Stdout, `{"status":"ready"}`)
 	conn, err := listener.Accept()
 	if err != nil {

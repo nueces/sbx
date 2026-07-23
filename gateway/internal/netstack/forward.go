@@ -3,6 +3,8 @@ package netstack
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/nueces/sbx/gateway/internal/capability"
 	"github.com/nueces/sbx/gateway/internal/config"
 	"github.com/nueces/sbx/gateway/internal/syntheticdns"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -20,9 +23,16 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
+type Mediator struct {
+	address, vmID, incarnation string
+	issuer                     *capability.Issuer
+	dialer                     net.Dialer
+}
+
 type TCPForwarder struct {
 	config     config.Config
 	resolver   *syntheticdns.Resolver
+	mediator   *Mediator
 	total      chan struct{}
 	mu         sync.Mutex
 	perDest    map[string]int
@@ -39,9 +49,23 @@ func (f *TCPForwarder) Stats() ForwardStats {
 	return ForwardStats{Uploaded: f.uploaded.Load(), Downloaded: f.downloaded.Load()}
 }
 
-func (n *Network) ForwardTCP(cfg config.Config, resolver *syntheticdns.Resolver) *TCPForwarder {
+func NewMediator(address string, key []byte, vmID, incarnation string) (*Mediator, error) {
+	host, port, err := net.SplitHostPort(address)
+	ip := net.ParseIP(host)
+	portNumber, portErr := strconv.ParseUint(port, 10, 16)
+	if err != nil || ip == nil || !ip.IsLoopback() || portErr != nil || portNumber == 0 {
+		return nil, errors.New("mediator must use a loopback TCP endpoint")
+	}
+	issuer, err := capability.New(key, vmID, incarnation)
+	if err != nil {
+		return nil, err
+	}
+	return &Mediator{address: address, vmID: vmID, incarnation: incarnation, issuer: issuer, dialer: net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}}, nil
+}
+
+func (n *Network) ForwardTCP(cfg config.Config, resolver *syntheticdns.Resolver, mediator *Mediator) *TCPForwarder {
 	f := &TCPForwarder{
-		config: cfg, resolver: resolver, total: make(chan struct{}, cfg.Quotas.TCPFlows),
+		config: cfg, resolver: resolver, mediator: mediator, total: make(chan struct{}, cfg.Quotas.TCPFlows),
 		perDest: make(map[string]int), dialer: net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second},
 	}
 	forwarder := tcp.NewForwarder(n.Stack, 0, cfg.Quotas.TCPFlows, f.handle)
@@ -61,8 +85,11 @@ func (f *TCPForwarder) handle(request *tcp.ForwarderRequest) {
 	if name, found := f.resolver.Acquire(ip); found {
 		host, synthetic = name, true
 	}
-	rule, allowed := f.config.Match("tcp", host, id.LocalPort)
-	if !allowed || !f.acquire(host) {
+	rule, allowed := f.config.Match("http", host, id.LocalPort)
+	if !allowed {
+		rule, allowed = f.config.Match("tcp", host, id.LocalPort)
+	}
+	if !allowed || rule.Protocol == "http" && f.mediator == nil || !f.acquire(host) {
 		if synthetic {
 			f.resolver.Release(ip)
 		}
@@ -124,6 +151,9 @@ func (f *TCPForwarder) forward(request *tcp.ForwarderRequest, rule config.Rule, 
 }
 
 func (f *TCPForwarder) dial(ctx context.Context, rule config.Rule, host string, port uint16) (net.Conn, error) {
+	if rule.Protocol == "http" {
+		return f.mediator.Dial(ctx, rule, host, port)
+	}
 	addresses, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
 	if err != nil {
 		return nil, err
@@ -138,6 +168,93 @@ func (f *TCPForwarder) dial(ctx context.Context, rule config.Rule, host string, 
 		}
 	}
 	return nil, fmt.Errorf("no permitted address for %s", host)
+}
+
+func (m *Mediator) Dial(ctx context.Context, rule config.Rule, host string, port uint16) (net.Conn, error) {
+	conn, err := m.dialer.DialContext(ctx, "tcp", m.address)
+	if err != nil {
+		return nil, err
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	var nonce [12]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	username, password, err := m.issuer.Issue(capability.Metadata{
+		VMID: m.vmID, Incarnation: m.incarnation, FlowID: base64.RawURLEncoding.EncodeToString(nonce[:]),
+		RuleID: rule.ID, Host: host, Port: port,
+	})
+	if err != nil || len(username) > 255 || len(password) > 255 || len(host) > 255 {
+		conn.Close()
+		return nil, errors.New("cannot create mediator capability")
+	}
+	packets := [][]byte{
+		{5, 1, 2},
+		append(append([]byte{1, byte(len(username))}, username...), append([]byte{byte(len(password))}, password...)...),
+		append(append([]byte{5, 1, 0, 3, byte(len(host))}, host...), byte(port>>8), byte(port)),
+	}
+	responses := [][]byte{{5, 2}, {1, 0}}
+	for index, packet := range packets {
+		if err := writeAll(conn, packet); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		if index < len(responses) {
+			response := make([]byte, len(responses[index]))
+			if _, err := io.ReadFull(conn, response); err != nil || !bytes.Equal(response, responses[index]) {
+				conn.Close()
+				return nil, errors.New("mediator authentication failed")
+			}
+		}
+	}
+	if err := readSOCKSReply(conn); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	_ = conn.SetDeadline(time.Time{})
+	return conn, nil
+}
+
+func writeAll(writer io.Writer, data []byte) error {
+	for len(data) != 0 {
+		n, err := writer.Write(data)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
+}
+
+func readSOCKSReply(reader io.Reader) error {
+	var header [4]byte
+	if _, err := io.ReadFull(reader, header[:]); err != nil || header[0] != 5 || header[1] != 0 || header[2] != 0 {
+		return errors.New("mediator denied destination")
+	}
+	length := 0
+	switch header[3] {
+	case 1:
+		length = 4
+	case 3:
+		var size [1]byte
+		if _, err := io.ReadFull(reader, size[:]); err != nil {
+			return err
+		}
+		length = int(size[0])
+	case 4:
+		length = 16
+	default:
+		return errors.New("invalid mediator response")
+	}
+	var discard [258]byte
+	_, err := io.ReadFull(reader, discard[:length+2])
+	return err
 }
 
 type closeWriter interface{ CloseWrite() error }
