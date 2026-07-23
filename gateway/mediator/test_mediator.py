@@ -45,7 +45,10 @@ from sbx_gateway_mediator import (  # noqa: E402
     CapabilityVerifier,
     CredentialProviderError,
     GatewayAddon,
+    HeaderSecret,
+    Hook,
     PackageAuth,
+    RequestPolicy,
     RetainedBufferBudget,
     _basic_authorization,
 )
@@ -344,6 +347,7 @@ class MediatorProcess:
         directory: Path,
         upstream_ca: Path,
         package_auth: dict[str, object] | None = None,
+        policy: dict[str, object] | None = None,
     ) -> None:
         self.confdir = Path(tempfile.mkdtemp(prefix="mitmproxy-", dir=directory))
         self.stdout = ""
@@ -375,6 +379,12 @@ class MediatorProcess:
             os.close(auth_write)
             argv.extend(("--package-auth-fd", str(auth_read)))
             pass_fds.append(auth_read)
+        if policy is not None:
+            policy_read, policy_write = os.pipe()
+            os.write(policy_write, json.dumps(policy).encode())
+            os.close(policy_write)
+            argv.extend(("--policy-fd", str(policy_read)))
+            pass_fds.append(policy_read)
         self.process = subprocess.Popen(
             argv,
             pass_fds=tuple(pass_fds),
@@ -386,6 +396,8 @@ class MediatorProcess:
         os.close(ready_write)
         if package_auth is not None:
             os.close(auth_read)
+        if policy is not None:
+            os.close(policy_read)
         readable, _, _ = select.select([ready_read], [], [], 10)
         payload = os.read(ready_read, 4096) if readable else b""
         os.close(ready_read)
@@ -578,6 +590,196 @@ class PackageAuthUnitTests(unittest.TestCase):
 
         addon.responseheaders(flow)
 
+        self.assertEqual(flow.response.status_code, 502)
+
+
+class HookAuthorizationTests(unittest.TestCase):
+    def _addon(
+        self,
+        *,
+        hooks: dict[str, Hook] | None = None,
+        policy: RequestPolicy | None = None,
+        secrets: tuple[HeaderSecret, ...] = (),
+        timeout: float = 1.0,
+    ) -> tuple[GatewayAddon, object]:
+        policy = policy or RequestPolicy("rule1", "localhost", (443,), hooks=tuple(hooks or ()))
+        addon = GatewayAddon(
+            CapabilityVerifier(KEY, "vm1", "worker1"),
+            policies=(policy,),
+            secrets=secrets,
+            hooks=hooks or {},
+            hook_timeout=timeout,
+        )
+        client = tflow.tclient_conn()
+        addon._admissions[client.id] = Admission(
+            "vm1", "worker1", "flow", "rule1", "localhost", 443, 1, 2
+        )
+        return addon, client
+
+    @staticmethod
+    def _flow(
+        client: object,
+        *,
+        method: str = "GET",
+        path: str = "/allowed/item",
+        headers: dict[str, str] | None = None,
+    ) -> http.HTTPFlow:
+        return tflow.tflow(
+            client_conn=client,
+            req=http.Request.make(method, f"https://localhost{path}", headers=headers or {}),
+        )
+
+    def test_request_and_response_hooks_are_ordered_and_mutations_are_deterministic(self) -> None:
+        events: list[str] = []
+
+        def header_hook(name: str, phase: str):
+            def run(_context: object, headers: http.Headers) -> str:
+                events.append(f"{phase}:{name}")
+                headers[f"X-{phase}"] = headers.get(f"X-{phase}", "") + name
+                return "continue"
+
+            return run
+
+        hooks = {
+            "one": Hook(header_hook("1", "request"), None, header_hook("1", "response")),
+            "two": Hook(header_hook("2", "request"), None, header_hook("2", "response")),
+        }
+        addon, client = self._addon(hooks=hooks)
+        flow = self._flow(client)
+
+        addon.requestheaders(flow)
+        self.assertIsNone(flow.response)
+        self.assertEqual(flow.request.headers["X-request"], "12")
+        flow.response = http.Response.make(200, b"ok")
+        addon.responseheaders(flow)
+
+        self.assertEqual(flow.response.headers["X-response"], "12")
+        self.assertEqual(events, ["request:1", "request:2", "response:1", "response:2"])
+
+    def test_request_policy_and_structural_secret_scope(self) -> None:
+        secret = HeaderSecret(
+            "TOKEN",
+            ("localhost",),
+            (443,),
+            ("GET",),
+            "/allowed",
+            "Authorization",
+            "Bearer {placeholder}",
+            PLACEHOLDER,
+            FAKE_TOKEN,
+        )
+        policy = RequestPolicy("rule1", "localhost", (443,), ("GET",), ("/",))
+        addon, client = self._addon(policy=policy, secrets=(secret,))
+        flow = self._flow(client, headers={"Authorization": f"Bearer {PLACEHOLDER}"})
+        addon.requestheaders(flow)
+        self.assertEqual(flow.request.headers["Authorization"], f"Bearer {FAKE_TOKEN}")
+
+        for name, method, path, headers in (
+            ("wrong-method", "POST", "/allowed/item", {"Authorization": f"Bearer {PLACEHOLDER}"}),
+            ("wrong-path", "GET", "/outside", {"Authorization": f"Bearer {PLACEHOLDER}"}),
+            ("wrong-field", "GET", "/allowed/item", {"X-Token": f"Bearer {PLACEHOLDER}"}),
+            ("malformed-value", "GET", "/allowed/item", {"Authorization": PLACEHOLDER}),
+        ):
+            with self.subTest(name):
+                addon, client = self._addon(policy=policy, secrets=(secret,))
+                flow = self._flow(client, method=method, path=path, headers=headers)
+                addon.requestheaders(flow)
+                if name == "wrong-path":
+                    self.assertIsNone(flow.response)
+                    self.assertEqual(flow.request.headers["Authorization"], f"Bearer {PLACEHOLDER}")
+                else:
+                    self.assertEqual(flow.response.status_code, 403)
+                    self.assertNotIn(FAKE_TOKEN.encode(), flow.response.content)
+                    self.assertNotIn(PLACEHOLDER.encode(), flow.response.content)
+
+    def test_streaming_default_chunk_mutation_and_explicit_bounded_buffering(self) -> None:
+        streaming = {
+            "stream": Hook(
+                on_request_chunk=lambda _context, chunk: chunk.upper(),
+                on_response_chunk=lambda _context, chunk: chunk[::-1],
+            )
+        }
+        addon, client = self._addon(hooks=streaming)
+        flow = self._flow(client)
+        addon.requestheaders(flow)
+        self.assertTrue(callable(flow.request.stream))
+        self.assertEqual(flow.request.stream(b"chunk"), b"CHUNK")
+        flow.response = http.Response.make(200, b"body")
+        addon.responseheaders(flow)
+        self.assertTrue(callable(flow.response.stream))
+        self.assertEqual(flow.response.stream(b"response"), b"esnopser")
+        self.assertEqual(addon.retained.total, 0)
+
+        buffered = {
+            "buffer": Hook(
+                on_request_chunk=lambda _context, body: b"[" + body + b"]",
+                request_buffer_limit=4,
+            )
+        }
+        addon, client = self._addon(hooks=buffered)
+        flow = self._flow(client)
+        addon.requestheaders(flow)
+        self.assertEqual(flow.request.stream(b"ab"), b"")
+        self.assertEqual(addon.retained.total, 2)
+        self.assertEqual(flow.request.stream(b"cd"), b"")
+        self.assertEqual(addon.retained.total, 4)
+        self.assertEqual(flow.request.stream(b""), b"[abcd]")
+        self.assertEqual(addon.retained.total, 0)
+
+        addon, client = self._addon(hooks=buffered)
+        flow = self._flow(client)
+        addon.requestheaders(flow)
+        self.assertEqual(flow.request.stream(b"abcde"), b"")
+        self.assertEqual(flow.response.status_code, 413)
+        self.assertEqual(addon.retained.total, 0)
+
+    def test_hook_timeout_crash_malformed_and_destination_widening_fail_closed(self) -> None:
+        def timeout(_context: object, _headers: http.Headers) -> str:
+            time.sleep(0.05)
+            return "continue"
+
+        def crash(_context: object, _headers: http.Headers) -> str:
+            raise RuntimeError("secret=" + FAKE_TOKEN)
+
+        def malformed(_context: object, _headers: http.Headers) -> object:
+            return {"action": "continue"}
+
+        def widen(_context: object, headers: http.Headers) -> str:
+            headers["Host"] = "other.example"
+            return "continue"
+
+        for name, callback in (
+            ("timeout", timeout),
+            ("crash", crash),
+            ("malformed", malformed),
+            ("widen", widen),
+        ):
+            with self.subTest(name):
+                hooks = {name: Hook(on_request_headers=callback)}
+                addon, client = self._addon(hooks=hooks, timeout=0.005)
+                flow = self._flow(client)
+                addon.requestheaders(flow)
+                self.assertEqual(flow.response.status_code, 403)
+                self.assertNotIn(FAKE_TOKEN.encode(), flow.response.content)
+
+    def test_malicious_chunk_output_and_response_retargeting_fail_closed(self) -> None:
+        hooks = {"bad": Hook(on_request_chunk=lambda _context, _chunk: "not-bytes")}
+        addon, client = self._addon(hooks=hooks)
+        flow = self._flow(client)
+        addon.requestheaders(flow)
+        self.assertEqual(flow.request.stream(b"data"), b"")
+        self.assertEqual(flow.response.status_code, 403)
+
+        def redirect(_context: object, headers: http.Headers) -> str:
+            headers["Location"] = "https://other.example/"
+            return "continue"
+
+        hooks = {"redirect": Hook(on_response_headers=redirect)}
+        addon, client = self._addon(hooks=hooks)
+        flow = self._flow(client)
+        addon.requestheaders(flow)
+        flow.response = http.Response.make(302, b"", {"Location": "/allowed/next"})
+        addon.responseheaders(flow)
         self.assertEqual(flow.response.status_code, 502)
 
 
@@ -954,6 +1156,61 @@ class MediatorIntegrationTests(unittest.TestCase):
             self.assertEqual(status, 502)
             self.assertNotIn(b"upstream-limit-bypassed", body)
             sock.close()
+
+    def test_policy_fd_structural_secret_replacement_and_fake_secret_scan(self) -> None:
+        policy = {
+            "version": 1,
+            "rules": [
+                {
+                    "id": "rule1",
+                    "host": "localhost",
+                    "ports": [self.fixture.port],
+                    "methods": ["GET"],
+                    "paths": ["/allowed"],
+                    "hooks": ["package-audit"],
+                }
+            ],
+            "secrets": [
+                {
+                    "name": "TOKEN",
+                    "hosts": ["localhost"],
+                    "ports": [self.fixture.port],
+                    "methods": ["GET"],
+                    "path_prefix": "/allowed",
+                    "header": "Authorization: Bearer {placeholder}",
+                    "placeholder": PLACEHOLDER,
+                    "value": FAKE_TOKEN,
+                }
+            ],
+        }
+        mediator = MediatorProcess(Path(self.temp.name), self.fixture.root_ca, policy=policy)
+        try:
+            conn = ssl.create_default_context(cafile=str(mediator.ca)).wrap_socket(
+                self._socks_to(mediator), server_hostname="localhost"
+            )
+            status, _, body = self._request(
+                conn,
+                (
+                    f"GET /allowed/item HTTP/1.1\r\n"
+                    f"Host: localhost:{self.fixture.port}\r\n"
+                    f"Authorization: Bearer {PLACEHOLDER}\r\n\r\n"
+                ).encode(),
+            )
+            self.assertEqual((status, body), (200, b"ok:GET"))
+            self.assertEqual(
+                self.fixture.authorizations[-1],
+                ("/allowed/item", f"Bearer {FAKE_TOKEN}"),
+            )
+            conn.close()
+        finally:
+            mediator.close()
+        combined = (mediator.stdout + mediator.stderr).encode()
+        state = b"".join(
+            path.read_bytes() for path in mediator.confdir.rglob("*") if path.is_file()
+        )
+        for secret in (FAKE_TOKEN.encode(), PLACEHOLDER.encode()):
+            self.assertNotIn(secret, combined)
+            self.assertNotIn(secret, state)
 
     def test_package_auth_workload_and_negative_cases(self) -> None:
         directory = Path(self.temp.name)

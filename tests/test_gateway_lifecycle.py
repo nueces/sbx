@@ -102,6 +102,7 @@ class FakeRunner:
         if component == "mediator":
             process = FakeProcess(exited=self.failure == "mediator_exit")
             ready_fd = kwargs["pass_fds"][1]
+            process.resources.append(os.fdopen(os.dup(kwargs["pass_fds"][2]), "rb", buffering=0))
             if self.failure == "mediator_timeout":
                 process.resources.append(os.fdopen(os.dup(ready_fd), "wb", buffering=0))
             elif self.failure != "mediator_exit":
@@ -155,10 +156,11 @@ def controller(
     monkeypatch.setattr(
         gateway.GatewayController,
         "_mediator_command",
-        lambda self, key, ready: [
+        lambda self, key, ready, policy: [
             "fake-mediator",
             str(key),
             str(ready),
+            str(policy),
             self.vm_id,
             self.worker_incarnation,
         ],
@@ -516,7 +518,7 @@ def direct_controller(
     monkeypatch.setattr(
         gateway.GatewayController,
         "_mediator_command",
-        lambda self, key, ready: [
+        lambda self, key, ready, policy: [
             sys.executable,
             "-c",
             mediator,

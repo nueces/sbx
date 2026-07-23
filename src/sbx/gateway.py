@@ -961,6 +961,10 @@ class GatewayController:
         self._closed = False
         self.mediator_address: str | None = None
         self.worker_incarnation = uuid.uuid4().hex
+        self._placeholders = {
+            binding.name: f"SBX_SECRET_{binding.name}_{secrets.token_urlsafe(24)}"
+            for binding in config.secrets
+        }
         random = bytearray(secrets.token_bytes(6))
         random[0] = (random[0] | 2) & 0xFE
         self.mac = ":".join(f"{value:02x}" for value in random)
@@ -970,6 +974,10 @@ class GatewayController:
         if self.directory is None:
             raise GatewayLifecycleError("gateway has not been prepared")
         return self.directory / "qemu-net.sock"
+
+    @property
+    def secret_placeholders(self) -> dict[str, str]:
+        return dict(self._placeholders)
 
     def _open_log(self, name: str) -> BinaryIO:
         assert self.directory is not None
@@ -1010,7 +1018,73 @@ class GatewayController:
             os.close(write_fd)
         return read_fd
 
-    def _mediator_command(self, key_fd: int, ready_fd: int) -> list[str]:
+    def _mediator_policy(self) -> bytes:
+        rules = [
+            {
+                "id": rule.id,
+                "host": rule.host,
+                "ports": list(rule.ports),
+                "methods": list(rule.methods),
+                "paths": list(rule.paths),
+                "hooks": list(rule.hooks),
+            }
+            for rule in self.config.rules
+            if rule.protocol == "http"
+        ]
+        bindings = []
+        for binding in self.config.secrets:
+            kind, reference = binding.provider.split(":", 1)
+            if kind == "env":
+                value = os.environ.get(reference)
+            elif kind == "file":
+                try:
+                    fd = os.open(
+                        reference,
+                        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    )
+                    try:
+                        info = os.fstat(fd)
+                        raw = os.read(fd, 65537)
+                    finally:
+                        os.close(fd)
+                except OSError as exc:
+                    raise GatewayLifecycleError(
+                        "gateway credential provider is unavailable"
+                    ) from exc
+                try:
+                    value = (
+                        raw.decode(errors="strict").strip() if stat.S_ISREG(info.st_mode) else None
+                    )
+                except UnicodeError as exc:
+                    raise GatewayLifecycleError(
+                        "gateway credential provider is unavailable"
+                    ) from exc
+            else:
+                value = None
+            if (
+                not value
+                or len(value.encode()) > 65536
+                or any(character in value for character in "\r\n\x00")
+            ):
+                raise GatewayLifecycleError("gateway credential provider is unavailable")
+            bindings.append(
+                {
+                    "name": binding.name,
+                    "hosts": list(binding.hosts),
+                    "ports": list(binding.ports),
+                    "methods": list(binding.methods),
+                    "path_prefix": binding.path_prefix,
+                    "header": binding.header,
+                    "placeholder": self._placeholders[binding.name],
+                    "value": value,
+                }
+            )
+        payload = _compact_json({"version": 1, "rules": rules, "secrets": bindings})
+        if len(payload) > 65536:
+            raise GatewayLifecycleError("gateway mediator policy is too large")
+        return payload
+
+    def _mediator_command(self, key_fd: int, ready_fd: int, policy_fd: int) -> list[str]:
         assert self.directory is not None
         python = Path(os.environ.get("SBX_GATEWAY_MEDIATOR_PYTHON", GATEWAY_MEDIATOR_PYTHON))
         launcher = Path(os.environ.get("SBX_GATEWAY_MEDIATOR_LAUNCHER", GATEWAY_MEDIATOR_LAUNCHER))
@@ -1027,6 +1101,8 @@ class GatewayController:
             str(key_fd),
             "--ready-fd",
             str(ready_fd),
+            "--policy-fd",
+            str(policy_fd),
             "--confdir",
             str(self.directory),
         ]
@@ -1121,6 +1197,7 @@ class GatewayController:
         """Reserve resources and authenticate mediator/worker readiness before QEMU."""
         if self.directory is not None:
             raise GatewayLifecycleError("gateway is already prepared")
+        mediator_policy = self._mediator_policy()
         try:
             self.directory = create_state(self.config, self.vm_id, self.generation, root=self.root)
             update_state(self.directory, status="starting")
@@ -1129,23 +1206,32 @@ class GatewayController:
 
             key = secrets.token_bytes(32)
             mediator_key = self._pipe_with(key)
+            mediator_policy_fd, mediator_policy_write = os.pipe()
             ready_read, ready_write = os.pipe()
             try:
                 try:
                     mediator = self.runner(
-                        self._mediator_command(mediator_key, ready_write),
+                        self._mediator_command(mediator_key, ready_write, mediator_policy_fd),
                         stdin=subprocess.DEVNULL,
                         stdout=self._open_log("mediator.log"),
                         stderr=subprocess.STDOUT,
-                        pass_fds=(mediator_key, ready_write),
+                        pass_fds=(mediator_key, ready_write, mediator_policy_fd),
                         start_new_session=True,
                     )
                     self.processes["mediator"] = mediator
                 finally:
                     os.close(mediator_key)
+                    os.close(mediator_policy_fd)
                     os.close(ready_write)
+                view = memoryview(mediator_policy)
+                while view:
+                    view = view[os.write(mediator_policy_write, view) :]
+                os.close(mediator_policy_write)
+                mediator_policy_write = -1
                 ready = self._read_json_fd(ready_read, mediator, "mediator")
             finally:
+                if mediator_policy_write >= 0:
+                    os.close(mediator_policy_write)
                 os.close(ready_read)
             if (
                 ready.get("status") != "ready"
