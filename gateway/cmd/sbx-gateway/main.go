@@ -161,7 +161,7 @@ func run() error {
 	totalFlows := gatewaynet.NewFlowQuota(cfg.Quotas.TCPFlows)
 	ingress := gatewaynet.NewIngressForwarder(network, registeredIngress, totalFlows, cfg.Quotas.IngressFlows)
 	defer ingress.Close()
-	resolver := syntheticdns.New(cfg)
+	resolver := syntheticdns.NewWithLimit(cfg, cfg.Quotas.DNSMappings)
 	primed := make(map[string]bool)
 	for _, rule := range cfg.Rules {
 		if primed[rule.Host] || strings.Contains(rule.Host, "*") || net.ParseIP(rule.Host) != nil {
@@ -208,7 +208,7 @@ func run() error {
 			allowedPorts = append(allowedPorts, rule.Ports...)
 		}
 	}
-	hardeningStatus, err := hardening.Apply(cfg.Quotas.OpenFiles, allowedPorts)
+	hardeningStatus, err := hardening.Apply(cfg.Quotas.OpenFiles-cfg.Quotas.OpenFiles/2, allowedPorts)
 	if err != nil {
 		return fmt.Errorf("hardening: %w", err)
 	}
@@ -222,7 +222,7 @@ func run() error {
 		return fmt.Errorf("DNS: %w", err)
 	}
 	defer dns.Close()
-	network.ForwardTCP(cfg, resolver, mediator, totalFlows)
+	forwarder := network.ForwardTCP(cfg, resolver, mediator, totalFlows)
 	if err := json.NewEncoder(os.Stdout).Encode(map[string]any{
 		"status": "ready", "version": 1, "vm_id": cfg.VMID,
 		"generation": cfg.Generation, "digest": cfg.Digest, "incarnation": *workerIncarnation,
@@ -287,9 +287,9 @@ func run() error {
 			}
 			return fmt.Errorf("data plane stopped (%+v): %w", stream.Stats(), err)
 		case <-ticker.C:
-			stats := stream.Stats()
+			stats, flows := stream.Stats(), forwarder.Stats()
 			outputMu.Lock()
-			fmt.Fprintf(os.Stdout, "{\"status\":\"stats\",\"frames_read\":%d,\"frames_written\":%d,\"frames_rejected\":%d}\n", stats.Read, stats.Written, stats.Rejected)
+			fmt.Fprintf(os.Stdout, "{\"status\":\"stats\",\"frames_read\":%d,\"frames_written\":%d,\"frames_rejected\":%d,\"tcp_active\":%d,\"tcp_rejected\":%d,\"destination_rejected\":%d,\"ingress_active\":%d,\"dns_active\":%d,\"dns_rejected\":%d,\"dns_mappings\":%d,\"bytes_in\":%d,\"bytes_out\":%d}\n", stats.Read, stats.Written, stats.Rejected, totalFlows.Active(), totalFlows.Rejected(), flows.PerDestinationRejected, ingress.Active(), dns.Active(), dns.Rejected(), resolver.Len(), flows.Uploaded, flows.Downloaded)
 			outputMu.Unlock()
 		}
 	}

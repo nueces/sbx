@@ -68,6 +68,25 @@ func TestActiveMappingIsNotEvicted(t *testing.T) {
 	r.Release(first)
 }
 
+func TestConfiguredCapacityIsPerResolver(t *testing.T) {
+	a := NewWithLimit(allow{"a.example": true, "b.example": true}, 1)
+	b := NewWithLimit(allow{"a.example": true, "b.example": true}, 2)
+	if _, err := a.Resolve("a.example"); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := a.byName["a.example"]
+	first.active = 1
+	if _, err := a.Resolve("b.example"); err == nil {
+		t.Fatal("resolver admitted a mapping beyond its configured active ceiling")
+	}
+	if _, err := b.Resolve("a.example"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Resolve("b.example"); err != nil || b.Len() != 2 || a.Len() != 1 {
+		t.Fatal("one VM's DNS mapping ceiling affected another resolver")
+	}
+}
+
 func TestSnapshotRestore(t *testing.T) {
 	original := New(allow{"api.example": true})
 	want, _ := original.Resolve("api.example")

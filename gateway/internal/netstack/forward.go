@@ -30,11 +30,22 @@ type Mediator struct {
 	dialer                     net.Dialer
 }
 
+const (
+	pendingWriteBytes      = 32 * 1024
+	maxAggregateRelayBytes = 64 * 1024 * 1024
+	rawTCPIdle             = 600 * time.Second
+	httpIdle               = 300 * time.Second
+)
+
 type FlowQuota struct {
-	tokens chan struct{}
+	tokens   chan struct{}
+	rejected atomic.Uint64
 }
 
 func NewFlowQuota(limit int) *FlowQuota {
+	if limit < 1 || pendingWriteBytes*limit*2 > maxAggregateRelayBytes {
+		panic("flow quota exceeds aggregate relay buffer ceiling")
+	}
 	return &FlowQuota{tokens: make(chan struct{}, limit)}
 }
 
@@ -43,30 +54,34 @@ func (q *FlowQuota) acquire() bool {
 	case q.tokens <- struct{}{}:
 		return true
 	default:
+		q.rejected.Add(1)
 		return false
 	}
 }
 
-func (q *FlowQuota) release() { <-q.tokens }
+func (q *FlowQuota) release()         { <-q.tokens }
+func (q *FlowQuota) Active() int      { return len(q.tokens) }
+func (q *FlowQuota) Rejected() uint64 { return q.rejected.Load() }
 
 type TCPForwarder struct {
-	config     config.Config
-	resolver   *syntheticdns.Resolver
-	mediator   *Mediator
-	total      *FlowQuota
-	mu         sync.Mutex
-	perDest    map[string]int
-	dialer     net.Dialer
-	uploaded   atomic.Uint64
-	downloaded atomic.Uint64
+	config        config.Config
+	resolver      *syntheticdns.Resolver
+	mediator      *Mediator
+	total         *FlowQuota
+	mu            sync.Mutex
+	perDest       map[string]int
+	dialer        net.Dialer
+	uploaded      atomic.Uint64
+	downloaded    atomic.Uint64
+	perDestDenied atomic.Uint64
 }
 
 type ForwardStats struct {
-	Uploaded, Downloaded uint64
+	Uploaded, Downloaded, PerDestinationRejected uint64
 }
 
 func (f *TCPForwarder) Stats() ForwardStats {
-	return ForwardStats{Uploaded: f.uploaded.Load(), Downloaded: f.downloaded.Load()}
+	return ForwardStats{f.uploaded.Load(), f.downloaded.Load(), f.perDestDenied.Load()}
 }
 
 func NewMediator(address string, key []byte, vmID, incarnation string) (*Mediator, error) {
@@ -129,6 +144,7 @@ func (f *TCPForwarder) acquire(host string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.perDest[host] >= f.config.Quotas.FlowsPerDestination {
+		f.perDestDenied.Add(1)
 		f.total.release()
 		return false
 	}
@@ -174,7 +190,11 @@ func (f *TCPForwarder) forward(request *tcp.ForwarderRequest, rule config.Rule, 
 		guest.Close()
 		return
 	}
-	uploaded, downloaded := relay(guest, upstream)
+	idle := rawTCPIdle
+	if rule.Protocol == "http" {
+		idle = httpIdle
+	}
+	uploaded, downloaded := relayIdle(guest, upstream, idle)
 	f.uploaded.Add(uploaded)
 	f.downloaded.Add(downloaded)
 }
@@ -196,7 +216,7 @@ func (f *TCPForwarder) passthrough(ctx context.Context, guest net.Conn, rule con
 		upstream.Close()
 		return 0, 0, err
 	}
-	uploaded, downloaded := relay(guest, upstream)
+	uploaded, downloaded := relayIdle(guest, upstream, rawTCPIdle)
 	return uploaded + uint64(len(prefix)), downloaded, nil
 }
 
@@ -310,11 +330,15 @@ func readSOCKSReply(reader io.Reader) error {
 type closeWriter interface{ CloseWrite() error }
 
 func relay(guest, upstream net.Conn) (uint64, uint64) {
+	return relayIdle(guest, upstream, rawTCPIdle)
+}
+
+func relayIdle(guest, upstream net.Conn, idle time.Duration) (uint64, uint64) {
 	var wg sync.WaitGroup
 	var uploaded, downloaded uint64
 	copyOne := func(dst, src net.Conn, count *uint64) {
 		defer wg.Done()
-		*count, _ = copyIdle(dst, src, 600*time.Second)
+		*count, _ = copyIdle(dst, src, idle)
 		if closer, ok := dst.(closeWriter); ok {
 			_ = closer.CloseWrite()
 		}
@@ -329,7 +353,7 @@ func relay(guest, upstream net.Conn) (uint64, uint64) {
 }
 
 func copyIdle(dst, src net.Conn, idle time.Duration) (uint64, error) {
-	buffer := make([]byte, 32*1024)
+	buffer := make([]byte, pendingWriteBytes)
 	var copied uint64
 	for {
 		_ = src.SetReadDeadline(time.Now().Add(idle))

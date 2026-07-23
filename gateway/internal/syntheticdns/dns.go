@@ -29,6 +29,7 @@ type Mapping struct {
 
 type Resolver struct {
 	policy Policy
+	limit  int
 	mu     sync.Mutex
 	byName map[string]*entry
 	byIP   map[netip.Addr]*entry
@@ -36,8 +37,13 @@ type Resolver struct {
 	clock  uint64
 }
 
-func New(policy Policy) *Resolver {
-	return &Resolver{policy: policy, byName: make(map[string]*entry), byIP: make(map[netip.Addr]*entry)}
+func New(policy Policy) *Resolver { return NewWithLimit(policy, MaxMappings) }
+
+func NewWithLimit(policy Policy, limit int) *Resolver {
+	if limit < 1 || limit > MaxMappings {
+		panic("invalid synthetic DNS mapping limit")
+	}
+	return &Resolver{policy: policy, limit: limit, byName: make(map[string]*entry), byIP: make(map[netip.Addr]*entry)}
 }
 
 func (r *Resolver) Snapshot() []Mapping {
@@ -52,7 +58,7 @@ func (r *Resolver) Snapshot() []Mapping {
 }
 
 func (r *Resolver) Restore(mappings []Mapping) error {
-	if len(mappings) > MaxMappings {
+	if len(mappings) > r.limit {
 		return errors.New("too many synthetic DNS mappings")
 	}
 	byName := make(map[string]*entry, len(mappings))
@@ -109,7 +115,7 @@ func (r *Resolver) Resolve(host string) (netip.Addr, error) {
 		return item.ip, nil
 	}
 	var ip netip.Addr
-	if len(r.byName) >= MaxMappings {
+	if len(r.byName) >= r.limit {
 		var oldest *entry
 		for _, item := range r.byName {
 			if item.active == 0 && (oldest == nil || item.used < oldest.used) {
@@ -131,6 +137,12 @@ func (r *Resolver) Resolve(host string) (netip.Addr, error) {
 	item := &entry{host: host, ip: ip, used: r.clock}
 	r.byName[host], r.byIP[ip] = item, item
 	return ip, nil
+}
+
+func (r *Resolver) Len() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.byName)
 }
 
 func (r *Resolver) Reply(query []byte) []byte {

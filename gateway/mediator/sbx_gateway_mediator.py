@@ -10,9 +10,11 @@ import json
 import os
 import queue
 import re
+import selectors
 import subprocess
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any, NamedTuple
@@ -32,6 +34,10 @@ MAX_WEBSOCKET_MESSAGE = 16 * 1024 * 1024
 MAX_HOOK_OUTPUT = 1024 * 1024
 MAX_HOOK_WORKERS = 8
 MAX_PROVIDER_OUTPUT = 64 * 1024
+MAX_PROVIDER_WORKERS = 8
+MAX_TLS_HANDSHAKES = 32
+MAX_TLS_CONTEXTS = 256
+TLS_CONTEXT_TTL = 10 * 60
 PROVIDER_TIMEOUT = 10
 HOOK_TIMEOUT = 1.0
 _IMMUTABLE_HEADERS = frozenset(
@@ -195,29 +201,100 @@ class CredentialProviderError(RuntimeError):
     pass
 
 
+_PROVIDER_SLOTS = threading.BoundedSemaphore(MAX_PROVIDER_WORKERS)
+
+
+def _bounded_provider_run(
+    argv: list[str] | tuple[str, ...],
+    *,
+    text: bool,
+    capture_output: bool,
+    check: bool,
+    timeout: float,
+    env: Mapping[str, str],
+) -> subprocess.CompletedProcess[str]:
+    if not text or not capture_output or check:
+        raise ValueError("invalid bounded provider invocation")
+    process = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        close_fds=True,
+    )
+    streams = {process.stdout: bytearray(), process.stderr: bytearray()}
+    selector = selectors.DefaultSelector()
+    for stream in streams:
+        assert stream is not None
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ)
+    deadline = time.monotonic() + timeout
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            for key, _ in selector.select(remaining):
+                chunk = os.read(key.fd, 8192)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                streams[key.fileobj].extend(chunk)
+                if sum(map(len, streams.values())) > MAX_PROVIDER_OUTPUT:
+                    raise CredentialProviderError("credential command returned oversized output")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(argv, timeout)
+        return subprocess.CompletedProcess(
+            argv,
+            process.wait(timeout=remaining),
+            bytes(streams[process.stdout]).decode(errors="replace"),
+            bytes(streams[process.stderr]).decode(errors="replace"),
+        )
+    except BaseException:
+        process.kill()
+        process.wait()
+        raise
+    finally:
+        selector.close()
+        for stream in streams:
+            stream.close()
+
+
+def _provider_result(
+    runner: Callable[..., subprocess.CompletedProcess[str]], argv: list[str] | tuple[str, ...]
+) -> subprocess.CompletedProcess[str]:
+    if not _PROVIDER_SLOTS.acquire(blocking=False):
+        raise CredentialProviderError("credential provider capacity exhausted")
+    try:
+        result = runner(
+            argv,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=PROVIDER_TIMEOUT,
+            env={"HOME": os.environ.get("HOME", ""), "PATH": os.defpath, "TZ": "UTC"},
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CredentialProviderError("credential command could not be started") from exc
+    finally:
+        _PROVIDER_SLOTS.release()
+    if len(result.stdout.encode()) + len(result.stderr.encode()) > MAX_PROVIDER_OUTPUT:
+        raise CredentialProviderError("credential command returned oversized output")
+    return result
+
+
 class CommandTokenProvider:
     def __init__(
         self,
         argv: tuple[str, ...],
-        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        runner: Callable[..., subprocess.CompletedProcess[str]] = _bounded_provider_run,
     ) -> None:
         self._argv = argv
         self._runner = runner
 
     def get_token(self) -> str:
-        try:
-            result = self._runner(
-                self._argv,
-                text=True,
-                capture_output=True,
-                check=False,
-                timeout=PROVIDER_TIMEOUT,
-                env={"HOME": os.environ.get("HOME", ""), "PATH": os.defpath, "TZ": "UTC"},
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise CredentialProviderError("credential command could not be started") from exc
-        if len(result.stdout.encode()) > MAX_PROVIDER_OUTPUT:
-            raise CredentialProviderError("credential command returned oversized output")
+        result = _provider_result(self._runner, self._argv)
         if result.returncode != 0:
             raise CredentialProviderError(
                 f"credential command failed{_diagnostic_suffix(result.stderr)}"
@@ -236,7 +313,7 @@ class AwsCodeArtifactTokenProvider:
         domain_owner: str,
         region: str,
         profile: str | None = None,
-        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        runner: Callable[..., subprocess.CompletedProcess[str]] = _bounded_provider_run,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._argv = ["aws"]
@@ -265,19 +342,7 @@ class AwsCodeArtifactTokenProvider:
         with self._lock:
             if self._cached is not None and self._cached[1] - self._clock() > 60:
                 return self._cached[0]
-            try:
-                result = self._runner(
-                    self._argv,
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                    timeout=PROVIDER_TIMEOUT,
-                    env={"HOME": os.environ.get("HOME", ""), "PATH": os.defpath, "TZ": "UTC"},
-                )
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                raise CredentialProviderError("aws CLI could not be started") from exc
-            if len(result.stdout.encode()) > MAX_PROVIDER_OUTPUT:
-                raise CredentialProviderError("aws CLI returned oversized output")
+            result = _provider_result(self._runner, self._argv)
             if result.returncode != 0:
                 raise CredentialProviderError(
                     f"aws CodeArtifact token refresh failed{_diagnostic_suffix(result.stderr)}"
@@ -355,12 +420,17 @@ class GatewayAddon:
         self._admissions: dict[str, Admission] = {}
         self._invalid_tls: set[str] = set()
         self._active: set[str] = set()
+        self._handshakes: set[str] = set()
+        self._tls_contexts: OrderedDict[str, float] = OrderedDict()
+        self._certstore: Any | None = None
         self.retained = RetainedBufferBudget()
 
     def running(self) -> None:
         if self._ready_fd is None:
             return
         proxyserver = self._master_addon("proxyserver")
+        self._certstore = self._master_addon("tlsconfig").certstore
+        self._certstore.STORE_CAP = min(self._certstore.STORE_CAP, MAX_TLS_CONTEXTS)
         ctx.master.addons.remove(self._master_addon("proxyauth"))
         addresses = proxyserver.listen_addrs()
         if len(addresses) != 1 or addresses[0][0] != "127.0.0.1":
@@ -409,9 +479,39 @@ class GatewayAddon:
             data.server.error = "sbx gateway denied destination"
 
     def tls_clienthello(self, data: tls.ClientHelloData) -> None:
-        admission = self._admissions.get(data.context.client.id)
-        if admission is None or _normalize_host(data.client_hello.sni or "") != admission.host:
-            self._invalid_tls.add(data.context.client.id)
+        client_id = data.context.client.id
+        admission = self._admissions.get(client_id)
+        host = _normalize_host(data.client_hello.sni or "")
+        if admission is None or host != admission.host:
+            self._invalid_tls.add(client_id)
+            data.context.client.error = "sbx gateway denied TLS identity"
+            return
+        if client_id not in self._handshakes and len(self._handshakes) >= MAX_TLS_HANDSHAKES:
+            self._invalid_tls.add(client_id)
+            data.context.client.error = "sbx gateway TLS handshake capacity exhausted"
+            return
+        self._handshakes.add(client_id)
+        now = time.monotonic()
+        expired = False
+        while (
+            self._tls_contexts
+            and next(iter(self._tls_contexts.values())) <= now - TLS_CONTEXT_TTL
+        ):
+            self._tls_contexts.popitem(last=False)
+            expired = True
+        if expired and self._certstore is not None:
+            self._certstore.certs.clear()
+            self._certstore.expire_queue.clear()
+        self._tls_contexts.pop(host, None)
+        self._tls_contexts[host] = now
+        while len(self._tls_contexts) > MAX_TLS_CONTEXTS:
+            self._tls_contexts.popitem(last=False)
+
+    def tls_established_client(self, data: Any) -> None:
+        self._handshakes.discard(data.context.client.id)
+
+    def tls_failed_client(self, data: Any) -> None:
+        self._handshakes.discard(data.context.client.id)
 
     def requestheaders(self, flow: http.HTTPFlow) -> None:
         admission = self._admissions.get(flow.client_conn.id)
@@ -505,6 +605,7 @@ class GatewayAddon:
     def client_disconnected(self, client: Any) -> None:
         self._admissions.pop(client.id, None)
         self._invalid_tls.discard(client.id)
+        self._handshakes.discard(client.id)
         if hasattr(client, "sbx_admission"):
             del client.sbx_admission
 

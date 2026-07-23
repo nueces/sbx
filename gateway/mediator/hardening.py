@@ -121,7 +121,7 @@ def _lower_limit(kind: int, value: int) -> None:
 
 def _resource_limits(open_files: int) -> None:
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    _lower_limit(resource.RLIMIT_NOFILE, max(64, open_files))
+    _lower_limit(resource.RLIMIT_NOFILE, max(32, open_files))
     _lower_limit(resource.RLIMIT_FSIZE, MAX_LOG_BYTES)
     _lower_limit(resource.RLIMIT_AS, MAX_ADDRESS_SPACE)
 

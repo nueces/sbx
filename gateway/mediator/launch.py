@@ -40,6 +40,7 @@ def command(confdir: Path, upstream_ca: Path | None = None) -> list[str]:
         "http3=false",
         "websocket=true",
         "rawtcp=false",
+        "tcp_timeout=10",
         "onboarding=false",
         "validate_inbound_headers=true",
         f"confdir={confdir}",
@@ -83,8 +84,8 @@ def main() -> None:
         raise RuntimeError("mediator requires mitmproxy 12.2.3")
     confdir = _private_directory(args.confdir)
     upstream_ca = args.upstream_ca.resolve(strict=True) if args.upstream_ca else None
-    if not 64 <= args.open_files <= 4096:
-        raise RuntimeError("mediator open-file limit must be between 64 and 4096")
+    if not 32 <= args.open_files <= 4096:
+        raise RuntimeError("mediator open-file limit must be between 32 and 4096")
     os.umask(0o077)
     os.chdir(confdir)
     argv = command(confdir, upstream_ca)
