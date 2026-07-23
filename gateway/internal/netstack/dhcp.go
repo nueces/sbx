@@ -39,12 +39,12 @@ func (n *Network) ServeDHCP() (net.PacketConn, error) {
 func serveDHCP(conn net.PacketConn) {
 	buf := make([]byte, 1500)
 	for {
-		n, peer, err := conn.ReadFrom(buf)
+		n, _, err := conn.ReadFrom(buf)
 		if err != nil {
 			return
 		}
 		if reply := dhcpReply(buf[:n]); reply != nil {
-			_, _ = conn.WriteTo(reply, peer)
+			_, _ = conn.WriteTo(reply, &net.UDPAddr{IP: net.IPv4bcast, Port: 68})
 		}
 	}
 }

@@ -46,7 +46,8 @@ func (i *Issuer) Issue(meta Metadata) (string, string, error) {
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return "", "", err
 	}
-	fields := []string{"1", meta.VMID, meta.Incarnation, meta.FlowID, meta.RuleID, strconv.FormatInt(meta.Expires.Unix(), 10), base64.RawURLEncoding.EncodeToString(nonce[:])}
+	host := strings.ToLower(strings.TrimSuffix(meta.Host, "."))
+	fields := []string{"1", meta.VMID, meta.Incarnation, meta.FlowID, meta.RuleID, strconv.FormatInt(meta.Expires.Unix(), 10), base64.RawURLEncoding.EncodeToString(nonce[:]), host, strconv.Itoa(int(meta.Port))}
 	for _, value := range fields[1:5] {
 		if value == "" || strings.Contains(value, "|") {
 			return "", "", errors.New("invalid capability metadata")
@@ -56,12 +57,12 @@ func (i *Issuer) Issue(meta Metadata) (string, string, error) {
 	if len(username) > 255 {
 		return "", "", errors.New("capability username exceeds RFC 1929 limit")
 	}
-	return username, i.mac(username, meta.Host, meta.Port), nil
+	return username, i.mac(username), nil
 }
 
 func (i *Issuer) Verify(username, password, host string, port uint16) (Metadata, error) {
 	parts := strings.Split(username, "|")
-	if len(parts) != 7 || parts[0] != "1" || len(username) > 255 {
+	if len(parts) != 9 || parts[0] != "1" || len(username) > 255 {
 		return Metadata{}, errors.New("invalid capability")
 	}
 	expires, err := strconv.ParseInt(parts[5], 10, 64)
@@ -71,7 +72,11 @@ func (i *Issuer) Verify(username, password, host string, port uint16) (Metadata,
 	if _, err := base64.RawURLEncoding.DecodeString(parts[6]); err != nil {
 		return Metadata{}, errors.New("invalid capability")
 	}
-	expected := i.mac(username, host, port)
+	claimedPort, err := strconv.ParseUint(parts[8], 10, 16)
+	if err != nil || parts[7] != strings.ToLower(strings.TrimSuffix(host, ".")) || uint16(claimedPort) != port {
+		return Metadata{}, errors.New("invalid capability destination")
+	}
+	expected := i.mac(username)
 	if !hmac.Equal([]byte(expected), []byte(password)) {
 		return Metadata{}, errors.New("invalid capability")
 	}
@@ -96,8 +101,8 @@ func (i *Issuer) Verify(username, password, host string, port uint16) (Metadata,
 	return Metadata{VMID: parts[1], Incarnation: parts[2], FlowID: parts[3], RuleID: parts[4], Host: strings.ToLower(strings.TrimSuffix(host, ".")), Port: port, Expires: expiry}, nil
 }
 
-func (i *Issuer) mac(username, host string, port uint16) string {
+func (i *Issuer) mac(username string) string {
 	mac := hmac.New(sha256.New, i.key)
-	fmt.Fprintf(mac, "%s\x00%s\x00%d", username, strings.ToLower(strings.TrimSuffix(host, ".")), port)
+	fmt.Fprint(mac, username)
 	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }

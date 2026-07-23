@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 )
@@ -14,23 +15,85 @@ type Policy interface {
 	AllowsHost(string) bool
 }
 
+type entry struct {
+	host   string
+	ip     netip.Addr
+	active int
+	used   uint64
+}
+
+type Mapping struct {
+	Host string `json:"host"`
+	IP   string `json:"ip"`
+}
+
 type Resolver struct {
 	policy Policy
 	mu     sync.Mutex
-	byName map[string]netip.Addr
-	byIP   map[netip.Addr]string
+	byName map[string]*entry
+	byIP   map[netip.Addr]*entry
 	next   uint32
+	clock  uint64
 }
 
 func New(policy Policy) *Resolver {
-	return &Resolver{policy: policy, byName: make(map[string]netip.Addr), byIP: make(map[netip.Addr]string)}
+	return &Resolver{policy: policy, byName: make(map[string]*entry), byIP: make(map[netip.Addr]*entry)}
 }
 
-func (r *Resolver) Host(ip netip.Addr) (string, bool) {
+func (r *Resolver) Snapshot() []Mapping {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	host, ok := r.byIP[ip.Unmap()]
-	return host, ok
+	result := make([]Mapping, 0, len(r.byName))
+	for _, item := range r.byName {
+		result = append(result, Mapping{Host: item.host, IP: item.ip.String()})
+	}
+	slices.SortFunc(result, func(a, b Mapping) int { return strings.Compare(a.Host, b.Host) })
+	return result
+}
+
+func (r *Resolver) Restore(mappings []Mapping) error {
+	if len(mappings) > MaxMappings {
+		return errors.New("too many synthetic DNS mappings")
+	}
+	byName := make(map[string]*entry, len(mappings))
+	byIP := make(map[netip.Addr]*entry, len(mappings))
+	pool := netip.MustParsePrefix("198.18.0.0/15")
+	for index, mapping := range mappings {
+		ip, err := netip.ParseAddr(mapping.IP)
+		if err != nil || !pool.Contains(ip) || !r.policy.AllowsHost(mapping.Host) || byName[mapping.Host] != nil || byIP[ip] != nil {
+			return errors.New("invalid synthetic DNS mapping")
+		}
+		item := &entry{host: mapping.Host, ip: ip, used: uint64(index + 1)}
+		byName[mapping.Host], byIP[ip] = item, item
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.byName) != 0 {
+		return errors.New("cannot restore over active synthetic DNS state")
+	}
+	r.byName, r.byIP, r.clock = byName, byIP, uint64(len(mappings))
+	return nil
+}
+
+func (r *Resolver) Acquire(ip netip.Addr) (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	item, ok := r.byIP[ip.Unmap()]
+	if !ok {
+		return "", false
+	}
+	item.active++
+	r.clock++
+	item.used = r.clock
+	return item.host, true
+}
+
+func (r *Resolver) Release(ip netip.Addr) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if item := r.byIP[ip.Unmap()]; item != nil && item.active > 0 {
+		item.active--
+	}
 }
 
 func (r *Resolver) Resolve(host string) (netip.Addr, error) {
@@ -40,17 +103,33 @@ func (r *Resolver) Resolve(host string) (netip.Addr, error) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if ip, ok := r.byName[host]; ok {
-		return ip, nil
+	r.clock++
+	if item := r.byName[host]; item != nil {
+		item.used = r.clock
+		return item.ip, nil
 	}
+	var ip netip.Addr
 	if len(r.byName) >= MaxMappings {
-		// Refusal is safer than evicting a mapping that may still identify an active flow.
-		return netip.Addr{}, errors.New("synthetic DNS capacity exhausted")
+		var oldest *entry
+		for _, item := range r.byName {
+			if item.active == 0 && (oldest == nil || item.used < oldest.used) {
+				oldest = item
+			}
+		}
+		if oldest == nil {
+			return netip.Addr{}, errors.New("synthetic DNS capacity exhausted")
+		}
+		delete(r.byName, oldest.host)
+		delete(r.byIP, oldest.ip)
+		ip = oldest.ip
 	}
-	r.next++
-	value := uint32(198)<<24 | uint32(18+(r.next>>16))<<16 | r.next&0xffff
-	ip := netip.AddrFrom4([4]byte{byte(value >> 24), byte(value >> 16), byte(value >> 8), byte(value)})
-	r.byName[host], r.byIP[ip] = ip, host
+	if !ip.IsValid() {
+		r.next++
+		value := uint32(198)<<24 | uint32(18+(r.next>>16))<<16 | r.next&0xffff
+		ip = netip.AddrFrom4([4]byte{byte(value >> 24), byte(value >> 16), byte(value >> 8), byte(value)})
+	}
+	item := &entry{host: host, ip: ip, used: r.clock}
+	r.byName[host], r.byIP[ip] = item, item
 	return ip, nil
 }
 

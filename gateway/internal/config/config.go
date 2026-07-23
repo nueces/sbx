@@ -46,7 +46,7 @@ func DefaultQuotas() Quotas {
 	return Quotas{TCPFlows: 512, FlowsPerDestination: 64, DNSMappings: 1024, OpenFiles: 4096}
 }
 
-func Parse(data []byte) (Config, error) {
+func decode(data []byte) (Config, error) {
 	var c Config
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
@@ -56,18 +56,35 @@ func Parse(data []byte) (Config, error) {
 	if err := dec.Decode(new(any)); !errors.Is(err, io.EOF) {
 		return c, errors.New("decode config: trailing value")
 	}
-	if err := c.normalize(); err != nil {
-		return c, err
-	}
-	got, err := c.ComputeDigest()
+	return c, nil
+}
+
+func Prepare(data []byte) (Config, error) {
+	c, err := decode(data)
 	if err != nil {
 		return c, err
 	}
-	if c.Digest == "" || !strings.EqualFold(c.Digest, got) {
-		return c, errors.New("config digest mismatch")
+	c.Digest = ""
+	if err := c.normalize(); err != nil {
+		return c, err
 	}
-	c.Digest = got
-	return c, nil
+	c.Digest, err = c.ComputeDigest()
+	return c, err
+}
+
+func Parse(data []byte) (Config, error) {
+	input, err := decode(data)
+	if err != nil {
+		return input, err
+	}
+	prepared, err := Prepare(data)
+	if err != nil {
+		return input, err
+	}
+	if input.Digest == "" || !strings.EqualFold(input.Digest, prepared.Digest) {
+		return input, errors.New("config digest mismatch")
+	}
+	return prepared, nil
 }
 
 func (c *Config) normalize() error {
