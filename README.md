@@ -11,13 +11,6 @@ uv tool install git+https://github.com/nueces/sbx.git@v0.2.4
 sbx doctor
 ```
 
-For local development:
-
-```bash
-git clone https://github.com/nueces/sbx.git
-uv tool install --editable ./sbx
-```
-
 ## Recommended workflow
 
 ### 1. Build the curated image
@@ -34,7 +27,7 @@ The image is written to `~/.smolvm/images/sbx`. The first build compiles a QEMU 
 Check the result with:
 
 ```bash
-sbx image ls
+sbx image list
 ```
 
 See the [image guide](docs/build-local-debian-pi-image.md) for custom sizes, Docker details, and troubleshooting.
@@ -59,32 +52,21 @@ On first creation, `sbx`:
 3. writes the project settings to `./.sbx.toml`; and
 4. launches Pi as the `agent` user in the mounted project.
 
-The generated configuration is intentionally small and resembles:
+### 3. Use the sandbox day to day
 
-```toml
-[sbx]
-name = "the-quest"
-agent = "pi"
-image = "~/.smolvm/images/sbx"
-project_path = "."
-run_user = "agent"
-writable_mounts = true
-copy_host_credentials = false
-git_config = true
-```
-
-The sandbox name is now stored in the project, so later commands are short:
+The sandbox name is stored in `.sbx.toml`, so commands run from the project directory do not need it again:
 
 ```bash
 sbx run       # start if needed and launch the agent
-sbx shell     # open a shell in the same project directory
-sbx stop      # stop the VM
+sbx shell     # open a shell in the mounted project
+sbx stop      # stop the VM without deleting its disk
+sbx ls        # list all sandboxes, including stopped ones
 sbx rm        # remove the VM after confirmation
 ```
 
-Run `/login` inside Pi when authentication is needed. `sbx run` automatically forwards the browser callback port to the VM.
+## Customize the sandbox
 
-### 3. Add another folder later
+### Add another folder
 
 Mounts are applied when a VM starts; they cannot be hot-added to an already-running VM. Add the folder to `.sbx.toml` using an absolute host path:
 
@@ -109,14 +91,14 @@ sbx run
 
 If you try to run with different mounts while the VM is already running, `sbx` keeps the current mounts and prints the same stop-and-run guidance.
 
-### 4. Install more tools inside the sandbox
+### Install more tools
 
-The curated image includes Pi. For one project, install other tools directly in the VM instead of rebuilding the image:
+The curated image includes Pi. For one project, install other tools directly on the sandbox disk instead of rebuilding the image:
 
 ```bash
 sbx shell
 
-# Inside the VM, as the configured agent user:
+# Run these inside the VM as the configured agent user:
 npm install -g opencode-ai
 npm install -g @anthropic-ai/claude-code
 npm install -g @openai/codex
@@ -125,42 +107,62 @@ exit
 
 Claude Code and OpenCode require their npm postinstall scripts to prepare native binaries; do not install either with `--ignore-scripts`.
 
-These commands change the sandbox disk, not the curated image. The disk survives `sbx stop`, so manually installed software remains available on later runs:
+Installed software survives `sbx stop` and remains available on later runs:
 
 ```bash
 sbx run --agent claude
 sbx run --agent codex
 
-# OpenCode is not an sbx agent preset; launch it from a sandbox shell.
+# OpenCode is not an sbx agent preset; launch it inside a sandbox shell.
 sbx shell
 opencode
 ```
 
-`sbx recreate` and `sbx rm` delete that VM disk. Install frequently used tools in the curated image if every new or recreated sandbox should contain them.
+`sbx recreate` and `sbx rm` delete the sandbox disk. Add frequently used tools to the curated image if every new or recreated sandbox should contain them.
 
-## Everyday operations
+## Authentication and networking
+
+Run `/login` inside Pi when authentication is needed. `sbx run` automatically forwards the browser callback port to the VM.
+
+Temporarily expose a VM service to the host until Ctrl-C:
 
 ```bash
-# List all sandboxes, including stopped ones.
-sbx ls
+sbx network forward 3000       # host 3000 -> guest 3000
+sbx network forward 8080:3000  # host 8080 -> guest 3000
+```
 
+These commands use the sandbox named in `.sbx.toml`. Use `--name OTHER_VM` only when forwarding from a different sandbox.
+
+## Other operations
+
+```bash
 # Create or start without launching an agent.
 sbx run --no-attach
 
 # Keep the VM running after the agent exits.
 sbx run --keep-running
 
-# Recreate the VM from the current configuration.
+# Delete and recreate the VM from the current configuration.
 sbx recreate --force
-
-# Temporarily expose a service from the VM until Ctrl-C.
-sbx network forward 3000
-sbx network forward 8080:3000
 ```
 
 Use `sbx --help` or `sbx COMMAND --help` for the complete command and option reference.
 
 ## Project configuration
+
+The first project creation produces a small `.sbx.toml` resembling:
+
+```toml
+[sbx]
+name = "the-quest"
+agent = "pi"
+image = "~/.smolvm/images/sbx"
+project_path = "."
+run_user = "agent"
+writable_mounts = true
+copy_host_credentials = false
+git_config = true
+```
 
 `sbx` reads configuration in this order, with later values winning:
 
@@ -168,7 +170,7 @@ Use `sbx --help` or `sbx COMMAND --help` for the complete command and option ref
 2. `./.sbx.toml` — project defaults; and
 3. `--config PATH` — an explicit override.
 
-CLI options override configuration. Keep durable project choices such as the image, VM resources, user, mounts, and forwarded environment names in `.sbx.toml`; use commands for actions such as running, stopping, or recreating.
+CLI options override configuration. Keep durable choices such as the image, VM resources, user, mounts, and forwarded environment names in `.sbx.toml`; use commands for actions such as running, stopping, or recreating.
 
 Security-sensitive behavior is configuration-only:
 
@@ -209,3 +211,14 @@ The same commands can be redirected into your shell's normal completion director
 - [Contributor setup and tests](docs/development.md)
 
 `sbx` uses QEMU by default to avoid per-VM TAP and nftables setup. See [QEMU defaults](docs/qemu-default.md) for the rationale.
+
+## Contributing
+
+Install an editable checkout for local development:
+
+```bash
+git clone https://github.com/nueces/sbx.git
+uv tool install --editable ./sbx
+```
+
+See [Contributor setup and tests](docs/development.md) before changing the project.

@@ -53,7 +53,7 @@ The local image manifest is `smolvm-image.json`:
 }
 ```
 
-`sbx` reads this manifest to locate the kernel/rootfs, validate the configured agent, and list image features with `sbx image ls`.
+`sbx` reads this manifest to locate the kernel/rootfs, validate the configured agent, and list image features with `sbx image list`.
 
 ## Runtime flow
 

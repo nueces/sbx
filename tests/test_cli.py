@@ -1719,7 +1719,7 @@ def test_image_build_debian_subcommand_is_removed() -> None:
     assert error.value.code == 2
 
 
-def test_image_ls_lists_local_images(
+def test_image_list_lists_local_images(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -1740,7 +1740,7 @@ def test_image_ls_lists_local_images(
     )
     (invalid_image / "smolvm-image.json").write_text("not json", encoding="utf-8")
 
-    assert cli.main(["image", "ls"]) == 0
+    assert cli.main(["image", "list"]) == 0
 
     out = capsys.readouterr().out
     assert "NAME" in out

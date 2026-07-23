@@ -1395,15 +1395,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     image = sub.add_parser("image", help="Advanced local image helpers.")
     image_sub = image.add_subparsers(dest="image_action", required=True)
-    build_parser = image_sub.add_parser(
-        "build", help="Build the curated local image for sbx."
-    )
+    build_parser = image_sub.add_parser("build", help="Build the curated local image for sbx.")
     build_debian.add_arguments(build_parser)
     build_parser.set_defaults(func=cmd_image_build)
 
-    list_images_parser = image_sub.add_parser("ls", help="List local sbx images.")
-    sbx.image.ls.add_arguments(list_images_parser)
-    list_images_parser.set_defaults(func=cmd_image_ls)
+    for image_list_name in ("list", "ls"):
+        list_images_parser = image_sub.add_parser(image_list_name, help="List local sbx images.")
+        sbx.image.ls.add_arguments(list_images_parser)
+        list_images_parser.set_defaults(func=cmd_image_ls)
 
     doctor = sub.add_parser("doctor", help="Run non-sudo diagnostics for the configured backend.")
     doctor.add_argument(

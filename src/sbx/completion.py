@@ -16,7 +16,7 @@ COMMANDS = (
     "completion",
 )
 NETWORK_COMMANDS = ("forward", "auth-port", "close-auth-port", "status")
-IMAGE_COMMANDS = ("build", "ls")
+IMAGE_COMMANDS = ("build", "list", "ls")
 AGENTS = ("pi", "claude", "codex")
 
 GLOBAL_OPTIONS = ("--config", "--debug", "--help")
@@ -196,7 +196,7 @@ _sbx_complete() {{
                 COMPREPLY=( $(compgen -W "{image_commands}" -- "$cur") )
             elif [[ "$subcmd" == "build" ]]; then
                 COMPREPLY=( $(compgen -W "{image_build_options}" -- "$cur") )
-            elif [[ "$subcmd" == "ls" ]]; then
+            elif [[ "$subcmd" == "list" || "$subcmd" == "ls" ]]; then
                 COMPREPLY=( $(compgen -W "{image_ls_options}" -- "$cur") )
             fi
             ;;
@@ -302,7 +302,7 @@ _sbx() {{
             _describe 'image command' image_commands
           elif [[ $words[3] == "build" ]]; then
             _describe 'option' image_build_options
-          elif [[ $words[3] == "ls" ]]; then
+          elif [[ $words[3] == "list" || $words[3] == "ls" ]]; then
             _describe 'option' image_ls_options
           else
             _arguments '*: :->args'
