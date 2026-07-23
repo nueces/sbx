@@ -92,6 +92,28 @@ func TestRejectsAmbiguousProtocolsAndWildcards(t *testing.T) {
 	if err := c.normalize(); err == nil {
 		t.Fatal("accepted unsafe wildcard")
 	}
+	c.Rules[0] = Rule{ID: "passthrough", Protocol: "tls", Host: "*.example.com", Ports: []uint16{443}}
+	if err := c.normalize(); err == nil {
+		t.Fatal("accepted non-exact TLS passthrough host")
+	}
+	c.Rules[0].Host = "203.0.113.1"
+	if err := c.normalize(); err == nil {
+		t.Fatal("accepted IP literal TLS passthrough host")
+	}
+}
+
+func TestPassthroughRejectsHTTPFeaturesAndSecretInjection(t *testing.T) {
+	c := validConfig()
+	c.Rules[0] = Rule{ID: "passthrough", Protocol: "tls", Host: "example.com", Ports: []uint16{443}, Methods: []string{"GET"}}
+	if err := c.normalize(); err == nil {
+		t.Fatal("accepted HTTP inspection on TLS passthrough")
+	}
+	for _, field := range []string{`"hooks":["inspect"]`, `"secrets":["token"]`} {
+		data := []byte(`{"version":1,"vm_id":"vm","generation":"gen","rules":[{"id":"passthrough","protocol":"tls","host":"example.com","ports":[443],` + field + `}],"quotas":{"tcp_flows":512,"flows_per_destination":64,"dns_mappings":1024,"open_files":4096}}`)
+		if _, err := Prepare(data); err == nil {
+			t.Fatalf("accepted passthrough feature %s", field)
+		}
+	}
 }
 
 func TestCanonicalDigestIsDeterministic(t *testing.T) {

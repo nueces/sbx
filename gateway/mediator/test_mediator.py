@@ -531,6 +531,33 @@ class MediatorIntegrationTests(unittest.TestCase):
         self.assertIn("store_streamed_bodies=false", rendered)
         self.assertNotIn("web_host", rendered)
         self.assertEqual(self.mediator.address[0], "127.0.0.1")
+        self.assertTrue(
+            all(path.stat().st_mode & 0o077 == 0 for path in self.mediator.confdir.iterdir())
+        )
+
+        isolated = MediatorProcess(Path(self.temp.name), self.fixture.root_ca)
+        try:
+            self.assertNotEqual(
+                hashlib.sha256(self.mediator.ca.read_bytes()).digest(),
+                hashlib.sha256(isolated.ca.read_bytes()).digest(),
+            )
+        finally:
+            isolated.close()
+
+    def test_mediated_tls_requires_per_vm_ca_trust(self) -> None:
+        untrusted = ssl.create_default_context()
+        raw = self._socks()
+        with self.assertRaises(ssl.SSLCertVerificationError):
+            untrusted.wrap_socket(raw, server_hostname="localhost")
+        raw.close()
+
+        trusted = self._tls()
+        status, _, body = self._request(
+            trusted,
+            f"GET /trusted HTTP/1.1\r\nHost: localhost:{self.fixture.port}\r\n\r\n".encode(),
+        )
+        self.assertEqual((status, body), (200, b"ok:GET"))
+        trusted.close()
 
     def test_socks_capability_failure_matrix_and_destination_binding(self) -> None:
         valid = credential(flow="replay", port=self.fixture.port)

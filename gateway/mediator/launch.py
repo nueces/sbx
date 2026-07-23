@@ -78,6 +78,7 @@ def main() -> None:
         raise RuntimeError("mediator requires mitmproxy 12.2.3")
     confdir = _private_directory(args.confdir)
     upstream_ca = args.upstream_ca.resolve(strict=True) if args.upstream_ca else None
+    os.umask(0o077)
     environment = os.environ.copy()
     environment.update(
         SBX_GATEWAY_KEY_FD=str(args.key_fd),

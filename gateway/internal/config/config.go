@@ -112,6 +112,14 @@ func (c *Config) normalize() error {
 			return fmt.Errorf("rule %q: %w", r.ID, err)
 		}
 		r.Host = host
+		if r.Protocol == "tls" {
+			if strings.HasPrefix(r.Host, "*.") {
+				return fmt.Errorf("rule %q: TLS passthrough requires an exact host", r.ID)
+			}
+			if _, err := netip.ParseAddr(r.Host); err == nil {
+				return fmt.Errorf("rule %q: TLS passthrough requires a DNS host", r.ID)
+			}
+		}
 		if len(r.Ports) == 0 {
 			return fmt.Errorf("rule %q: no ports", r.ID)
 		}
