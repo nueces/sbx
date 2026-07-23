@@ -588,6 +588,13 @@ def test_start_local_image_closes_on_start_failure(
     assert closed == [True]
 
 
+def test_manifest_run_user() -> None:
+    assert cli._manifest_run_user({}) is None
+    assert cli._manifest_run_user({"sbx": {"run_user": "agent"}}) == "agent"
+    with pytest.raises(cli.ConfigError, match="run_user.*string"):
+        cli._manifest_run_user({"sbx": {"run_user": 1000}})
+
+
 @pytest.mark.parametrize(
     ("manifest", "message"),
     [

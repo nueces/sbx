@@ -573,7 +573,18 @@ port_forwards = ["8080:80"]
     assert "Created sandbox 'configured'." in capfd.readouterr().out
 
 
+@pytest.mark.parametrize(
+    ("manifest_run_user", "configured_run_user", "expected_run_user"),
+    [
+        ("agent", "", "agent"),
+        ("agent", 'run_user = "developer"', "developer"),
+        (None, "", None),
+    ],
+)
 def test_run_uses_local_image_directory(
+    manifest_run_user: str | None,
+    configured_run_user: str,
+    expected_run_user: str | None,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -583,9 +594,18 @@ def test_run_uses_local_image_directory(
     image_dir.mkdir()
     (image_dir / "vmlinux.bin").write_text("kernel", encoding="utf-8")
     (image_dir / "rootfs.ext4").write_text("rootfs", encoding="utf-8")
+    manifest_sbx = {"agent": "pi", "launch_command": "pi"}
+    if manifest_run_user is not None:
+        manifest_sbx["run_user"] = manifest_run_user
     (image_dir / "smolvm-image.json").write_text(
-        '{"name":"debian-pi","kernel":"vmlinux.bin","rootfs":"rootfs.ext4",'
-        '"sbx":{"agent":"pi","launch_command":"pi"}}',
+        json.dumps(
+            {
+                "name": "debian-pi",
+                "kernel": "vmlinux.bin",
+                "rootfs": "rootfs.ext4",
+                "sbx": manifest_sbx,
+            }
+        ),
         encoding="utf-8",
     )
     config = tmp_path / "config.toml"
@@ -596,6 +616,7 @@ name = "vm1"
 image = "{image_dir}"
 copy_host_credentials = true
 mount = [".:/workspace"]
+{configured_run_user}
 '''.strip(),
         encoding="utf-8",
     )
@@ -621,6 +642,9 @@ mount = [".:/workspace"]
     assert captured["agent"] == "pi"
     assert captured["mounts"] == [".:/workspace"]
     assert captured["attach"] is True
+    assert captured["run_user"] == expected_run_user
+    if manifest_run_user is not None and not configured_run_user:
+        assert captured["args"].run_user == "agent"
     assert "copy_host_credentials=true" not in capsys.readouterr().err
 
 
@@ -1087,7 +1111,14 @@ def test_run_existing_vm_starts_without_creating(
     tmp_path: Path,
 ) -> None:
     install_fake_smolvm(monkeypatch, tmp_path)
+    image = tmp_path / "image"
+    image.mkdir()
+    (image / "smolvm-image.json").write_text('{"sbx":{"run_user":"agent"}}', encoding="utf-8")
+    (tmp_path / ".sbx.toml").write_text(
+        f'[sbx]\nname = "vm1"\nimage = "{image}"\n', encoding="utf-8"
+    )
     calls: list[list[str]] = []
+    attached: dict[str, object] = {}
 
     def fake_run_capture(
         argv: list[str], *, env: dict[str, str] | None = None
@@ -1117,12 +1148,18 @@ def test_run_existing_vm_starts_without_creating(
         ),
     )
     monkeypatch.setattr(guest_setup, "sync_guest_clock", lambda vm_id, **kwargs: None)
+    monkeypatch.setattr(guest_setup, "prepare_run_user", lambda *args, **kwargs: None)
     monkeypatch.setattr(cli.network, "expose_auth_port", lambda vm_id, host_port, guest_port: 0)
-    monkeypatch.setattr(guest_setup, "attach", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        guest_setup,
+        "attach",
+        lambda *args, **kwargs: attached.update({"user": kwargs.get("user")}) or 0,
+    )
 
-    rc = cli.main(["run", "vm1"])
+    rc = cli.main(["run"])
 
     assert rc == 0
+    assert attached["user"] == "agent"
     assert calls == [
         ["smolvm", "sandbox", "info", "vm1", "--json"],
         ["smolvm", "sandbox", "start", "vm1", "--boot-timeout", "60"],

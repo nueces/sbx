@@ -8,8 +8,22 @@ Host credentials are not copied by default. `sbx` forwards only selected environ
 
 ```bash
 uv tool install git+https://github.com/nueces/sbx.git@v0.2.4
+```
+
+Alternatively, install an editable clone:
+
+```bash
+git clone https://github.com/nueces/sbx.git
+uv tool install --editable ./sbx
+```
+
+After either installation, check that the host, QEMU backend, and project configuration are ready before creating a sandbox:
+
+```bash
 sbx doctor
 ```
+
+`sbx doctor` reports missing host requirements and configuration or VM-state problems without starting a VM.
 
 ## Recommended workflow
 
@@ -18,7 +32,6 @@ sbx doctor
 The curated image contains Pi, common development tools, and rootless Docker. Building it requires a working host Docker installation:
 
 ```bash
-docker version
 sbx image build
 ```
 
@@ -40,7 +53,6 @@ Run this from the project you want the agent to work on:
 cd ~/code/my-project
 sbx run the-quest \
   --image '~/.smolvm/images/sbx' \
-  --run-user agent \
   --project-path . \
   --writable-mounts
 ```
@@ -88,6 +100,8 @@ If the VM is running, restart it through `sbx` to apply the mounts:
 sbx stop
 sbx run
 ```
+
+This stop/start cycle does not recreate the sandbox or delete its disk, so applying a new mount does not lose the agent session. Use the agent's normal resume/continue flow after restarting.
 
 If you try to run with different mounts while the VM is already running, `sbx` keeps the current mounts and prints the same stop-and-run guidance.
 
@@ -211,14 +225,3 @@ The same commands can be redirected into your shell's normal completion director
 - [Contributor setup and tests](docs/development.md)
 
 `sbx` uses QEMU by default to avoid per-VM TAP and nftables setup. See [QEMU defaults](docs/qemu-default.md) for the rationale.
-
-## Contributing
-
-Install an editable checkout for local development:
-
-```bash
-git clone https://github.com/nueces/sbx.git
-uv tool install --editable ./sbx
-```
-
-See [Contributor setup and tests](docs/development.md) before changing the project.

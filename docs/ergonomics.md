@@ -131,7 +131,7 @@ Behavior:
 Example:
 
 ```bash
-sbx run the-quest --image ~/.smolvm/images/sbx --memory 8192 --cpus 4 --disk-size 40960 --project-path . --run-user agent
+sbx run the-quest --image ~/.smolvm/images/sbx --memory 8192 --cpus 4 --disk-size 40960 --project-path .
 ```
 
 could create:

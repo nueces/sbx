@@ -36,11 +36,7 @@ src/sbx/image/resources/Containers/
 
 The build command reads these packaged resources with `importlib.resources` and combines them into a temporary Containerfile. Docker layer caching still makes the base OS layer reusable across tooling changes.
 
-Because Pi and uv tools are installed for `agent`, the matching `sbx` config should use:
-
-```toml
-run_user = "agent"
-```
+Because Pi and uv tools are installed for `agent`, the generated manifest defaults `run_user` to `agent`; the first project config records that effective user automatically.
 
 ## 2. Install the tools
 
@@ -123,7 +119,8 @@ Example manifest:
   "sbx": {
     "agent": "pi",
     "features": ["docker"],
-    "launch_command": "pi"
+    "launch_command": "pi",
+    "run_user": "agent"
   }
 }
 ```
@@ -135,11 +132,12 @@ Use the built image and write the selected project settings:
 ```bash
 sbx run the-quest \
   --image '~/.smolvm/images/sbx' \
-  --run-user agent \
   --project-path . \
   --writable-mounts \
   --write-config
 ```
+
+The curated image manifest selects `run_user = "agent"` when CLI and project configuration do not select a user. `--project-path .` remains explicit because it creates a writable host mount.
 
 The suggested `.sbx.toml` is:
 

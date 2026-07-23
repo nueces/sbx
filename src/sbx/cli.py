@@ -461,6 +461,15 @@ def _manifest_sbx(manifest: Mapping[str, Any]) -> Mapping[str, Any]:
     return sbx
 
 
+def _manifest_run_user(manifest: Mapping[str, Any]) -> str | None:
+    value = _manifest_sbx(manifest).get("run_user")
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ConfigError("image manifest field 'sbx.run_user' must be a string")
+    return guest_setup.validate_run_user(value)
+
+
 def _project_config_path() -> Path:
     return LOCAL_CONFIG_PATHS[0]
 
@@ -843,12 +852,18 @@ def cmd_start(args: argparse.Namespace) -> int:
         print(f"sbx: {exc}", file=sys.stderr)
         return 2
 
+    image = lifecycle_warnings.path_from_config(_arg_or_config(args, "image", config, "sbx"))
     requested_name = _arg_or_config(args, "name", config, "sbx")
     if requested_name:
         requested_name = guest_setup.validate_vm_name(str(requested_name))
         existing_status = _get_existing_vm_status(str(requested_name))
         runtime.debug(f"existing VM lookup: name={requested_name!r}, status={existing_status!r}")
         if existing_status is not None:
+            if run_user is None and image is not None:
+                with suppress(ConfigError):
+                    run_user = _manifest_run_user(lifecycle_warnings.local_image_manifest(image))
+                    if run_user is not None:
+                        args.run_user = run_user
             if existing_status != "running":
                 try:
                     _sync_existing_vm_start_config(
@@ -895,10 +910,13 @@ def cmd_start(args: argparse.Namespace) -> int:
                 print(json.dumps({"vm": {"name": str(requested_name), "status": "running"}}))
             return rc
 
-    image = lifecycle_warnings.path_from_config(_arg_or_config(args, "image", config, "sbx"))
     if image is not None:
         try:
             manifest = lifecycle_warnings.local_image_manifest(image)
+            if run_user is None:
+                run_user = _manifest_run_user(manifest)
+                if run_user is not None:
+                    args.run_user = run_user
             return _start_local_image(
                 args=args,
                 config=config,

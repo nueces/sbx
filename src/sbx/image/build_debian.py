@@ -429,6 +429,7 @@ def main_from_args(args: argparse.Namespace) -> int:
             "agent": "pi",
             "features": [] if args.containerfile is not None else ["docker"],
             "launch_command": "pi",
+            "run_user": "agent",
         },
     }
     manifest_path.write_text(
@@ -474,7 +475,6 @@ def main_from_args(args: argparse.Namespace) -> int:
     print("Next:")
     print("  sbx run the-quest \\")
     print(f"    --image {shlex.quote(image_path)} \\")
-    print("    --run-user agent \\")
     print("    --project-path . \\")
     print("    --writable-mounts \\")
     print("    --write-config")
