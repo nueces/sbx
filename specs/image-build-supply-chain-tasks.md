@@ -28,7 +28,7 @@ Do not edit or commit directly to `main/` or `specification/main/`. Do not commi
 
 - Land Docker-by-default and its supply-chain hardening in the same feature; do not leave an intermediate releasable state that routes every build through mutable scripts.
 - Build one packaged image variant: Debian + rootless Docker + Pi.
-- Use packaged resources instead of build-time script downloads.
+- Download upstream build inputs only from immutable commit URLs and verify every file before use.
 - Reuse the smallest available SmolVM rootfs/ext4 seam, but never call an API that downloads a kernel or injects the guest agent.
 - Keep `smolvm==0.0.28` pinned; do not combine a SmolVM upgrade with this feature.
 - Keep custom Containerfiles supported without pretending they contain Docker.
@@ -69,6 +69,8 @@ Do not edit or commit directly to `main/` or `specification/main/`. Do not commi
 ### T003 — Trace all affected image-build and local-image paths
 
 - [ ] Locate every source, test, completion, README, and documentation reference to:
+  - `image build-debian` and `cmd_image_build_debian`;
+  - the default image name `debian-sbx`;
   - `--with-docker`;
   - `with_docker`;
   - `--kernel-url`;
@@ -88,59 +90,50 @@ Do not edit or commit directly to `main/` or `specification/main/`. Do not commi
 - [ ] Keep that private call contained in `src/sbx/image/build_debian.py`, covered by tests, and recorded in `docs/fragile-glue.md`.
 - [ ] Do not call `ImageBuilder.build_debian_ssh_key()` or `DockerRootfsBuilder.build_boot_image()`; both add an unwanted artifact.
 
-## Phase 1 — vendor executable kernel inputs
+## Phase 1 — pin and verify remote kernel inputs
 
-### T005 — Add the reviewed SmolVM kernel recipe files as package resources
+### T005 — Define immutable source pins and per-file digests
 
-- [ ] Add these exact files under a single packaged resource directory such as `src/sbx/image/resources/kernel/smolvm/`:
-
-  ```text
-  build.sh
-  config.fragment
-  config.amd64.fragment
-  config.arm64.fragment
-  linux.version
-  linux.sha256
-  ```
-
-- [ ] Source them from SmolVM commit:
+- [ ] Pin the six SmolVM kernel recipe files to commit:
 
   ```text
   20e1fdf72c2139622eb32ab21f288c7290bba7bf
   ```
 
-- [ ] Preserve Linux version `6.12.85` and expected tarball SHA-256:
+- [ ] Pin Moby `contrib/check-config.sh` to commit:
 
   ```text
-  e35ac999f40a6874493d8d60f33f1150d7a89ae5841c428da82257fbcd070aed
+  b780867932842071ca38968da81ec52d8b70f0bc
   ```
 
-- [ ] Review the vendored `build.sh` before adding it; do not blindly copy a working-tree or cache file.
-- [ ] Record the source repository and commit in a short adjacent resource comment or existing implementation documentation; do not add a generic provenance framework.
-- [ ] Confirm all six files are included in the built Python wheel through the existing resource package.
+- [ ] Record the seven expected SHA-256 values from the design in one small immutable mapping beside the downloader.
+- [ ] Use only raw URLs containing the full commit SHA; do not use `main`, `master`, a tag, or a release-latest URL.
+- [ ] Preserve Linux version `6.12.85` and its source-tarball SHA-256 from the verified SmolVM `linux.version` and `linux.sha256` inputs.
+- [ ] Remove the vendored SmolVM and Moby files from `src/sbx/image/resources/kernel/` and verify they are absent from the wheel.
 
-### T006 — Vendor Docker's kernel configuration checker
+### T006 — Download and verify before use
 
-- [ ] Select and record one reviewed Moby commit rather than `master`.
-- [ ] Add that revision's `contrib/check-config.sh` under `src/sbx/image/resources/kernel/`.
-- [ ] Record the source commit beside the resource or in existing implementation documentation.
-- [ ] Do not retain a URL fallback, refresh flag, downloader, mirror list, or runtime version check.
-- [ ] Confirm the checker is included in the built wheel.
+- [ ] Add one standard-library downloader that accepts only sbx-owned URL/digest constants.
+- [ ] Download each input into temporary storage and compute SHA-256 before copying it into the kernel work directory.
+- [ ] On mismatch, delete the temporary file and report URL, expected digest, actual digest, and the deliberate pin-update action.
+- [ ] Do not make a script executable, modify it, mount it into Docker, or execute it before verification succeeds.
+- [ ] Do not add caller-supplied URLs, environment overrides, fallback mirrors, retries from another source, refresh flags, or checksum bypasses.
+- [ ] Append the packaged sbx Docker config fragment only after the downloaded upstream `config.fragment` passes verification.
 
-### T007 — Replace network downloads with packaged copies
+### T007 — Add a maintainer update checker
 
-- [ ] Remove `urllib.request`, `_download()`, `SMOLVM_RAW_BASE`, and download-only constants from `build_debian.py`.
-- [ ] Replace the six SmolVM download calls with copies from packaged resources into the temporary kernel work directory.
-- [ ] Copy the packaged `check-config.sh` into the same temporary directory.
-- [ ] Keep temporary scripts executable only for the duration of the build.
-- [ ] Use the existing sbx Docker kernel fragment by appending it to the copied SmolVM `config.fragment`.
-- [ ] Prove no image-build source references `raw.githubusercontent.com/CelestoAI/SmolVM` or `moby/moby/master`.
+- [ ] Add one developer script under `.github/scripts/` that checks the latest upstream revision of the seven paths.
+- [ ] Report each changed file, latest commit, and new SHA-256 relative to the current pins.
+- [ ] Also report changes to upstream LICENSE and NOTICE files for both source repositories.
+- [ ] Exit successfully when nothing changed and non-zero when review is needed.
+- [ ] Do not silently overwrite pins or downloaded executable files; maintainers must review and update commit/digest values deliberately.
+- [ ] Document the command in `docs/development.md`.
 
 ### T008 — Preserve Linux source integrity failure behavior
 
-- [ ] Keep the vendored `linux.sha256` check before Linux extraction or compilation.
+- [ ] Keep the downloaded and verified `linux.sha256` check before Linux extraction or compilation.
 - [ ] Ensure a mismatch stops the kernel build before any output kernel is installed.
-- [ ] Ensure the failure identifies the Linux source artifact, expected digest, actual digest, and deliberate pin-update action.
+- [ ] Ensure sbx reports the Linux source artifact, expected digest, actual digest, and deliberate pin-update action, even though upstream `build.sh` has only generic `sha256sum` output.
 - [ ] Do not retry another URL or bypass verification.
 - [ ] Add the smallest runnable check for mismatch behavior; it may invoke the script with fake/local inputs but must not contact kernel.org.
 
@@ -201,10 +194,15 @@ Do not edit or commit directly to `main/` or `specification/main/`. Do not commi
 
 - [ ] Add one focused assertion that the rootfs build context and Dockerfile contain no `smolvm-guest-agent` artifact or `COPY` instruction.
 
-## Phase 3 — make Docker the packaged default
+## Phase 3 — expose one curated Docker image
 
-### T014 — Remove the Docker opt-in flag and branches
+### T014 — Rename the command and curated image
 
+- [ ] Register `sbx image build` as the curated image command.
+- [ ] Remove `image build-debian`; do not keep an alias or deprecation branch.
+- [ ] Rename CLI dispatch helpers and completion command entries where the Debian-specific name is user-visible; internal Debian resource/module names may remain.
+- [ ] Change the default image name from `debian-sbx` to `sbx`, so the default directory is `~/.smolvm/images/sbx`.
+- [ ] Preserve `--name` as an explicit override.
 - [ ] Remove `--with-docker` from `add_arguments()`.
 - [ ] Remove `args.with_docker`, conditional builder selection, and the custom-Containerfile incompatibility error.
 - [ ] Always select the packaged Docker fragment for the packaged base/agent composition path.
@@ -262,13 +260,15 @@ Do not edit or commit directly to `main/` or `specification/main/`. Do not commi
 - [ ] Make custom-image manifests use the same kernel filename with `features: []`.
 - [ ] Keep runtime compatibility with older manifests referencing `vmlinux-docker.bin` or another relative kernel filename.
 
-### T018 — Simplify image-build output
+### T018 — Simplify image-build output and show the next step
 
 - [ ] Remove the `with_docker`, `kernel_url`, and `kernel_source` payload fields.
 - [ ] Keep `docker_containerfile` populated for the packaged recipe and `null` for custom Containerfiles.
 - [ ] Print the kernel path without a source suffix in the human summary.
 - [ ] Do not add new provenance, result, or manifest fields.
 - [ ] Preserve the remaining human summary, `--json`, and sbx config snippet shapes.
+- [ ] After a successful human-readable build, print a suggested `sbx run the-quest --image ~/.smolvm/images/sbx ... --write-config` command using the actual built image path.
+- [ ] Keep `--write-config` on `run`/`create`; do not add it to `image build` or modify `.sbx.toml` during an image build.
 
 ## Phase 4 — force local-image communication through SSH
 
@@ -302,15 +302,18 @@ Do not edit or commit directly to `main/` or `specification/main/`. Do not commi
 - [ ] Add parser tests proving `--with-docker` and `--kernel-url` are rejected as unknown arguments.
 - [ ] Preserve JSON and human summary coverage with obsolete conditional fields removed.
 
-### T023 — Test vendored kernel inputs
+### T023 — Test pinned kernel input downloads
 
-- [ ] Assert all six SmolVM recipe files and packaged `check-config.sh` are available through `_packaged_resources()`.
-- [ ] Assert `_build_docker_kernel()` copies packaged inputs and never performs network script downloads.
-- [ ] Assert the sbx Docker config fragment is appended once.
-- [ ] Assert `build.sh` runs before `check-config.sh`.
+- [ ] Assert all seven URLs contain the expected full commit and have the design's SHA-256 value.
+- [ ] Fake downloads in temporary files; automated tests must not contact GitHub.
+- [ ] Assert every file is verified before it enters the kernel work directory.
+- [ ] Assert a mismatch reports URL plus expected/actual digests and prevents execution.
+- [ ] Assert the sbx Docker config fragment is appended once after upstream verification.
+- [ ] Assert verified `build.sh` runs before verified `check-config.sh`.
 - [ ] Assert the kernel is installed only after both commands succeed.
 - [ ] Assert failure removes temporary output and does not replace a previously valid `vmlinux.bin`.
 - [ ] Preserve the ownership-repair `chown` assertion.
+- [ ] Test the maintenance checker with fake API/download responses, including unchanged, changed, and license-change results.
 
 ### T024 — Test packaged and custom manifests separately
 
@@ -319,12 +322,16 @@ Do not edit or commit directly to `main/` or `specification/main/`. Do not commi
 - [ ] Both paths: assert the Docker-capable kernel is built and referenced as `vmlinux.bin`.
 - [ ] Existing-image listing/runtime tests: retain fixtures with `vmlinux-docker.bin` and prove manifest-driven compatibility.
 
-### T025 — Update CLI dispatch and completion tests
+### T025 — Update CLI dispatch, configuration, and completion tests
 
-- [ ] Rewrite `tests/test_cli.py` image-build dispatch assertions without `with_docker`.
+- [ ] Rewrite `tests/test_cli.py` dispatch assertions for `image build` without `with_docker`.
+- [ ] Assert `image build-debian` is rejected and no alias remains.
+- [ ] Assert the default build name/path is `sbx` / `~/.smolvm/images/sbx`; preserve `--name` override coverage.
+- [ ] Assert `image build` never creates or updates `.sbx.toml`.
+- [ ] Assert `run`/`create --write-config` persists an explicitly supplied `--image ~/.smolvm/images/sbx`, `--run-user agent`, `--project-path .`, and `--writable-mounts`.
 - [ ] Remove `--with-docker` and `--kernel-url` from static completion option tables.
 - [ ] Update bash, zsh, and fish completion expectations.
-- [ ] Keep `image build-debian` and all remaining options discoverable.
+- [ ] Keep `image build` and all remaining options discoverable.
 
 ### T026 — Add SSH-only local-image tests
 
@@ -350,12 +357,28 @@ Do not edit or commit directly to `main/` or `specification/main/`. Do not commi
 
 ## Phase 6 — update documentation and fragile seams
 
-### T028 — Update image build documentation
+### T028 — Update the curated image workflow documentation
 
-- [ ] Update `README.md` and `docs/build-local-debian-pi-image.md` so the normal command produces a Docker-capable image.
+- [ ] Update `README.md` and `docs/build-local-debian-pi-image.md` to use only `sbx image build` and the default `~/.smolvm/images/sbx` image.
+- [ ] Present the curated image as the recommended local-image workflow.
+- [ ] Show `the-quest` as the example sandbox name used by the website.
+- [ ] Show the recommended command:
+
+  ```bash
+  sbx image build
+  sbx run the-quest \
+    --image ~/.smolvm/images/sbx \
+    --run-user agent \
+    --project-path . \
+    --writable-mounts \
+    --write-config
+  ```
+
+- [ ] Show the resulting/suggested `.sbx.toml` with `image = "~/.smolvm/images/sbx"`, `copy_host_credentials = false`, and `git_config = true`.
+- [ ] Explain that `--write-config` belongs to `run`/`create`; `image build` never writes project configuration.
 - [ ] Remove all examples and prose using `--with-docker` or `--kernel-url`.
 - [ ] Use `vmlinux.bin` in new image layouts.
-- [ ] Explain that builds compile the kernel and therefore take longer and require network access for the SHA-verified Linux source and package repositories.
+- [ ] Explain that builds compile the kernel and therefore take longer and require network access for immutable, SHA-verified SmolVM/Moby inputs, the SHA-verified Linux source, and package repositories.
 - [ ] Keep rootless Docker usage and troubleshooting commands accurate.
 - [ ] Do not add a separate Docker tutorial.
 
@@ -379,7 +402,7 @@ Do not edit or commit directly to `main/` or `specification/main/`. Do not commi
 - [ ] Search source, tests, README, and docs for:
 
   ```bash
-  rg -n 'with-docker|with_docker|kernel-url|vmlinux-docker|published QEMU kernel|Python stdlib-only' \
+  rg -n 'build-debian|debian-sbx|with-docker|with_docker|kernel-url|vmlinux-docker|published QEMU kernel|Python stdlib-only' \
     src tests README.md docs
   ```
 
@@ -390,11 +413,11 @@ Do not edit or commit directly to `main/` or `specification/main/`. Do not commi
 
 ### T032 — Review the final build dependency boundary
 
-- [ ] Prove image-build Python code performs no remote script download.
-- [ ] Prove the only kernel source network fetch is Linux `6.12.85` and that it is verified before use.
+- [ ] Prove image-build Python code downloads only the seven immutable, individually verified build inputs and Linux `6.12.85` source.
+- [ ] Prove no downloaded input is copied, modified, made executable, or executed before SHA-256 verification.
 - [ ] Prove no SmolVM published kernel or guest-agent binary is requested during a local image build.
-- [ ] Prove packaged scripts come from wheel resources, not repository-relative paths.
-- [ ] Prove no custom URL or bypass flag remains.
+- [ ] Prove the SmolVM recipe and Moby checker are absent from source/wheel package resources.
+- [ ] Prove no mutable, custom, fallback, or verification-bypass URL remains.
 
 ### T033 — Review failure and replacement behavior
 
@@ -407,7 +430,7 @@ Do not edit or commit directly to `main/` or `specification/main/`. Do not commi
 ### T034 — Review scope and deletion opportunities
 
 - [ ] Confirm there is one packaged image composition and one kernel output name.
-- [ ] Confirm there is no Docker feature toggle, kernel URL abstraction, downloader, artifact registry, or communication-channel option.
+- [ ] Confirm there is no Docker feature toggle, caller-configurable URL, fallback downloader, artifact registry, or communication-channel option.
 - [ ] Confirm custom Containerfiles use one explicit conservative metadata rule rather than runtime detection.
 - [ ] Confirm no unrelated package pinning, SmolVM upgrade, lifecycle refactor, or hypervisor work entered the diff.
 - [ ] Run an over-engineering review and remove dead conditionals/helpers left by the old two-variant path.
@@ -440,7 +463,7 @@ Do not edit or commit directly to `main/` or `specification/main/`. Do not commi
 
 Only on a suitable Docker/QEMU host with disposable resources:
 
-- [ ] Build a default image without `--with-docker`.
+- [ ] Run `sbx image build` and confirm it creates `~/.smolvm/images/sbx` without `--with-docker`.
 - [ ] Confirm the image directory contains `smolvm-image.json`, `rootfs.ext4`, and `vmlinux.bin`, with no `vmlinux-docker.bin`.
 - [ ] Inspect the rootfs or boot the image and confirm `/usr/local/bin/smolvm-guest-agent` is absent.
 - [ ] Start a fresh VM and confirm SSH readiness without a vsock delay.
@@ -453,11 +476,15 @@ Only on a suitable Docker/QEMU host with disposable resources:
 
 ## Final definition of done
 
-- [ ] `--with-docker`, `--kernel-url`, and the unused `--ssh-public-key` are removed from parser, completion, tests, and docs.
+- [ ] `sbx image build` is the only curated build command and defaults to `~/.smolvm/images/sbx`.
+- [ ] `image build-debian`, `--with-docker`, `--kernel-url`, and the unused `--ssh-public-key` are removed from parser, completion, tests, and docs.
+- [ ] Documentation uses `the-quest`, recommends the curated image, and shows `run`/`create --write-config` persisting it.
+- [ ] `image build` does not modify project configuration.
 - [ ] Packaged builds always include rootless Docker and report `features: ["docker"]`.
 - [ ] Custom Containerfiles remain supported and conservatively report `features: []`.
-- [ ] The six SmolVM recipe files and reviewed Moby checker are packaged with sbx.
-- [ ] No executable build script is downloaded at image-build time.
+- [ ] The six SmolVM recipe files and Moby checker are absent from the sbx wheel.
+- [ ] All seven build inputs are downloaded from immutable commit URLs and individually SHA-256 verified before use.
+- [ ] The maintainer checker reports upstream source and licensing changes without automatically updating pins.
 - [ ] Linux source remains version-pinned and SHA-256 verified before compilation.
 - [ ] Local image builds download neither a SmolVM published kernel nor guest-agent binary.
 - [ ] New images contain only `vmlinux.bin`, `rootfs.ext4`, and their manifest as boot artifacts.
