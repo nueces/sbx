@@ -17,9 +17,11 @@ import tempfile
 import urllib.request
 from collections.abc import Iterator
 from contextlib import contextmanager
-from importlib.resources import files
-from importlib.resources.abc import Traversable
+from importlib.resources import as_file, files
 from pathlib import Path
+
+from smolvm.images.builder import ImageBuilder
+from smolvm.images.published import BASE_KERNELS
 
 RESOURCE_PACKAGE = "sbx.image.resources"
 DEFAULT_BASE_CONTAINERFILE = Path("Containers") / "Debian" / "Base.Containerfile"
@@ -40,23 +42,9 @@ SMOLVM_KERNEL_FILES = (
 DOCKER_KERNEL_NAME = "vmlinux-docker.bin"
 
 
-def _copy_resource_tree(source: Traversable, target: Path) -> None:
-    if source.is_dir():
-        target.mkdir(parents=True, exist_ok=True)
-        for child in source.iterdir():
-            _copy_resource_tree(child, target / child.name)
-    else:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(source.read_bytes())
-
-
 @contextmanager
 def _packaged_resources() -> Iterator[Path]:
-    with tempfile.TemporaryDirectory(prefix="sbx-image-build-resources-") as tmp:
-        root = Path(tmp)
-        package_root = files(RESOURCE_PACKAGE)
-        for name in ("Containers", "kernel", "scripts"):
-            _copy_resource_tree(package_root / name, root / name)
+    with as_file(files(RESOURCE_PACKAGE)) as root:
         yield root
 
 
@@ -94,20 +82,17 @@ def _compose_containerfiles(
     output.write_text(content, encoding="utf-8")
 
 
-def _docker_builder_class(builder_class: type) -> type:
-    class SbxDockerImageBuilder(builder_class):  # type: ignore[misc, valid-type]
-        def _default_init_script(self) -> str:
-            # ponytail: protected SmolVM hook; replace with public boot hooks when upstream exists.
-            return self._base_init_script(
-                custom_commands="""
+class SbxDockerImageBuilder(ImageBuilder):
+    def _default_init_script(self) -> str:
+        # ponytail: protected SmolVM hook; replace with public boot hooks when upstream exists.
+        return self._base_init_script(
+            custom_commands="""
 # sbx: start rootless Docker at boot for Docker-capable images.
 if [ -x /usr/local/bin/sbx-start-rootless-docker ]; then
     /usr/local/bin/sbx-start-rootless-docker >/var/log/sbx-rootless-docker.log 2>&1 &
 fi
 """
-            )
-
-    return SbxDockerImageBuilder
+        )
 
 
 def _download(url: str, output: Path) -> None:
@@ -254,62 +239,6 @@ def _build_containerfile_base_image(
     return root_tag
 
 
-def _print_sdk_sketch(*, kernel_path: Path, rootfs_path: Path, boot_args: str) -> None:
-    print("SDK usage sketch:")
-    print("  from pathlib import Path")
-    print("  from smolvm import SmolVM, VMConfig")
-    print("  config = VMConfig(")
-    print("      vm_id='debian-test',")
-    print(f"      kernel_path=Path({str(kernel_path)!r}),")
-    print(f"      rootfs_path=Path({str(rootfs_path)!r}),")
-    print(f"      boot_args={boot_args!r},")
-    print("      backend='qemu',")
-    print("      ssh_capable=True,")
-    print("  )")
-    print("  with SmolVM(config) as vm:")
-    print("      vm.start()")
-    print("      vm.wait_for_ssh()")
-    print("      print(vm.run('cat /etc/debian_version'))")
-
-
-def _print_existing_sdk_sketch(image_dir: Path) -> int:
-    image_dir = image_dir.expanduser().resolve()
-    manifest_path = image_dir / "smolvm-image.json"
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        kernel_name = manifest["kernel"]
-        rootfs_name = manifest["rootfs"]
-    except FileNotFoundError:
-        print(f"build-debian-image: manifest not found: {manifest_path}", file=sys.stderr)
-        return 2
-    except (KeyError, TypeError, json.JSONDecodeError) as exc:
-        print(f"build-debian-image: invalid image manifest {manifest_path}: {exc}", file=sys.stderr)
-        return 2
-    if not isinstance(kernel_name, str) or not isinstance(rootfs_name, str):
-        print(
-            f"build-debian-image: invalid image manifest {manifest_path}: "
-            "kernel and rootfs must be strings",
-            file=sys.stderr,
-        )
-        return 2
-    boot_args = manifest.get(
-        "boot_args", "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init"
-    )
-    if not isinstance(boot_args, str):
-        print(
-            f"build-debian-image: invalid image manifest {manifest_path}: "
-            "boot_args must be a string",
-            file=sys.stderr,
-        )
-        return 2
-    _print_sdk_sketch(
-        kernel_path=image_dir / kernel_name,
-        rootfs_path=image_dir / rootfs_name,
-        boot_args=boot_args,
-    )
-    return 0
-
-
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--name",
@@ -378,29 +307,9 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Print machine-readable JSON instead of a text summary.",
     )
-    parser.add_argument(
-        "--sdk-sketch",
-        action="store_true",
-        help="Include a SmolVM SDK usage sketch in the text summary.",
-    )
-    parser.add_argument(
-        "--print-sdk-sketch",
-        type=Path,
-        metavar="IMAGE_DIR",
-        help="Print a SmolVM SDK usage sketch for an existing local image directory and exit.",
-    )
-
-
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Build a local Debian SSH-ready image for SmolVM.")
-    add_arguments(parser)
-    return parser
 
 
 def main_from_args(args: argparse.Namespace) -> int:
-    if args.print_sdk_sketch is not None:
-        return _print_existing_sdk_sketch(args.print_sdk_sketch)
-
     if args.with_docker and args.containerfile is not None:
         print(
             "build-debian-image: --with-docker cannot be combined with --containerfile; "
@@ -416,19 +325,7 @@ def main_from_args(args: argparse.Namespace) -> int:
         )
         return 2
 
-    try:
-        from smolvm.images.builder import ImageBuilder
-        from smolvm.images.published import BASE_KERNELS
-    except ImportError as exc:
-        print(
-            "build-debian-image: smolvm is not installed. Install the supported tool, "
-            "for example: uv tool install 'smolvm==0.0.19'",
-            file=sys.stderr,
-        )
-        print(f"Original import error: {exc}", file=sys.stderr)
-        return 127
-
-    BuilderClass = _docker_builder_class(ImageBuilder) if args.with_docker else ImageBuilder
+    BuilderClass = SbxDockerImageBuilder if args.with_docker else ImageBuilder
     builder = BuilderClass(cache_dir=args.cache_dir.expanduser() if args.cache_dir else None)
     base_image = args.base_image
     arch = "amd64" if builder._host_arch_key() == "x86_64" else "arm64"
@@ -535,14 +432,12 @@ def main_from_args(args: argparse.Namespace) -> int:
     print("  [sbx]")
     print(f"  image = {str(manifest_path.parent)!r}")
     print("  run_user = 'agent'")
-    if args.sdk_sketch:
-        print()
-        _print_sdk_sketch(kernel_path=kernel_path, rootfs_path=rootfs_path, boot_args=boot_args)
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = _build_parser()
+    parser = argparse.ArgumentParser(description="Build a local Debian SSH-ready image for SmolVM.")
+    add_arguments(parser)
     return main_from_args(parser.parse_args(argv))
 
 

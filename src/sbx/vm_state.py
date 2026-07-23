@@ -1,6 +1,5 @@
 import json
 import sqlite3
-from pathlib import Path
 from typing import Any
 
 from sbx.constants import SMOLVM_DB_PATH
@@ -39,16 +38,3 @@ def mark_error_vm_stopped_for_restart(vm_id: str) -> None:
             """,
             (vm_id,),
         )
-
-
-def vm_image(vm: Any) -> str:
-    rootfs = getattr(getattr(vm, "config", None), "rootfs_path", None)
-    if rootfs is None:
-        return "-"
-    path = Path(rootfs)
-    return path.parent.name or path.name or "-"
-
-
-def vm_ssh_port(vm: Any) -> str:
-    port = getattr(getattr(vm, "network", None), "ssh_host_port", None)
-    return str(port) if port is not None else "-"

@@ -76,13 +76,7 @@ That package points to the older GitHub organization/account:
 badlogic/pi-mono
 ```
 
-`sbx` currently delegates agent installation to SmolVM:
-
-```bash
-smolvm pi start
-```
-
-So this stale package likely comes from SmolVM's Pi preset or prebuilt Pi image, not directly from `sbx`.
+`sbx` delegates agent installation to SmolVM's Pi preset through its SDK compatibility layer. Therefore this stale package likely comes from the SmolVM preset or prebuilt Pi image, not directly from `sbx`.
 
 ### 2. New Pi requires newer Node than the VM provides
 

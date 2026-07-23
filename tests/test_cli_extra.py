@@ -27,6 +27,13 @@ def isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(cli, "SMOLVM_DB_PATH", tmp_path / "smolvm.db")
     monkeypatch.setattr(vm_state, "SMOLVM_DB_PATH", tmp_path / "smolvm.db")
     monkeypatch.setattr(guest_setup, "set_hostname", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        cli.smolvm_preset,
+        "create_preset",
+        lambda preset_name, **kwargs: SimpleNamespace(
+            vm_id=kwargs.get("vm_name") or f"{preset_name}-sbx", close=lambda: None
+        ),
+    )
 
 
 @pytest.fixture
@@ -437,7 +444,7 @@ def test_run_helpers_and_require_errors(
     assert runtime.run(["cmd"]) == 9
 
 
-def test_simple_helper_error_branches(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_simple_helper_error_branches(tmp_path: Path) -> None:
     assert cli._deep_merge({"a": {"b": 1}}, {"a": {"c": 2}}) == {"a": {"b": 1, "c": 2}}
     assert cli._resolve_project_path(str(tmp_path / "missing")) == tmp_path / "missing"
     assert cli._same_path_mount(str(tmp_path)) == f"{tmp_path}:{tmp_path}"
@@ -445,8 +452,6 @@ def test_simple_helper_error_branches(tmp_path: Path, capsys: pytest.CaptureFixt
         guest_setup.validate_run_user("bad user")
     with pytest.raises(cli.ConfigError, match="invalid env var"):
         guest_setup.validate_env_names(["1BAD"])
-    cli._print_start_failure('{"error":{"message":"QEMU exited early"}}')
-    assert "Try `sbx recreate" in capsys.readouterr().err
 
 
 def test_ssh_command_and_pid_alive(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1119,10 +1124,6 @@ def test_config_and_validation_error_branches(tmp_path: Path) -> None:
         guest_setup.validate_run_user("bad user")
     with pytest.raises(cli.ConfigError, match="invalid env var"):
         guest_setup.validate_env_names(["BAD-NAME"])
-    with pytest.raises(cli.ConfigError, match="could not read"):
-        cli._extract_started_vm_name("not-json")
-    with pytest.raises(cli.ConfigError, match="did not include"):
-        cli._extract_started_vm_name('{"data":{"vm":{"name":""}}}')
 
 
 def test_command_edge_cases(
