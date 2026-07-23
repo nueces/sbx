@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import random
 import select
 import socket
 import ssl
@@ -15,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -57,6 +59,10 @@ from sbx_gateway_mediator import (  # noqa: E402
     RequestPolicy,
     RetainedBufferBudget,
     _basic_authorization,
+    _normalized_path,
+    _parse_basic_authorization,
+    load_package_auth,
+    load_policy,
 )
 
 KEY = b"k" * 32
@@ -619,6 +625,31 @@ class PackageAuthUnitTests(unittest.TestCase):
         addon.responseheaders(flow)
 
         self.assertEqual(flow.response.status_code, 502)
+
+
+class MalformedInputTests(unittest.TestCase):
+    @staticmethod
+    def _parse(parser: object, payload: bytes) -> None:
+        with tempfile.TemporaryFile() as source:
+            source.write(payload)
+            source.seek(0)
+            with suppress(ValueError):
+                parser(os.dup(source.fileno()))  # type: ignore[operator]
+
+    def test_bounded_malformed_policy_package_and_secret_fields(self) -> None:
+        random_source = random.Random(19)
+        payloads = [b"", b"null", b"[]", b"{}", b"{" * 65537]
+        payloads.extend(
+            random_source.randbytes(random_source.randrange(0, 70000)) for _ in range(500)
+        )
+        started = time.monotonic()
+        for payload in payloads:
+            self._parse(load_policy, payload)
+            self._parse(load_package_auth, payload)
+            text = payload[:4096].decode("latin1")
+            _parse_basic_authorization(text)
+            _normalized_path(text)
+        self.assertLess(time.monotonic() - started, 10)
 
 
 class HookAuthorizationTests(unittest.TestCase):

@@ -129,6 +129,16 @@ func TestExactTLSPassthroughPreservesPinnedMTLSAndPayload(t *testing.T) {
 	}
 }
 
+func FuzzClientHelloSNI(f *testing.F) {
+	f.Add(make([]byte, 34))
+	f.Fuzz(func(t *testing.T, hello []byte) {
+		if len(hello) > maxTLSHandshake {
+			return
+		}
+		_, _ = clientHelloSNI(hello)
+	})
+}
+
 func TestTLSPassthroughRejectsWrongAndMissingSNI(t *testing.T) {
 	for _, serverName := range []string{"other.example", ""} {
 		t.Run(serverName, func(t *testing.T) {

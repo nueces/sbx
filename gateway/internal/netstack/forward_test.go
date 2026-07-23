@@ -1,6 +1,7 @@
 package netstack
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net"
@@ -174,6 +175,11 @@ func TestMediatorDialUsesAuthenticatedDestinationBoundSOCKS(t *testing.T) {
 	if err := <-result; err != nil {
 		t.Fatal(err)
 	}
+}
+
+func FuzzReadSOCKSReply(f *testing.F) {
+	f.Add([]byte{5, 0, 0, 1, 127, 0, 0, 1, 0, 0})
+	f.Fuzz(func(t *testing.T, reply []byte) { _ = readSOCKSReply(bytes.NewReader(reply)) })
 }
 
 func TestMediatorCrashFailsClosed(t *testing.T) {

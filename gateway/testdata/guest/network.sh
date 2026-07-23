@@ -11,6 +11,9 @@ gateway_ca_port=
 capacity_id=
 capacity_echo_port=
 capacity_requests=1
+task19_mode=
+task19_port=
+task19_ca_port=
 for value in $(cat /proc/cmdline); do
   case "$value" in
     sbx.package_port=*) package_port=${value#*=} ;;
@@ -18,8 +21,169 @@ for value in $(cat /proc/cmdline); do
     sbx.capacity_id=*) capacity_id=${value#*=} ;;
     sbx.capacity_echo_port=*) capacity_echo_port=${value#*=} ;;
     sbx.capacity_requests=*) capacity_requests=${value#*=} ;;
+    sbx.task19_mode=*) task19_mode=${value#*=} ;;
+    sbx.task19_port=*) task19_port=${value#*=} ;;
+    sbx.task19_ca_port=*) task19_ca_port=${value#*=} ;;
   esac
 done
+if [ -n "$task19_mode" ]; then
+  python3 - "$task19_mode" "$task19_port" "$task19_ca_port" <<'PY' >/dev/ttyS0 2>&1
+import base64
+import concurrent.futures
+import http.client
+import json
+import socket
+import subprocess
+import ssl
+import struct
+import sys
+import threading
+import time
+
+mode, port, ca_port = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+hosts = ("a.localhost", "b.localhost")
+if mode == "slirp":
+    with open("/etc/hosts", "a", encoding="ascii") as hosts_file:
+        hosts_file.write("10.0.2.2 a.localhost b.localhost\n")
+
+with socket.create_connection((hosts[0], ca_port), timeout=10) as connection:
+    certificate = b""
+    while chunk := connection.recv(65536):
+        certificate += chunk
+assert certificate.count(b"BEGIN CERTIFICATE") == 1
+with open("/run/task19-ca.pem", "wb") as output:
+    output.write(certificate)
+context = ssl.create_default_context(cafile="/run/task19-ca.pem")
+
+
+def request(host, path, method="GET", body=None, *, timeout=60):
+    connection = http.client.HTTPSConnection(host, port, context=context, timeout=timeout)
+    started = time.perf_counter()
+    connection.request(method, path, body=body)
+    response = connection.getresponse()
+    payload = response.read()
+    elapsed = time.perf_counter() - started
+    status = response.status
+    connection.close()
+    assert status == 200, (path, status, payload[:100])
+    return payload, elapsed
+
+
+def percentile(values, fraction):
+    return sorted(values)[min(len(values) - 1, int(len(values) * fraction))]
+
+
+def dns_query(name):
+    labels = b"".join(bytes([len(label)]) + label.encode() for label in name.split(".")) + b"\0"
+    packet = struct.pack("!HHHHHH", 1, 0x0100, 1, 0, 0, 0) + labels + struct.pack("!HH", 1, 1)
+    nameserver = next(
+        line.split()[1]
+        for line in open("/etc/resolv.conf", encoding="ascii")
+        if line.startswith("nameserver ")
+    )
+    query = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    query.settimeout(5)
+    try:
+        query.sendto(packet, (nameserver, 53))
+        reply = query.recv(1232)
+    finally:
+        query.close()
+    assert len(reply) >= 12 and struct.unpack("!H", reply[6:8])[0] == 1
+
+
+class Ingress(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.done = threading.Event()
+
+    def run(self):
+        listener = socket.socket()
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("0.0.0.0", 3000))
+        listener.listen()
+        print("TASK19_INGRESS_READY", flush=True)
+        connection, _ = listener.accept()
+        with connection:
+            connection.settimeout(30)
+            request_data = b""
+            while b"\r\n\r\n" not in request_data:
+                request_data += connection.recv(4096)
+            size = 100 * 1024 * 1024
+            connection.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Length: "
+                + str(size).encode()
+                + b"\r\nConnection: close\r\n\r\n"
+            )
+            chunk = b"i" * 65536
+            for _ in range(size // len(chunk)):
+                connection.sendall(chunk)
+        listener.close()
+        self.done.set()
+
+
+ingress = Ingress()
+ingress.start()
+assert ingress.done.wait(120), "ingress benchmark did not run"
+results = {"mode": mode}
+for size in (1024 * 1024, 100 * 1024 * 1024, 32 * 1024 * 1024):
+    started = time.perf_counter()
+    subprocess.run(
+        ["curl", "--fail", "--silent", "--show-error", "--cacert", "/run/task19-ca.pem",
+         "--output", "/dev/null", f"https://{hosts[0]}:{port}/bytes/{size}"],
+        check=True,
+        timeout=180,
+    )
+    elapsed = time.perf_counter() - started
+    results[f"throughput_{size}_mbps"] = size * 8 / elapsed / 1_000_000
+
+connection = http.client.HTTPSConnection(hosts[0], port, context=context, timeout=30)
+latencies = []
+for _ in range(100):
+    started = time.perf_counter()
+    connection.request("GET", "/latency")
+    response = connection.getresponse()
+    assert response.status == 200 and response.read() == b"xx"
+    latencies.append((time.perf_counter() - started) * 1000)
+connection.close()
+results["latency_ms"] = {
+    "p50": percentile(latencies, 0.50),
+    "p95": percentile(latencies, 0.95),
+    "p99": percentile(latencies, 0.99),
+}
+
+started = time.perf_counter()
+for index in range(100):
+    dns_query(hosts[index % 2])
+results["dns_lookups_per_second"] = 100 / (time.perf_counter() - started)
+
+barrier = threading.Barrier(128)
+def concurrent_request(index):
+    barrier.wait(timeout=30)
+    body, _ = request(hosts[index % 2], "/concurrent", timeout=60)
+    return body
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=128) as executor:
+    bodies = list(executor.map(concurrent_request, range(128)))
+assert bodies == [b"concurrent"] * 128
+results["concurrent_requests"] = len(bodies)
+
+upload = b"u" * (8 * 1024 * 1024)
+body, upload_seconds = request(hosts[0], "/slow-read", "POST", upload, timeout=180)
+assert body == str(len(upload)).encode()
+body, download_seconds = request(hosts[0], "/slow-write/8388608", timeout=180)
+assert len(body) == 8 * 1024 * 1024
+results["backpressure"] = {
+    "upload_bytes": len(upload),
+    "upload_seconds": upload_seconds,
+    "download_bytes": len(body),
+    "download_seconds": download_seconds,
+}
+encoded = base64.b64encode(json.dumps(results, sort_keys=True).encode()).decode()
+for _ in range(3):
+    print("TASK19_RESULT " + encoded, flush=True)
+PY
+  exit 0
+fi
 if [ -n "$capacity_id" ]; then
   python3 - "$capacity_id" "$capacity_echo_port" "$capacity_requests" <<'PY' >/dev/ttyS0 2>&1
 import socket
