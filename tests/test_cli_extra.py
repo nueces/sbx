@@ -1006,7 +1006,9 @@ def test_tunnel_and_session_state(monkeypatch: pytest.MonkeyPatch) -> None:
     assert session_state.active_sessions("vm1") == [{"pid": 123, "kind": "run"}]
 
     stopped: list[list[str]] = []
-    monkeypatch.setattr(cli.runtime, "run_smolvm", lambda argv: stopped.append(list(argv)) or 0)
+    monkeypatch.setattr(
+        cli.runtime, "run_smolvm", lambda argv, **kwargs: stopped.append(list(argv)) or 0
+    )
     cli._stop_vm_if_last_session("vm1", stop_on_exit=False)
     assert stopped == []
     session_state.save_sessions({})

@@ -2,6 +2,8 @@ import socket
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from smolvm.runtime.guest_platforms import _LINUX_SPEC
@@ -237,6 +239,137 @@ def test_malformed_socket_paths_fail_clearly(
             external_network=backend(path),
             host_system="Linux",
         )
+
+
+def test_start_vm_uses_external_backend_for_the_runtime_process(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    vm_info: VMInfo,
+    unix_socket: Path,
+) -> None:
+    events: list[object] = []
+
+    class State:
+        def get_vm(self, vm_id: str) -> VMInfo:
+            assert vm_id == vm_info.vm_id
+            return vm_info
+
+        def update_vm(self, vm_id: str, **values: object) -> VMInfo:
+            events.append(("update", vm_id, values))
+            return vm_info
+
+    class Process:
+        pid = 7654
+
+        def __init__(self, argv: list[str], **kwargs: object) -> None:
+            events.append(("popen", argv, kwargs))
+
+    context = SimpleNamespace(start_qemu=None)
+    qemu = tmp_path / "qemu-system-x86_64"
+    qemu.touch()
+    sdk = SimpleNamespace(
+        state=State(),
+        data_dir=tmp_path,
+        _log_files={},
+        _process_handles={},
+        _check_workspace_mounts=lambda info: events.append(("mount-check", info.vm_id)),
+        _runtime_context=lambda: context,
+        _find_qemu_binary=lambda: qemu,
+        _resolve_boot_args=lambda info: info.config.boot_args,
+        _close_runtime_log=lambda *args: events.append(("close-log", args)),
+    )
+    vm = SimpleNamespace(
+        vm_id=vm_info.vm_id,
+        _sdk=sdk,
+        _info=vm_info,
+        _reset_runtime_state=lambda **kwargs: events.append(("reset", kwargs)),
+    )
+    external = backend(unix_socket)
+
+    class Adapter:
+        def __init__(self, adapter_context: object) -> None:
+            assert adapter_context is context
+
+        def start(self, info: VMInfo, *, log_path: Path, boot_timeout: float) -> object:
+            assert boot_timeout == 12
+            process = context.start_qemu(info, log_path)
+            return SimpleNamespace(
+                status=VMState.RUNNING,
+                pid=process.pid,
+                control_socket_path=tmp_path / "control.sock",
+            )
+
+    def build(info: VMInfo, **kwargs: Any) -> list[str]:
+        assert info is vm_info
+        assert kwargs["external_network"] == external
+        return [str(qemu), "-netdev", "stream"]
+
+    monkeypatch.setattr(smolvm_network, "QemuRuntimeAdapter", Adapter)
+    monkeypatch.setattr(smolvm_network, "get_guest_platform", lambda *args, **kwargs: _LINUX_SPEC)
+    monkeypatch.setattr(smolvm_network, "build_qemu_argv", build)
+    monkeypatch.setattr(smolvm_network.subprocess, "Popen", Process)
+
+    assert smolvm_network.start_vm(vm, external, boot_timeout=12) == 7654
+    assert sdk._process_handles[7654].pid == 7654
+    assert any(event[0] == "popen" for event in events if isinstance(event, tuple))
+    assert ("reset", {"close_ssh": False}) in events
+    for stream in sdk._log_files.values():
+        stream.close()
+
+
+def test_start_vm_failure_marks_state_error_and_closes_log(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    vm_info: VMInfo,
+    unix_socket: Path,
+) -> None:
+    events: list[object] = []
+
+    class State:
+        def get_vm(self, _vm_id: str) -> VMInfo:
+            return vm_info
+
+        def update_vm(self, _vm_id: str, **values: object) -> VMInfo:
+            events.append(values)
+            return vm_info
+
+    class Adapter:
+        def __init__(self, _context: object) -> None:
+            pass
+
+        def start(self, *_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("QEMU failed")
+
+    sdk = SimpleNamespace(
+        state=State(),
+        data_dir=tmp_path,
+        _check_workspace_mounts=lambda _info: None,
+        _runtime_context=SimpleNamespace,
+        _close_runtime_log=lambda *args: events.append(("close", args)),
+    )
+    vm = SimpleNamespace(vm_id=vm_info.vm_id, _sdk=sdk)
+    monkeypatch.setattr(smolvm_network, "QemuRuntimeAdapter", Adapter)
+
+    with pytest.raises(RuntimeError, match="QEMU failed"):
+        smolvm_network.start_vm(vm, backend(unix_socket), boot_timeout=1)
+
+    assert any(value.get("status") is VMState.ERROR for value in events if isinstance(value, dict))
+    assert any(value[0] == "close" for value in events if isinstance(value, tuple))
+
+
+def test_start_vm_rejects_invalid_state_and_missing_network(
+    vm_info: VMInfo, unix_socket: Path
+) -> None:
+    state = SimpleNamespace(
+        get_vm=lambda _vm_id: vm_info.model_copy(update={"status": VMState.RUNNING})
+    )
+    vm = SimpleNamespace(vm_id=vm_info.vm_id, _sdk=SimpleNamespace(state=state))
+    with pytest.raises(Exception, match="Cannot start VM"):
+        smolvm_network.start_vm(vm, backend(unix_socket), boot_timeout=1)
+
+    state.get_vm = lambda _vm_id: vm_info.model_copy(update={"network": None})
+    with pytest.raises(Exception, match="no network configuration"):
+        smolvm_network.start_vm(vm, backend(unix_socket), boot_timeout=1)
 
 
 def test_socket_path_must_name_an_existing_unix_socket(tmp_path: Path, vm_info: VMInfo) -> None:

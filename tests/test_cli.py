@@ -1195,7 +1195,13 @@ def test_run_existing_vm_starts_without_creating(
             stderr="",
         )
 
-    def fake_run(argv: list[str], *, check: bool = False, env: dict[str, str] | None = None) -> int:
+    def fake_run(
+        argv: list[str],
+        *,
+        check: bool = False,
+        env: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> int:
         calls.append(argv)
         return 0
 

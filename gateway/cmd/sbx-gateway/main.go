@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/nueces/sbx/gateway/internal/capability"
@@ -124,7 +125,12 @@ func run() error {
 	}
 	defer dns.Close()
 	network.ForwardTCP(cfg, resolver, mediator)
-	fmt.Fprintln(os.Stdout, `{"status":"ready"}`)
+	if err := json.NewEncoder(os.Stdout).Encode(map[string]any{
+		"status": "ready", "version": 1, "vm_id": cfg.VMID,
+		"generation": cfg.Generation, "digest": cfg.Digest, "mediator": mediator != nil,
+	}); err != nil {
+		return fmt.Errorf("readiness: %w", err)
+	}
 	conn, err := listener.Accept()
 	if err != nil {
 		return fmt.Errorf("accept: %w", err)
@@ -134,6 +140,8 @@ func run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errs := make(chan error, 2)
+	var outputMu sync.Mutex
+	var networkReady sync.Once
 	go func() {
 		for {
 			frame, err := stream.ReadFrame()
@@ -141,6 +149,11 @@ func run() error {
 				errs <- err
 				return
 			}
+			networkReady.Do(func() {
+				outputMu.Lock()
+				fmt.Fprintln(os.Stdout, `{"status":"network-ready"}`)
+				outputMu.Unlock()
+			})
 			network.Inject(frame)
 		}
 	}()
@@ -169,7 +182,9 @@ func run() error {
 			return fmt.Errorf("data plane stopped (%+v): %w", stream.Stats(), err)
 		case <-ticker.C:
 			stats := stream.Stats()
-			fmt.Fprintf(os.Stdout, "{\"frames_read\":%d,\"frames_written\":%d,\"frames_rejected\":%d}\n", stats.Read, stats.Written, stats.Rejected)
+			outputMu.Lock()
+			fmt.Fprintf(os.Stdout, "{\"status\":\"stats\",\"frames_read\":%d,\"frames_written\":%d,\"frames_rejected\":%d}\n", stats.Read, stats.Written, stats.Rejected)
+			outputMu.Unlock()
 		}
 	}
 }

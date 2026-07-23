@@ -89,22 +89,36 @@ def debug_command(argv: Sequence[str], env: Mapping[str, str] | None) -> None:
     debug(f"env source: {env_source}; {interesting}")
 
 
-def run(argv: Sequence[str], *, check: bool = False, env: Mapping[str, str] | None = None) -> int:
+def run(
+    argv: Sequence[str],
+    *,
+    check: bool = False,
+    env: Mapping[str, str] | None = None,
+    timeout: float | None = None,
+) -> int:
     debug_command(argv, env)
     try:
-        proc = subprocess.run(list(argv), check=check, env=dict(env) if env is not None else None)
+        proc = subprocess.run(
+            list(argv), check=check, env=dict(env) if env is not None else None, timeout=timeout
+        )
     except FileNotFoundError:
         print(f"sbx: command not found on PATH: {argv[0]}", file=sys.stderr)
         return 127
     except subprocess.CalledProcessError as exc:
         debug(f"return code: {exc.returncode}")
         return exc.returncode
+    except subprocess.TimeoutExpired:
+        print(f"sbx: command timed out after {timeout:g} seconds: {argv[0]}", file=sys.stderr)
+        return 124
     debug(f"return code: {proc.returncode}")
     return proc.returncode
 
 
 def run_capture(
-    argv: Sequence[str], *, env: Mapping[str, str] | None = None
+    argv: Sequence[str],
+    *,
+    env: Mapping[str, str] | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str] | None:
     debug_command(argv, env)
     try:
@@ -114,6 +128,7 @@ def run_capture(
             text=True,
             capture_output=True,
             env=dict(env) if env is not None else None,
+            timeout=timeout,
         )
         debug(f"return code: {result.returncode}")
         if result.stdout:
@@ -124,6 +139,8 @@ def run_capture(
     except FileNotFoundError:
         print(f"sbx: command not found on PATH: {argv[0]}", file=sys.stderr)
         return None
+    except subprocess.TimeoutExpired as exc:
+        raise ConfigError(f"command timed out after {timeout:g} seconds: {argv[0]}") from exc
 
 
 def smolvm_argv(args: Sequence[str]) -> list[str]:

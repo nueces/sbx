@@ -116,8 +116,8 @@ def install_guest_ca(
     *,
     run_capture: Callable[[Sequence[str]], subprocess.CompletedProcess[str] | None] | None = None,
     ssh: Callable[[str], list[str]] | None = None,
+    timeout: float = 60,
 ) -> str:
-    run_capture = run_capture or runtime.run_capture
     ssh = ssh or runtime.ssh_command
     certificate = _owner_file(ca.public_certificate)
     fingerprint = certificate_fingerprint(certificate)
@@ -125,7 +125,11 @@ def install_guest_ca(
         raise GatewayCAError("gateway CA changed before guest installation")
     script = shlex.quote(_guest_install_script(certificate, fingerprint))
     command = [*ssh(vm_id), "bash -lc " + script]
-    completed = run_capture(command)
+    completed = (
+        runtime.run_capture(command, timeout=timeout)
+        if run_capture is None
+        else run_capture(command)
+    )
     if completed is None:
         raise GatewayCAError("failed to install gateway CA: SSH command not found")
     installed = completed.stdout.strip().splitlines()[-1] if completed.stdout.strip() else ""
