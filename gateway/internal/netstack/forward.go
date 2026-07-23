@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -87,6 +88,9 @@ func (f *TCPForwarder) handle(request *tcp.ForwarderRequest) {
 	}
 	rule, allowed := f.config.Match("http", host, id.LocalPort)
 	if !allowed {
+		rule, allowed = f.config.Match("tls", host, id.LocalPort)
+	}
+	if !allowed {
 		rule, allowed = f.config.Match("tcp", host, id.LocalPort)
 	}
 	if !allowed || rule.Protocol == "http" && f.mediator == nil || !f.acquire(host) {
@@ -132,22 +136,51 @@ func (f *TCPForwarder) forward(request *tcp.ForwarderRequest, rule config.Rule, 
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	upstream, err := f.dial(ctx, rule, host, port)
-	if err != nil {
-		request.Complete(true)
-		return
-	}
 	var wq waiter.Queue
 	endpoint, tcpErr := request.CreateEndpoint(&wq)
 	request.Complete(tcpErr != nil)
 	if tcpErr != nil {
-		upstream.Close()
 		return
 	}
 	guest := gonet.NewTCPConn(&wq, endpoint)
+	if rule.Protocol == "tls" {
+		uploaded, downloaded, err := f.passthrough(ctx, guest, rule, host, port)
+		if err == nil {
+			f.uploaded.Add(uploaded)
+			f.downloaded.Add(downloaded)
+		}
+		guest.Close()
+		return
+	}
+	upstream, err := f.dial(ctx, rule, host, port)
+	if err != nil {
+		guest.Close()
+		return
+	}
 	uploaded, downloaded := relay(guest, upstream)
 	f.uploaded.Add(uploaded)
 	f.downloaded.Add(downloaded)
+}
+
+func (f *TCPForwarder) passthrough(ctx context.Context, guest net.Conn, rule config.Rule, host string, port uint16) (uint64, uint64, error) {
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = guest.SetReadDeadline(deadline)
+	}
+	prefix, sni, err := readClientHello(guest)
+	if err != nil || !strings.EqualFold(strings.TrimSuffix(sni, "."), host) {
+		return 0, 0, errors.New("TLS passthrough SNI mismatch")
+	}
+	upstream, err := f.dial(ctx, rule, host, port)
+	if err != nil {
+		return 0, 0, err
+	}
+	_ = guest.SetReadDeadline(time.Time{})
+	if err := writeAll(upstream, prefix); err != nil {
+		upstream.Close()
+		return 0, 0, err
+	}
+	uploaded, downloaded := relay(guest, upstream)
+	return uploaded + uint64(len(prefix)), downloaded, nil
 }
 
 func (f *TCPForwarder) dial(ctx context.Context, rule config.Rule, host string, port uint16) (net.Conn, error) {
