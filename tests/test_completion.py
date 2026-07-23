@@ -32,7 +32,7 @@ def test_completion_scripts_include_all_command_option_groups() -> None:
             "auth-port",
             "close-auth-port",
             "status",
-            "build-debian",
+            "build",
             "force",
             "host-port",
             "guest-port",
@@ -40,6 +40,7 @@ def test_completion_scripts_include_all_command_option_groups() -> None:
             "rootfs-size-mb",
         ):
             assert value in script
+        assert "build-debian" not in script
 
 
 def test_bash_completion_completes_redirection_targets(tmp_path) -> None:

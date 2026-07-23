@@ -417,6 +417,7 @@ def test_start_local_image_happy_path(
     assert isinstance(vm_config, dict)
     assert vm_config["vm_id"] == "vm-from-cli"
     assert vm_config["boot_args"] == "boot args"
+    assert vm_config["comm_channel"] == "ssh"
     assert vm_config["ssh_public_key"] == "ssh-ed25519 public"
     assert vm_config["port_forwards"] == [
         {"host_address": "127.0.0.1", "host_port": 8080, "guest_port": 3000}
@@ -490,8 +491,8 @@ def test_ssh_command_missing_vm_raises_config_error(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(smolvm.facade, "SmolVM", MissingSmolVM)
 
-    with pytest.raises(cli.ConfigError, match="VM 'reviewhero' not found"):
-        guest_setup.ssh_command("reviewhero")
+    with pytest.raises(cli.ConfigError, match="VM 'the-quest' not found"):
+        guest_setup.ssh_command("the-quest")
 
 
 def test_shell_prechecks_missing_managed_vm_before_registering_session(
@@ -500,7 +501,7 @@ def test_shell_prechecks_missing_managed_vm_before_registering_session(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     config = tmp_path / "config.toml"
-    config.write_text('[sbx]\nname = "reviewhero"\nrun_user = "agent"\n', encoding="utf-8")
+    config.write_text('[sbx]\nname = "the-quest"\nrun_user = "agent"\n', encoding="utf-8")
     monkeypatch.setattr(cli, "_get_existing_vm_status", lambda vm_id: None)
 
     def fail_register(vm_id: str, kind: str) -> None:
@@ -512,7 +513,7 @@ def test_shell_prechecks_missing_managed_vm_before_registering_session(
 
     captured = capsys.readouterr()
     assert rc == 1
-    assert "VM 'reviewhero' not found" in captured.err
+    assert "VM 'the-quest' not found" in captured.err
     assert "Traceback" not in captured.err
 
 
@@ -524,7 +525,7 @@ def test_shell_reports_missing_vm_from_smolvm_without_traceback(
     from smolvm.exceptions import VMNotFoundError
 
     config = tmp_path / "config.toml"
-    config.write_text('[sbx]\nname = "reviewhero"\nrun_user = "agent"\n', encoding="utf-8")
+    config.write_text('[sbx]\nname = "the-quest"\nrun_user = "agent"\n', encoding="utf-8")
     monkeypatch.setattr(cli, "_get_existing_vm_status", lambda vm_id: "running")
     monkeypatch.setattr(guest_setup, "host_git_config", lambda project_root=None: None)
     monkeypatch.setattr(cli, "_stop_vm_if_last_session", lambda vm_id, *, stop_on_exit: None)
@@ -540,7 +541,7 @@ def test_shell_reports_missing_vm_from_smolvm_without_traceback(
 
     captured = capsys.readouterr()
     assert rc == 2
-    assert "sbx: VM 'reviewhero' not found" in captured.err
+    assert "sbx: VM 'the-quest' not found" in captured.err
     assert "Traceback" not in captured.err
 
 

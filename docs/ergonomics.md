@@ -57,9 +57,9 @@ Good durable config fields include:
 
 ```toml
 [sbx]
-name = "project-sbx"
+name = "the-quest"
 agent = "pi"
-image = "~/.smolvm/images/debian-sbx"
+image = "~/.smolvm/images/sbx"
 memory = 8192
 cpus = 4
 disk_size = 40960
@@ -100,9 +100,9 @@ an already-created VM may still have an 81920 MiB disk. `sbx run` should reuse t
 
 ```text
 sbx config/state:
-  warning: VM 'project-sbx' already exists and differs from .sbx.toml:
+  warning: VM 'the-quest' already exists and differs from .sbx.toml:
     disk_size: config requests 10240 MiB, existing VM has 81920 MiB
-  Existing VMs are reused as-is. Run `sbx recreate project-sbx --force` to apply config changes.
+  Existing VMs are reused as-is. Run `sbx recreate the-quest --force` to apply config changes.
 ```
 
 When using a local image, `sbx doctor` should also warn if `[sbx].disk_size` is smaller than the local image rootfs. `sbx run` should fail early with the same explanation: set `disk_size` to at least the image rootfs size, remove `disk_size`, or rebuild the configured local image with a smaller rootfs.
@@ -131,15 +131,15 @@ Behavior:
 Example:
 
 ```bash
-sbx run --name reviewhero --image ~/.smolvm/images/debian-sbx --memory 8192 --cpus 4 --disk-size 40960 --project-path . --run-user agent
+sbx run --name the-quest --image ~/.smolvm/images/sbx --memory 8192 --cpus 4 --disk-size 40960 --project-path . --run-user agent
 ```
 
 could create:
 
 ```toml
 [sbx]
-name = "reviewhero"
-image = "~/.smolvm/images/debian-sbx"
+name = "the-quest"
+image = "~/.smolvm/images/sbx"
 memory = 8192
 cpus = 4
 disk_size = 40960
