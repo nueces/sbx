@@ -6,8 +6,8 @@ import sqlite3
 import sys
 import tempfile
 import tomllib
-from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager, suppress
+from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +20,7 @@ from sbx import (
     lifecycle_warnings,
     runtime,
     session_state,
+    smolvm_preset,
     vm_metadata,
     vm_state,
 )
@@ -253,18 +254,6 @@ def _sync_forwarded_env_or_error(vm_id: str, names: list[str]) -> bool:
     return True
 
 
-@contextmanager
-def _patched_environ(env: Mapping[str, str]) -> Iterator[None]:
-    original = dict(os.environ)
-    os.environ.clear()
-    os.environ.update(env)
-    try:
-        yield
-    finally:
-        os.environ.clear()
-        os.environ.update(original)
-
-
 def _validate_cpus(value: Any) -> int:
     cpus = int(value)
     if not 1 <= cpus <= 32:
@@ -378,38 +367,6 @@ def _start_existing_vm_if_needed(vm_id: str, status: str, boot_timeout: float) -
     if rc != 0:
         _maybe_print_boot_timeout_running_hint(vm_id, boot_timeout)
     return rc
-
-
-def _smolvm_error_message(stdout: str, fallback: str) -> str:
-    try:
-        payload = json.loads(stdout)
-        message = payload["error"]["message"]
-    except (KeyError, TypeError, json.JSONDecodeError):
-        return fallback
-    return message if isinstance(message, str) and message else fallback
-
-
-def _print_start_failure(stdout: str) -> None:
-    message = _smolvm_error_message(stdout, "SmolVM failed to start the VM.")
-    print(f"sbx: {message}", file=sys.stderr)
-    if "QEMU exited early" in message:
-        print(
-            "sbx: The VM was created but the backend failed during boot. "
-            "Try `sbx recreate <name> --force`; if it repeats, run `sbx doctor` "
-            "and inspect the SmolVM backend runtime logs.",
-            file=sys.stderr,
-        )
-
-
-def _extract_started_vm_name(stdout: str) -> str:
-    try:
-        payload = json.loads(stdout)
-        name = payload["data"]["vm"]["name"]
-    except (KeyError, TypeError, json.JSONDecodeError) as exc:
-        raise ConfigError("could not read VM name from smolvm JSON output") from exc
-    if not isinstance(name, str) or not name:
-        raise ConfigError("smolvm JSON output did not include a VM name")
-    return name
 
 
 def _stop_vm_if_last_session(vm_id: str, *, stop_on_exit: bool) -> None:
@@ -590,119 +547,6 @@ def _maybe_write_project_config(
         )
 
 
-def _start_preset_with_sdk(
-    *,
-    args: argparse.Namespace,
-    config: Mapping[str, Any],
-    agent: str,
-    cpus: int | None,
-    mounts: Sequence[str],
-    writable_mounts: bool,
-    attach: bool,
-    run_user: str | None,
-    auth_port: bool,
-    auth_host_port: int,
-    auth_guest_port: int,
-    stop_on_exit: bool,
-    cwd: str | None,
-    git_config_text: str | None,
-    copy_host_credentials: bool,
-    forward_env: list[str],
-    json_output: bool,
-    port_forwards: Sequence[str],
-) -> int:
-    from smolvm import SmolVM
-    from smolvm.facade import _build_auto_config
-    from smolvm.presets import apply_preset, get_preset
-    from smolvm.types import PortForwardConfig
-
-    preset_name = "claude-code" if agent == "claude" else agent
-    preset = get_preset(preset_name)
-    memory = _arg_or_config(args, "memory", config, "sbx", default=preset.default_mem_mib)
-    disk_size = _arg_or_config(args, "disk_size", config, "sbx", default=preset.default_disk_mib)
-    requested_name = _arg_or_config(args, "name", config, "sbx")
-    requested_os = _arg_or_config(args, "os", config, "sbx", default="ubuntu")
-    install_timeout = int(_arg_or_config(args, "install_timeout", config, "sbx", default=600))
-    boot_timeout = _validate_boot_timeout(
-        _arg_or_config(args, "boot_timeout", config, "sbx", default=DEFAULT_BOOT_TIMEOUT)
-    )
-
-    def start() -> str:
-        vm = None
-        config_obj, ssh_key_path = _build_auto_config(
-            vm_name=str(requested_name) if requested_name else None,
-            name_prefix=agent,
-            os=str(requested_os),
-            backend=DEFAULT_BACKEND,
-            memory=int(memory),
-            disk_size_mib=int(disk_size),
-            ssh_key_path=None,
-        )
-        updates: dict[str, Any] = {
-            "port_forwards": [
-                PortForwardConfig(**item)
-                for item in network.port_forwards_from_specs(port_forwards)
-            ]
-        }
-        if cpus is not None:
-            updates["vcpu_count"] = cpus
-        config_obj = config_obj.model_copy(update=updates)
-        try:
-            vm = SmolVM(
-                config_obj,
-                ssh_key_path=ssh_key_path,
-                mounts=list(mounts),
-                writable_mounts=writable_mounts,
-            )
-            vm.start(boot_timeout=boot_timeout)
-            vm.wait_for_ssh(timeout=boot_timeout)
-            guest_setup.set_hostname(str(vm.vm_id), run_capture=runtime.run_capture)
-            ssh = vm._ensure_ssh_for_env()
-            apply_preset(ssh, preset, install_timeout=install_timeout)
-            return str(vm.vm_id)
-        finally:
-            if vm is not None:
-                vm.close()
-
-    env = guest_setup.sanitize_forwarded_env(dict(os.environ), forward_env)
-    temp_home_ctx = None
-    if not copy_host_credentials:
-        temp_home_ctx = tempfile.TemporaryDirectory(prefix="sbx-no-credentials-")
-        env = guest_setup.credential_free_env(Path(temp_home_ctx.name), forward_env=forward_env)
-        runtime.debug(f"credential-free HOME: {temp_home_ctx.name}")
-
-    try:
-        with _patched_environ(env):
-            vm_name = start()
-    finally:
-        if temp_home_ctx is not None:
-            temp_home_ctx.cleanup()
-
-    _maybe_write_project_config(args, config, vm_name=vm_name, agent=agent, created=True)
-    vm_metadata.record_vm_project(vm_name, _project_identity(args, config))
-
-    if json_output:
-        print(json.dumps({"vm": {"name": vm_name, "status": "running"}}))
-    elif attach:
-        user_msg = f" as user {run_user}" if run_user is not None else ""
-        print(f"Started '{vm_name}'. Launching {agent}{user_msg}...")
-    else:
-        print(f"Started '{vm_name}'.")
-
-    return _post_start_actions(
-        vm_name=vm_name,
-        command=LAUNCH_COMMANDS[agent],
-        attach=attach,
-        run_user=run_user,
-        auth_port=auth_port,
-        auth_host_port=auth_host_port,
-        auth_guest_port=auth_guest_port,
-        stop_on_exit=stop_on_exit,
-        cwd=cwd,
-        git_config_text=git_config_text,
-    )
-
-
 def _start_local_image(
     *,
     args: argparse.Namespace,
@@ -864,28 +708,24 @@ def cmd_start(args: argparse.Namespace) -> int:
         print(f"sbx: agent must be one of: {', '.join(AGENTS)}", file=sys.stderr)
         return 2
 
-    argv: list[str] = [str(agent), "start"]
     configured_backend = _cfg(config, "sbx", "backend", DEFAULT_BACKEND)
     if configured_backend != DEFAULT_BACKEND:
         print("sbx: other backends are not supported yet", file=sys.stderr)
         return 2
 
-    scalar_options = (
-        ("name", "--name"),
-        ("memory", "--memory"),
-        ("disk_size", "--disk-size"),
-        ("os", "--os"),
-        ("install_timeout", "--install-timeout"),
-    )
-    for attr, flag in scalar_options:
-        value = _arg_or_config(args, attr, config, "sbx")
-        if value is not None:
-            argv += [flag, str(value)]
-    argv += ["--backend", DEFAULT_BACKEND]
+    memory_value = _arg_or_config(args, "memory", config, "sbx")
+    disk_size_value = _arg_or_config(args, "disk_size", config, "sbx")
+    install_timeout_value = _arg_or_config(args, "install_timeout", config, "sbx", default=600)
+    try:
+        memory_mib = int(memory_value) if memory_value is not None else None
+        disk_size_mib = int(disk_size_value) if disk_size_value is not None else None
+        install_timeout = int(install_timeout_value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("memory, disk_size, and install_timeout must be integers") from exc
+    requested_os = str(_arg_or_config(args, "os", config, "sbx", default="ubuntu"))
     boot_timeout = _validate_boot_timeout(
         _arg_or_config(args, "boot_timeout", config, "sbx", default=DEFAULT_BOOT_TIMEOUT)
     )
-    argv += ["--boot-timeout", f"{boot_timeout:g}"]
 
     mounts = (
         args.mount
@@ -897,20 +737,14 @@ def cmd_start(args: argparse.Namespace) -> int:
     project_path = _arg_or_config(args, "project_path", config, "sbx")
     project_guest_cwd = _project_guest_cwd(project_path)
     if project_path is not None:
-        project_mount = _same_path_mount(str(project_path))
-        effective_mounts.append(project_mount)
-        argv += ["--mount", project_mount]
+        effective_mounts.append(_same_path_mount(str(project_path)))
 
     for mount in mounts or []:
-        mount = mount if ":" in mount else _same_path_mount(mount)
-        effective_mounts.append(mount)
-        argv += ["--mount", mount]
+        effective_mounts.append(mount if ":" in mount else _same_path_mount(mount))
 
     writable_mounts = bool(_arg_or_config(args, "writable_mounts", config, "sbx", default=False))
     if project_path is not None:
         writable_mounts = True
-    if writable_mounts:
-        argv.append("--writable-mounts")
 
     attach = True if args.attach is None else bool(args.attach)
     run_user = _arg_or_config(args, "run_user", config, "sbx")
@@ -939,7 +773,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     cpus = _validate_cpus(cpus_value) if cpus_value is not None else None
     try:
         port_forwards = _list_value(sbx_cfg.get("port_forwards"), key="[sbx].port_forwards")
-        network.port_forwards_from_specs(port_forwards)
+        parsed_port_forwards = network.port_forwards_from_specs(port_forwards)
     except ConfigError as exc:
         print(f"sbx: {exc}", file=sys.stderr)
         return 2
@@ -1026,112 +860,64 @@ def cmd_start(args: argparse.Namespace) -> int:
             print(f"sbx: failed to start image: {exc}", file=sys.stderr)
             return 1
 
-    if cpus is not None or port_forwards:
-        try:
-            return _start_preset_with_sdk(
-                args=args,
-                config=config,
-                agent=str(agent),
-                cpus=cpus,
-                mounts=effective_mounts,
-                writable_mounts=writable_mounts,
-                attach=attach,
-                run_user=str(run_user) if run_user is not None else None,
-                auth_port=auth_port,
-                auth_host_port=auth_host_port,
-                auth_guest_port=auth_guest_port,
-                stop_on_exit=stop_on_exit,
-                cwd=project_guest_cwd,
-                git_config_text=git_config_text,
-                copy_host_credentials=copy_host_credentials,
-                forward_env=forward_env,
-                json_output=bool(args.json),
-                port_forwards=port_forwards,
-            )
-        except ConfigError as exc:
-            print(f"sbx: {exc}", file=sys.stderr)
-            return 2
-        except Exception as exc:  # noqa: BLE001 - keep CLI errors user-friendly.
-            if _maybe_print_boot_timeout_running_hint(
-                str(requested_name) if requested_name else None, boot_timeout
-            ):
-                return 1
-            print(f"sbx: failed to start preset with cpus={cpus}: {exc}", file=sys.stderr)
-            return 1
-
-    managed_start = auth_port or (
-        attach
-        and (run_user is not None or project_guest_cwd is not None or git_config_text is not None)
-    )
-    argv.append("--no-attach" if managed_start or not attach else "--attach")
-
-    json_output = bool(args.json)
-    if json_output or managed_start:
-        argv.append("--json")
-
     temp_home_ctx = None
-    smolvm_env = guest_setup.sanitize_forwarded_env(dict(os.environ), forward_env)
+    host_env = guest_setup.sanitize_forwarded_env(dict(os.environ), forward_env)
     if not copy_host_credentials:
         temp_home_ctx = tempfile.TemporaryDirectory(prefix="sbx-no-credentials-")
-        smolvm_env = guest_setup.credential_free_env(
+        host_env = guest_setup.credential_free_env(
             Path(temp_home_ctx.name), forward_env=forward_env
         )
         runtime.debug(f"credential-free HOME: {temp_home_ctx.name}")
 
-    if not managed_start:
-        try:
-            rc = runtime.run_smolvm(argv, env=smolvm_env)
-            if rc == 0 and requested_name:
-                guest_setup.set_hostname(str(requested_name), run_capture=runtime.run_capture)
-                _maybe_write_project_config(
-                    args, config, vm_name=str(requested_name), agent=str(agent), created=True
-                )
-                vm_metadata.record_vm_project(str(requested_name), project_identity)
-            return rc
-        finally:
-            if temp_home_ctx is not None:
-                temp_home_ctx.cleanup()
-
-    completed = runtime.run_smolvm_capture(argv, env=smolvm_env)
-    if temp_home_ctx is not None:
-        temp_home_ctx.cleanup()
-    if completed is None:
-        return 127
-    if completed.stderr:
-        print(completed.stderr, end="", file=sys.stderr)
-    if completed.returncode != 0:
-        if json_output and completed.stdout:
-            print(completed.stdout, end="")
-        elif completed.stdout:
-            _print_start_failure(completed.stdout)
-        _maybe_print_boot_timeout_running_hint(
-            str(requested_name) if requested_name else None, boot_timeout
+    vm = None
+    try:
+        vm = smolvm_preset.create_preset(
+            str(agent),
+            vm_name=str(requested_name) if requested_name else None,
+            guest_os=requested_os,
+            cpus=cpus,
+            memory_mib=memory_mib,
+            disk_size_mib=disk_size_mib,
+            mounts=effective_mounts,
+            writable_mounts=writable_mounts,
+            port_forwards=parsed_port_forwards,
+            boot_timeout=boot_timeout,
+            install_timeout=install_timeout,
+            host_env=host_env,
         )
-        return completed.returncode
+        vm_name = str(vm.vm_id)
+        guest_setup.set_hostname(vm_name, run_capture=runtime.run_capture)
+    except Exception as exc:  # noqa: BLE001 - keep CLI errors user-friendly.
+        if _maybe_print_boot_timeout_running_hint(
+            str(requested_name) if requested_name else None, boot_timeout
+        ):
+            return 1
+        print(f"sbx: failed to create preset {str(agent)!r}: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if vm is not None:
+            with suppress(Exception):
+                vm.close()
+        if temp_home_ctx is not None:
+            temp_home_ctx.cleanup()
 
-    vm_name = _extract_started_vm_name(completed.stdout)
-    guest_setup.set_hostname(vm_name, run_capture=runtime.run_capture)
     _maybe_write_project_config(args, config, vm_name=vm_name, agent=str(agent), created=True)
     vm_metadata.record_vm_project(vm_name, project_identity)
-    if auth_port:
-        port_rc = network.expose_auth_port(vm_name, auth_host_port, auth_guest_port)
-        if port_rc != 0:
-            return port_rc
 
-    if json_output:
-        print(completed.stdout, end="")
+    if args.json:
+        print(json.dumps({"vm": {"name": vm_name, "status": "running"}}))
     elif attach:
         user_msg = f" as user {run_user}" if run_user is not None else ""
         print(f"Started '{vm_name}'. Launching {agent}{user_msg}...")
     else:
-        print(f"Started '{vm_name}'. Auth callback port: localhost:{auth_host_port}")
+        print(f"Started '{vm_name}'.")
 
     return _post_start_actions(
         vm_name=vm_name,
         command=LAUNCH_COMMANDS[str(agent)],
         attach=attach,
         run_user=str(run_user) if run_user is not None else None,
-        auth_port=False,
+        auth_port=auth_port,
         auth_host_port=auth_host_port,
         auth_guest_port=auth_guest_port,
         stop_on_exit=stop_on_exit,
@@ -1615,33 +1401,13 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _normalize_argv(argv: Sequence[str]) -> list[str]:
-    """Normalize `sbx run NAME --flag` to `sbx run --name NAME --flag`."""
-    normalized = list(argv)
-    for command in ("run", "create", "recreate"):
-        if command not in normalized:
-            continue
-        command_index = normalized.index(command)
-        name_index = command_index + 1
-        if name_index >= len(normalized):
-            return normalized
-        candidate = normalized[name_index]
-        if candidate != "--" and not candidate.startswith("-"):
-            normalized.insert(name_index, "--name")
-        return normalized
-    return normalized
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
-    normalized_argv = _normalize_argv(raw_argv)
     parser = build_parser()
-    args = parser.parse_args(normalized_argv)
+    args = parser.parse_args(raw_argv)
     runtime.DEBUG = bool(args.debug)
     runtime.debug(f"argv: {raw_argv}")
-    if normalized_argv != raw_argv:
-        runtime.debug(f"normalized argv: {normalized_argv}")
     if args.action in {"completion", "image"}:
         args.config_data = {}
     else:

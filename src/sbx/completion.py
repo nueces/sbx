@@ -81,8 +81,6 @@ IMAGE_BUILD_DEBIAN_OPTIONS = (
     "--cache-dir",
     "--kernel-url",
     "--json",
-    "--sdk-sketch",
-    "--print-sdk-sketch",
     "--help",
 )
 IMAGE_LS_OPTIONS = ("--json", "--help")

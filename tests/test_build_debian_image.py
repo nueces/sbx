@@ -77,7 +77,7 @@ def test_packaged_pi_containerfile_uses_npm_global_install() -> None:
     assert 'export PATH="$HOME/.local/bin:$HOME/.nodejs/bin:$PATH"' in content
 
 
-def test_build_debian_image_omits_sdk_sketch_by_default(
+def test_build_debian_image_prints_summary(
     fake_smolvm_images: None,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -94,132 +94,8 @@ def test_build_debian_image_omits_sdk_sketch_by_default(
     assert "sbx config:" in out
     assert "disk_size" not in out
     assert "run_user = 'agent'" in out
-    assert "SDK usage sketch:" not in out
-    assert "from smolvm import SmolVM" not in out
     manifest = json.loads((tmp_path / "image" / "smolvm-image.json").read_text())
     assert manifest["sbx"]["features"] == []
-
-
-def test_build_debian_image_prints_sdk_sketch_when_requested(
-    fake_smolvm_images: None,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    module = _load_module()
-    key = tmp_path / "id_ed25519.pub"
-    key.write_text("ssh-ed25519 fake", encoding="utf-8")
-
-    rc = module.main(["--ssh-public-key", str(key), "--name", "image", "--sdk-sketch"])
-
-    assert rc == 0
-    out = capsys.readouterr().out
-    assert "SDK usage sketch:" in out
-    assert "from smolvm import SmolVM, VMConfig" in out
-
-
-def test_build_debian_image_prints_sdk_sketch_for_existing_image_without_rebuild(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    module = _load_module()
-    image = tmp_path / "image"
-    image.mkdir()
-    (image / "smolvm-image.json").write_text(
-        '{"kernel":"vmlinux.bin","rootfs":"rootfs.ext4","boot_args":"boot args"}',
-        encoding="utf-8",
-    )
-
-    rc = module.main(["--print-sdk-sketch", str(image)])
-
-    assert rc == 0
-    out = capsys.readouterr().out
-    assert "SDK usage sketch:" in out
-    assert f"kernel_path=Path('{image / 'vmlinux.bin'}')" in out
-    assert f"rootfs_path=Path('{image / 'rootfs.ext4'}')" in out
-    assert "boot_args='boot args'" in out
-
-
-def test_print_sdk_sketch_reports_missing_manifest(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    module = _load_module()
-    image = tmp_path / "image"
-    image.mkdir()
-
-    rc = module.main(["--print-sdk-sketch", str(image)])
-
-    assert rc == 2
-    assert "manifest not found" in capsys.readouterr().err
-
-
-def test_print_sdk_sketch_reports_invalid_manifest_json(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    module = _load_module()
-    image = tmp_path / "image"
-    image.mkdir()
-    (image / "smolvm-image.json").write_text("not json", encoding="utf-8")
-
-    rc = module.main(["--print-sdk-sketch", str(image)])
-
-    assert rc == 2
-    assert "invalid image manifest" in capsys.readouterr().err
-
-
-def test_print_sdk_sketch_rejects_non_string_manifest_paths(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    module = _load_module()
-    image = tmp_path / "image"
-    image.mkdir()
-    (image / "smolvm-image.json").write_text(
-        '{"kernel":123,"rootfs":"rootfs.ext4"}',
-        encoding="utf-8",
-    )
-
-    rc = module.main(["--print-sdk-sketch", str(image)])
-
-    assert rc == 2
-    assert "kernel and rootfs must be strings" in capsys.readouterr().err
-
-
-def test_print_sdk_sketch_rejects_non_string_boot_args(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    module = _load_module()
-    image = tmp_path / "image"
-    image.mkdir()
-    (image / "smolvm-image.json").write_text(
-        '{"kernel":"vmlinux.bin","rootfs":"rootfs.ext4","boot_args":123}',
-        encoding="utf-8",
-    )
-
-    rc = module.main(["--print-sdk-sketch", str(image)])
-
-    assert rc == 2
-    assert "boot_args must be a string" in capsys.readouterr().err
-
-
-def test_print_sdk_sketch_uses_default_boot_args(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    module = _load_module()
-    image = tmp_path / "image"
-    image.mkdir()
-    (image / "smolvm-image.json").write_text(
-        '{"kernel":"vmlinux.bin","rootfs":"rootfs.ext4"}',
-        encoding="utf-8",
-    )
-
-    rc = module.main(["--print-sdk-sketch", str(image)])
-
-    assert rc == 0
-    assert "console=ttyS0 reboot=k panic=1" in capsys.readouterr().out
 
 
 def test_build_debian_image_missing_ssh_key_returns_2(
@@ -258,22 +134,6 @@ def test_build_debian_image_rejects_with_docker_and_custom_containerfile(
 
     assert rc == 2
     assert "cannot be combined" in capsys.readouterr().err
-
-
-def test_build_debian_image_import_error_returns_127(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    module = _load_module()
-    key = tmp_path / "id_ed25519.pub"
-    key.write_text("ssh-ed25519 fake", encoding="utf-8")
-    monkeypatch.setitem(sys.modules, "smolvm.images.builder", None)
-
-    rc = module.main(["--ssh-public-key", str(key)])
-
-    assert rc == 127
-    assert "smolvm is not installed" in capsys.readouterr().err
 
 
 def test_build_debian_image_json_output(

@@ -122,13 +122,9 @@ Estimated difficulty: medium.
 
 `sbx` could construct `WorkspaceMount` objects directly and use SmolVM's Python API for all normal starts.
 
-This would allow per-mount control without changing SmolVM CLI, but it is more invasive for `sbx` because the normal code path currently shells out to preset commands such as:
+Preset-backed VM creation now goes through sbx's SmolVM SDK compatibility module, so this option no longer requires replacing a preset CLI subprocess. It still requires sbx to model per-mount writability and pass `WorkspaceMount` objects into that creation boundary.
 
-```bash
-smolvm pi start ...
-```
-
-Estimated difficulty: medium/high compared to extending SmolVM CLI.
+Estimated difficulty: medium compared to extending SmolVM CLI.
 
 ## Suggested future `sbx` interface
 

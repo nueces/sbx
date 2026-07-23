@@ -84,13 +84,7 @@ Or pass a fully composed Containerfile directly:
 sbx image build-debian --containerfile path/to/Containerfile
 ```
 
-By default the subcommand prints only the built image paths and a minimal `sbx` config snippet. To also print a SmolVM SDK usage sketch after building, pass `--sdk-sketch`.
-
-To print the SDK sketch later without rebuilding the image, run:
-
-```bash
-sbx image build-debian --print-sdk-sketch ~/.smolvm/images/debian-sbx
-```
+The subcommand prints the built image paths and a minimal `sbx` config snippet.
 
 The subcommand also writes a local image manifest:
 

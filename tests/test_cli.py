@@ -22,6 +22,14 @@ def isolated_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(guest_setup, "host_git_config", lambda project_root=None: None)
     monkeypatch.setattr(guest_setup, "set_hostname", lambda *args, **kwargs: None)
     monkeypatch.setattr(guest_setup, "sync_guest_clock", lambda *args, **kwargs: None)
+    monkeypatch.setattr(guest_setup, "attach", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        cli.smolvm_preset,
+        "create_preset",
+        lambda preset_name, **kwargs: SimpleNamespace(
+            vm_id=kwargs.get("vm_name") or f"{preset_name}-sbx", close=lambda: None
+        ),
+    )
 
 
 def install_fake_smolvm(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
@@ -39,6 +47,22 @@ def print_smolvm_args(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         cli.runtime, "run_smolvm", lambda args, **kwargs: print(" ".join(args)) or 0
     )
+
+
+def capture_preset(
+    monkeypatch: pytest.MonkeyPatch,
+    captured: dict[str, object],
+    *,
+    vm_id: str = "vm1",
+) -> None:
+    def fake_create(preset_name: str, **kwargs: object) -> SimpleNamespace:
+        captured["preset"] = (preset_name, kwargs)
+        return SimpleNamespace(
+            vm_id=vm_id,
+            close=lambda: captured.setdefault("preset_closed", True),
+        )
+
+    monkeypatch.setattr(cli.smolvm_preset, "create_preset", fake_create)
 
 
 def test_smolvm_runner_does_not_need_console_script_on_path() -> None:
@@ -443,13 +467,18 @@ mount = [".:/workspace"]
         encoding="utf-8",
     )
     monkeypatch.setattr(cli, "LOCAL_CONFIG_PATHS", (local_config,))
+    monkeypatch.setattr(cli, "_post_start_actions", lambda **kwargs: 0)
+    captured: dict[str, object] = {}
+    capture_preset(monkeypatch, captured, vm_id="demo")
 
     rc = cli.main(["run", "--no-auth-port"])
 
     assert rc == 0
-    assert capfd.readouterr().out == (
-        "codex start --name demo --backend qemu --boot-timeout 60 --mount .:/workspace --attach\n"
-    )
+    preset_name, preset_kwargs = captured["preset"]
+    assert preset_name == "codex"
+    assert preset_kwargs["vm_name"] == "demo"
+    assert preset_kwargs["mounts"] == [".:/workspace"]
+    assert capfd.readouterr().out == "Started 'demo'. Launching codex...\n"
 
 
 def test_run_supports_all_exposed_options_from_config(
@@ -471,6 +500,7 @@ agent = "codex"
 name = "configured"
 memory = 8192
 disk_size = 32768
+cpus = 4
 backend = "qemu"
 os = "ubuntu"
 mount = ["{extra_mount}", ".:/workspace"]
@@ -478,45 +508,36 @@ project_path = "{project}"
 writable_mounts = false
 install_timeout = 900
 boot_timeout = 75
+port_forwards = ["8080:80"]
 """.strip(),
         encoding="utf-8",
     )
 
+    captured: dict[str, object] = {}
+    capture_preset(monkeypatch, captured, vm_id="configured")
+
     rc = cli.main(["--config", str(config), "run", "--no-auth-port", "--no-attach"])
 
     assert rc == 0
-    assert capfd.readouterr().out == (
-        "codex start --name configured --memory 8192 --disk-size 32768 "
-        "--os ubuntu --install-timeout 900 --backend qemu --boot-timeout 75 "
-        f"--mount {project}:{project} "
-        f"--mount {extra_mount}:{extra_mount} "
-        "--mount .:/workspace --writable-mounts --no-attach\n"
-    )
-
-
-def test_run_with_cpus_uses_sdk_start_path(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    install_fake_smolvm(monkeypatch, tmp_path)
-    config = tmp_path / "config.toml"
-    config.write_text(
-        '[sbx]\nagent = "pi"\ncpus = 4\nauth_port = false\ngit_config = false\n',
-        encoding="utf-8",
-    )
-    captured: dict[str, object] = {}
-
-    def fake_start_preset_with_sdk(**kwargs: object) -> int:
-        captured.update(kwargs)
-        return 0
-
-    monkeypatch.setattr(cli, "_start_preset_with_sdk", fake_start_preset_with_sdk)
-
-    rc = cli.main(["--config", str(config), "run", "--no-attach"])
-
-    assert rc == 0
-    assert captured["agent"] == "pi"
-    assert captured["cpus"] == 4
+    preset_name, preset_kwargs = captured["preset"]
+    assert preset_name == "codex"
+    assert preset_kwargs["vm_name"] == "configured"
+    assert preset_kwargs["memory_mib"] == 8192
+    assert preset_kwargs["disk_size_mib"] == 32768
+    assert preset_kwargs["cpus"] == 4
+    assert preset_kwargs["guest_os"] == "ubuntu"
+    assert preset_kwargs["install_timeout"] == 900
+    assert preset_kwargs["boot_timeout"] == 75
+    assert preset_kwargs["mounts"] == [
+        f"{project}:{project}",
+        f"{extra_mount}:{extra_mount}",
+        ".:/workspace",
+    ]
+    assert preset_kwargs["writable_mounts"] is True
+    assert preset_kwargs["port_forwards"] == [
+        {"host_address": "127.0.0.1", "host_port": 8080, "guest_port": 80}
+    ]
+    assert capfd.readouterr().out == "Started 'configured'.\n"
 
 
 def test_run_uses_local_image_directory(
@@ -550,6 +571,13 @@ mount = [".:/workspace"]
         return 0
 
     monkeypatch.setattr(cli, "_start_local_image", fake_start_local_image)
+    monkeypatch.setattr(
+        cli.smolvm_preset,
+        "create_preset",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("local images must not install presets")
+        ),
+    )
 
     rc = cli.main(["--config", str(config), "run", "--no-auth-port"])
 
@@ -560,28 +588,14 @@ mount = [".:/workspace"]
     assert captured["attach"] is True
 
 
-def test_run_user_from_config_starts_without_smolvm_attach_then_attaches_as_user(
+def test_run_user_from_config_starts_then_attaches_as_user(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capfd: pytest.CaptureFixture[str],
 ) -> None:
     install_fake_smolvm(monkeypatch, tmp_path)
     captured: dict[str, object] = {}
-
-    def fake_run_capture(
-        argv: list[str], *, env: dict[str, str] | None = None
-    ) -> subprocess.CompletedProcess[str]:
-        captured["argv"] = argv
-        captured["env"] = env
-        return subprocess.CompletedProcess(
-            argv,
-            0,
-            stdout=(
-                '{"ok": true, "data": {"vm": {"name": "vm1"}}, '
-                '"command": "start", "exit_code": 0, "error": null}\n'
-            ),
-            stderr="",
-        )
+    capture_preset(monkeypatch, captured)
 
     def fake_prepare(vm_id: str, user: str, **kwargs: object) -> None:
         captured["prepare"] = (vm_id, user)
@@ -590,33 +604,16 @@ def test_run_user_from_config_starts_without_smolvm_attach_then_attaches_as_user
         captured["attach"] = (vm_id, kwargs.get("user"), launch_command, kwargs.get("cwd"))
         return 0
 
-    monkeypatch.setattr(cli.runtime, "run_capture", fake_run_capture)
     monkeypatch.setattr(cli.network, "expose_auth_port", lambda vm_id, host_port, guest_port: 0)
     monkeypatch.setattr(guest_setup, "prepare_run_user", fake_prepare)
     monkeypatch.setattr(guest_setup, "attach", fake_attach)
     config = tmp_path / "config.toml"
-    config.write_text(
-        """
-[sbx]
-run_user = "agent"
-""".strip(),
-        encoding="utf-8",
-    )
+    config.write_text('[sbx]\nrun_user = "agent"\n', encoding="utf-8")
 
     rc = cli.main(["--config", str(config), "run"])
 
     assert rc == 0
-    assert captured["argv"] == [
-        "smolvm",
-        "pi",
-        "start",
-        "--backend",
-        "qemu",
-        "--boot-timeout",
-        "60",
-        "--no-attach",
-        "--json",
-    ]
+    assert captured["preset_closed"] is True
     assert captured["prepare"] == ("vm1", "agent")
     assert captured["attach"] == ("vm1", "agent", "pi", None)
     assert capfd.readouterr().out == (
@@ -672,17 +669,7 @@ def test_git_config_defaults_on_for_managed_run(
     )
     monkeypatch.setattr(guest_setup, "attach", lambda *args, **kwargs: 0)
 
-    def fake_run_capture(
-        argv: list[str], *, env: dict[str, str] | None = None
-    ) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(
-            argv,
-            0,
-            stdout='{ "ok": true, "data": {"vm": {"name": "vm1"}} }\n',
-            stderr="",
-        )
-
-    monkeypatch.setattr(cli.runtime, "run_capture", fake_run_capture)
+    capture_preset(monkeypatch, captured)
 
     assert cli.main(["run"]) == 0
     assert captured["git"] == ("vm1", None, "[user]\n\tname = Test\n")
@@ -705,17 +692,7 @@ def test_no_git_config_disables_forwarding(
     )
     monkeypatch.setattr(guest_setup, "attach", lambda *args, **kwargs: 0)
 
-    def fake_run_capture(
-        argv: list[str], *, env: dict[str, str] | None = None
-    ) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(
-            argv,
-            0,
-            stdout='{ "ok": true, "data": {"vm": {"name": "vm1"}} }\n',
-            stderr="",
-        )
-
-    monkeypatch.setattr(cli.runtime, "run_capture", fake_run_capture)
+    capture_preset(monkeypatch, captured)
 
     assert cli.main(["run", "--no-git-config"]) == 0
     assert captured["git"] == ("vm1", None, None)
@@ -748,32 +725,18 @@ def test_run_does_not_copy_host_credentials_by_default(
         captured["temp_home"] = temp_home
         return {"HOME": str(temp_home), "SBX_TEST": "credential-free"}
 
-    def fake_run(argv: list[str], *, check: bool = False, env: dict[str, str] | None = None) -> int:
-        captured["argv"] = argv
-        captured["env"] = env
-        return 0
-
     monkeypatch.setattr(guest_setup, "credential_free_env", fake_credential_free_env)
-    monkeypatch.setattr(cli.runtime, "run", fake_run)
+    capture_preset(monkeypatch, captured, vm_id="pi-sbx")
 
     rc = cli.main(["run", "--no-attach", "--no-auth-port"])
 
     assert rc == 0
-    assert captured["argv"] == [
-        "smolvm",
-        "pi",
-        "start",
-        "--backend",
-        "qemu",
-        "--boot-timeout",
-        "60",
-        "--no-attach",
-    ]
-    assert captured["env"] == {
+    _, preset_kwargs = captured["preset"]
+    assert preset_kwargs["host_env"] == {
         "HOME": str(captured["temp_home"]),
         "SBX_TEST": "credential-free",
-        "SMOLVM_DISABLE_VERSION_CHECK": "1",
     }
+    assert not Path(captured["temp_home"]).exists()
 
 
 def test_env_vars_are_not_forwarded_by_default_with_host_credentials(
@@ -784,17 +747,13 @@ def test_env_vars_are_not_forwarded_by_default_with_host_credentials(
     monkeypatch.setenv("OPENAI_API_KEY", "secret")
     captured: dict[str, object] = {}
 
-    def fake_run(argv: list[str], *, check: bool = False, env: dict[str, str] | None = None) -> int:
-        captured["env"] = env
-        return 0
-
-    monkeypatch.setattr(cli.runtime, "run", fake_run)
+    capture_preset(monkeypatch, captured, vm_id="pi-sbx")
 
     rc = cli.main(["run", "--no-attach", "--copy-host-credentials", "--no-auth-port"])
 
     assert rc == 0
-    assert captured["env"] is not None
-    assert "OPENAI_API_KEY" not in captured["env"]
+    _, preset_kwargs = captured["preset"]
+    assert "OPENAI_API_KEY" not in preset_kwargs["host_env"]
 
 
 def test_env_flag_explicitly_forwards_selected_env_var(
@@ -805,11 +764,7 @@ def test_env_flag_explicitly_forwards_selected_env_var(
     monkeypatch.setenv("OPENAI_API_KEY", "secret")
     captured: dict[str, object] = {}
 
-    def fake_run(argv: list[str], *, check: bool = False, env: dict[str, str] | None = None) -> int:
-        captured["env"] = env
-        return 0
-
-    monkeypatch.setattr(cli.runtime, "run", fake_run)
+    capture_preset(monkeypatch, captured, vm_id="pi-sbx")
 
     rc = cli.main(
         [
@@ -823,7 +778,8 @@ def test_env_flag_explicitly_forwards_selected_env_var(
     )
 
     assert rc == 0
-    assert captured["env"]["OPENAI_API_KEY"] == "secret"
+    _, preset_kwargs = captured["preset"]
+    assert preset_kwargs["host_env"]["OPENAI_API_KEY"] == "secret"
 
 
 def test_copy_host_credentials_flag_uses_current_environment(
@@ -836,28 +792,14 @@ def test_copy_host_credentials_flag_uses_current_environment(
     def fail_credential_free_env(temp_home: Path, *, forward_env: list[str]) -> dict[str, str]:
         raise AssertionError("credential-free env should not be created")
 
-    def fake_run(argv: list[str], *, check: bool = False, env: dict[str, str] | None = None) -> int:
-        captured["argv"] = argv
-        captured["env"] = env
-        return 0
-
     monkeypatch.setattr(guest_setup, "credential_free_env", fail_credential_free_env)
-    monkeypatch.setattr(cli.runtime, "run", fake_run)
+    capture_preset(monkeypatch, captured, vm_id="pi-sbx")
 
     rc = cli.main(["run", "--no-attach", "--copy-host-credentials", "--no-auth-port"])
 
     assert rc == 0
-    assert captured["argv"] == [
-        "smolvm",
-        "pi",
-        "start",
-        "--backend",
-        "qemu",
-        "--boot-timeout",
-        "60",
-        "--no-attach",
-    ]
-    assert captured["env"] is not None
+    _, preset_kwargs = captured["preset"]
+    assert preset_kwargs["host_env"]["HOME"] == os.environ["HOME"]
 
 
 def test_destroy_deletes_vm(
@@ -1003,26 +945,12 @@ def test_run_with_project_path_attaches_from_mounted_project_cwd(
     project = tmp_path / "project"
     project.mkdir()
     captured: dict[str, object] = {}
-
-    def fake_run_capture(
-        argv: list[str], *, env: dict[str, str] | None = None
-    ) -> subprocess.CompletedProcess[str]:
-        captured["argv"] = argv
-        return subprocess.CompletedProcess(
-            argv,
-            0,
-            stdout=(
-                '{"ok": true, "data": {"vm": {"name": "vm1"}}, '
-                '"command": "start", "exit_code": 0, "error": null}\n'
-            ),
-            stderr="",
-        )
+    capture_preset(monkeypatch, captured)
 
     def fake_attach(vm_id: str, launch_command: str, **kwargs: object) -> int:
         captured["attach"] = (vm_id, launch_command, kwargs.get("cwd"))
         return 0
 
-    monkeypatch.setattr(cli.runtime, "run_capture", fake_run_capture)
     monkeypatch.setattr(guest_setup, "attach", fake_attach)
 
     rc = cli.main(
@@ -1036,20 +964,9 @@ def test_run_with_project_path_attaches_from_mounted_project_cwd(
     )
 
     assert rc == 0
-    assert captured["argv"] == [
-        "smolvm",
-        "pi",
-        "start",
-        "--backend",
-        "qemu",
-        "--boot-timeout",
-        "60",
-        "--mount",
-        f"{project}:{project}",
-        "--writable-mounts",
-        "--no-attach",
-        "--json",
-    ]
+    _, preset_kwargs = captured["preset"]
+    assert preset_kwargs["mounts"] == [f"{project}:{project}"]
+    assert preset_kwargs["writable_mounts"] is True
     assert captured["attach"] == ("vm1", "pi", str(project))
 
 
@@ -1059,20 +976,7 @@ def test_run_exposes_auth_port_by_default_before_attach(
 ) -> None:
     install_fake_smolvm(monkeypatch, tmp_path)
     captured: dict[str, object] = {}
-
-    def fake_run_capture(
-        argv: list[str], *, env: dict[str, str] | None = None
-    ) -> subprocess.CompletedProcess[str]:
-        captured["argv"] = argv
-        return subprocess.CompletedProcess(
-            argv,
-            0,
-            stdout=(
-                '{"ok": true, "data": {"vm": {"name": "vm1"}}, '
-                '"command": "start", "exit_code": 0, "error": null}\n'
-            ),
-            stderr="",
-        )
+    capture_preset(monkeypatch, captured)
 
     def fake_expose(vm_id: str, host_port: int, guest_port: int) -> int:
         captured["expose"] = (vm_id, host_port, guest_port)
@@ -1082,24 +986,11 @@ def test_run_exposes_auth_port_by_default_before_attach(
         captured["attach"] = (vm_id, launch_command, kwargs.get("cwd"))
         return 0
 
-    monkeypatch.setattr(cli.runtime, "run_capture", fake_run_capture)
     monkeypatch.setattr(cli.network, "expose_auth_port", fake_expose)
     monkeypatch.setattr(guest_setup, "attach", fake_attach)
 
-    rc = cli.main(["run", "--copy-host-credentials"])
-
-    assert rc == 0
-    assert captured["argv"] == [
-        "smolvm",
-        "pi",
-        "start",
-        "--backend",
-        "qemu",
-        "--boot-timeout",
-        "60",
-        "--no-attach",
-        "--json",
-    ]
+    assert cli.main(["run", "--copy-host-credentials"]) == 0
+    assert captured["preset_closed"] is True
     assert captured["expose"] == ("vm1", 1455, 1455)
     assert captured["attach"] == ("vm1", "pi", None)
 
@@ -1131,6 +1022,13 @@ def test_run_existing_vm_starts_without_creating(
 
     monkeypatch.setattr(cli.runtime, "run_capture", fake_run_capture)
     monkeypatch.setattr(cli.runtime, "run", fake_run)
+    monkeypatch.setattr(
+        cli.smolvm_preset,
+        "create_preset",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("existing VMs must not install presets")
+        ),
+    )
     monkeypatch.setattr(guest_setup, "sync_guest_clock", lambda vm_id, **kwargs: None)
     monkeypatch.setattr(cli.network, "expose_auth_port", lambda vm_id, host_port, guest_port: 0)
     monkeypatch.setattr(guest_setup, "attach", lambda *args, **kwargs: 0)
@@ -1180,77 +1078,49 @@ def test_failed_managed_run_hides_json_and_prints_hint(
 ) -> None:
     install_fake_smolvm(monkeypatch, tmp_path)
 
-    def fake_run_capture(
-        argv: list[str], *, env: dict[str, str] | None = None
-    ) -> subprocess.CompletedProcess[str]:
-        if argv[:2] == ["smolvm", "sandbox", "info"]:
-            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="not found")
-        return subprocess.CompletedProcess(
-            argv,
-            1,
-            stdout=(
-                '{"ok": false, "error": {"message": '
-                "\"QEMU exited early while booting VM '999714'\"}}\n"
-            ),
-            stderr="",
-        )
-
-    monkeypatch.setattr(cli.runtime, "run_capture", fake_run_capture)
+    monkeypatch.setattr(
+        cli.smolvm_preset,
+        "create_preset",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("QEMU exited early while booting VM 'vm1'")
+        ),
+    )
 
     rc = cli.main(["run", "--name", "vm1"])
 
     output = capsys.readouterr()
     assert rc == 1
     assert output.out == ""
+    assert "failed to create preset 'pi'" in output.err
     assert "QEMU exited early" in output.err
-    assert "sbx recreate <name> --force" in output.err
 
 
-def test_run_positional_name_before_options_does_not_pass_sbx_flags_to_smolvm(
+@pytest.mark.parametrize(
+    ("error", "expected_rc"),
+    [(RuntimeError("failed"), 1), (KeyboardInterrupt(), 130)],
+)
+def test_preset_failure_cleans_temporary_home(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    error: BaseException,
+    expected_rc: int,
 ) -> None:
     install_fake_smolvm(monkeypatch, tmp_path)
-    captured: dict[str, object] = {}
+    captured: dict[str, Path] = {}
 
-    def fake_run_capture(
-        argv: list[str], *, env: dict[str, str] | None = None
-    ) -> subprocess.CompletedProcess[str]:
-        if argv[:2] == ["smolvm", "sandbox", "info"]:
-            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="not found")
-        captured["create"] = argv
-        return subprocess.CompletedProcess(
-            argv,
-            0,
-            stdout=(
-                '{"ok": true, "data": {"vm": {"name": "pi-sbx"}}, '
-                '"command": "start", "exit_code": 0, "error": null}\n'
-            ),
-            stderr="",
-        )
+    def fake_credential_free_env(temp_home: Path, *, forward_env: list[str]) -> dict[str, str]:
+        captured["temp_home"] = temp_home
+        return {"HOME": str(temp_home)}
 
-    def fake_run(argv: list[str], *, check: bool = False, env: dict[str, str] | None = None) -> int:
-        captured["create"] = argv
-        return 0
+    monkeypatch.setattr(guest_setup, "credential_free_env", fake_credential_free_env)
+    monkeypatch.setattr(
+        cli.smolvm_preset,
+        "create_preset",
+        lambda *args, **kwargs: (_ for _ in ()).throw(error),
+    )
 
-    monkeypatch.setattr(cli.runtime, "run_capture", fake_run_capture)
-    monkeypatch.setattr(cli.runtime, "run", fake_run)
-
-    rc = cli.main(["run", "pi-sbx", "--no-auth-port", "--no-attach"])
-
-    assert rc == 0
-    assert captured["create"] == [
-        "smolvm",
-        "pi",
-        "start",
-        "--name",
-        "pi-sbx",
-        "--backend",
-        "qemu",
-        "--boot-timeout",
-        "60",
-        "--no-attach",
-    ]
+    assert cli.main(["create", "vm1", "--no-auth-port"]) == expected_rc
+    assert not captured["temp_home"].exists()
 
 
 def test_run_positional_name_creates_missing_vm(
@@ -1259,43 +1129,14 @@ def test_run_positional_name_creates_missing_vm(
 ) -> None:
     install_fake_smolvm(monkeypatch, tmp_path)
     captured: dict[str, object] = {}
+    capture_preset(monkeypatch, captured, vm_id="pi-sbx")
+    monkeypatch.setattr(cli.network, "expose_auth_port", lambda *args: 0)
 
-    def fake_run_capture(
-        argv: list[str], *, env: dict[str, str] | None = None
-    ) -> subprocess.CompletedProcess[str]:
-        if argv[:2] == ["smolvm", "sandbox", "info"]:
-            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="not found")
-        captured["create"] = argv
-        return subprocess.CompletedProcess(
-            argv,
-            0,
-            stdout=(
-                '{"ok": true, "data": {"vm": {"name": "pi-sbx"}}, '
-                '"command": "start", "exit_code": 0, "error": null}\n'
-            ),
-            stderr="",
-        )
-
-    monkeypatch.setattr(cli.runtime, "run_capture", fake_run_capture)
-    monkeypatch.setattr(cli.network, "expose_auth_port", lambda vm_id, host_port, guest_port: 0)
-    monkeypatch.setattr(guest_setup, "attach", lambda *args, **kwargs: 0)
-
-    rc = cli.main(["run", "pi-sbx"])
-
-    assert rc == 0
-    assert captured["create"] == [
-        "smolvm",
-        "pi",
-        "start",
-        "--name",
-        "pi-sbx",
-        "--backend",
-        "qemu",
-        "--boot-timeout",
-        "60",
-        "--no-attach",
-        "--json",
-    ]
+    assert cli.main(["run", "pi-sbx"]) == 0
+    preset_name, preset_kwargs = captured["preset"]
+    assert preset_name == "pi"
+    assert preset_kwargs["vm_name"] == "pi-sbx"
+    assert captured["preset_closed"] is True
 
 
 def test_run_missing_vm_creates_it(
@@ -1304,43 +1145,13 @@ def test_run_missing_vm_creates_it(
 ) -> None:
     install_fake_smolvm(monkeypatch, tmp_path)
     captured: dict[str, object] = {}
+    capture_preset(monkeypatch, captured)
+    monkeypatch.setattr(cli.network, "expose_auth_port", lambda *args: 0)
 
-    def fake_run_capture(
-        argv: list[str], *, env: dict[str, str] | None = None
-    ) -> subprocess.CompletedProcess[str]:
-        if argv[:2] == ["smolvm", "sandbox", "info"]:
-            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="not found")
-        captured["create"] = argv
-        return subprocess.CompletedProcess(
-            argv,
-            0,
-            stdout=(
-                '{"ok": true, "data": {"vm": {"name": "vm1"}}, '
-                '"command": "start", "exit_code": 0, "error": null}\n'
-            ),
-            stderr="",
-        )
-
-    monkeypatch.setattr(cli.runtime, "run_capture", fake_run_capture)
-    monkeypatch.setattr(cli.network, "expose_auth_port", lambda vm_id, host_port, guest_port: 0)
-    monkeypatch.setattr(guest_setup, "attach", lambda *args, **kwargs: 0)
-
-    rc = cli.main(["run", "--name", "vm1", "--copy-host-credentials"])
-
-    assert rc == 0
-    assert captured["create"] == [
-        "smolvm",
-        "pi",
-        "start",
-        "--name",
-        "vm1",
-        "--backend",
-        "qemu",
-        "--boot-timeout",
-        "60",
-        "--no-attach",
-        "--json",
-    ]
+    assert cli.main(["run", "--name", "vm1", "--copy-host-credentials"]) == 0
+    _, preset_kwargs = captured["preset"]
+    assert preset_kwargs["vm_name"] == "vm1"
+    assert preset_kwargs["host_env"]["HOME"] == os.environ["HOME"]
 
 
 def test_create_is_run_no_attach_alias(
@@ -1349,28 +1160,33 @@ def test_create_is_run_no_attach_alias(
 ) -> None:
     install_fake_smolvm(monkeypatch, tmp_path)
     captured: dict[str, object] = {}
+    capture_preset(monkeypatch, captured)
+    monkeypatch.setattr(
+        cli,
+        "_post_start_actions",
+        lambda **kwargs: captured.setdefault("post", kwargs) and 0,
+    )
 
-    def fake_run(argv: list[str], *, check: bool = False, env: dict[str, str] | None = None) -> int:
-        captured["argv"] = argv
-        return 0
+    assert (
+        cli.main(["create", "--name", "vm1", "--copy-host-credentials", "--no-auth-port"])
+        == 0
+    )
+    assert captured["post"]["attach"] is False
 
-    monkeypatch.setattr(cli.runtime, "run", fake_run)
 
-    rc = cli.main(["create", "--name", "vm1", "--copy-host-credentials", "--no-auth-port"])
+def test_preset_creation_json_is_sbx_owned(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    install_fake_smolvm(monkeypatch, tmp_path)
+    captured: dict[str, object] = {}
+    capture_preset(monkeypatch, captured)
 
-    assert rc == 0
-    assert captured["argv"] == [
-        "smolvm",
-        "pi",
-        "start",
-        "--name",
-        "vm1",
-        "--backend",
-        "qemu",
-        "--boot-timeout",
-        "60",
-        "--no-attach",
-    ]
+    assert cli.main(["create", "vm1", "--json", "--no-auth-port"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "vm": {"name": "vm1", "status": "running"}
+    }
 
 
 def test_expose_auth_port_warns_when_port_already_listening(
@@ -1618,18 +1434,15 @@ def test_recreate_deletes_then_starts_vm(
     tmp_path: Path,
 ) -> None:
     install_fake_smolvm(monkeypatch, tmp_path)
-    calls: list[list[str] | tuple[str, str]] = []
+    calls: list[tuple[str, str]] = []
+    captured: dict[str, object] = {}
 
     def fake_delete(vm_id: str, extra_args: list[str] | None = None) -> int:
         calls.append(("delete", vm_id))
         return 0
 
-    def fake_run(argv: list[str], *, check: bool = False, env: dict[str, str] | None = None) -> int:
-        calls.append(argv)
-        return 0
-
     monkeypatch.setattr(cli, "_delete_vm", fake_delete)
-    monkeypatch.setattr(cli.runtime, "run", fake_run)
+    capture_preset(monkeypatch, captured)
 
     rc = cli.main(
         [
@@ -1644,21 +1457,9 @@ def test_recreate_deletes_then_starts_vm(
     )
 
     assert rc == 0
-    assert calls == [
-        ("delete", "vm1"),
-        [
-            "smolvm",
-            "pi",
-            "start",
-            "--name",
-            "vm1",
-            "--backend",
-            "qemu",
-            "--boot-timeout",
-            "60",
-            "--no-attach",
-        ],
-    ]
+    assert calls == [("delete", "vm1")]
+    _, preset_kwargs = captured["preset"]
+    assert preset_kwargs["vm_name"] == "vm1"
 
 
 def test_cli_project_path_overrides_config(
@@ -1680,6 +1481,9 @@ project_path = "{config_project}"
         encoding="utf-8",
     )
 
+    captured: dict[str, object] = {}
+    capture_preset(monkeypatch, captured, vm_id="pi-sbx")
+
     rc = cli.main(
         [
             "--config",
@@ -1693,11 +1497,10 @@ project_path = "{config_project}"
     )
 
     assert rc == 0
-    assert capfd.readouterr().out == (
-        "pi start --backend qemu --boot-timeout 60 "
-        f"--mount {cli_project}:{cli_project} "
-        "--writable-mounts --no-attach\n"
-    )
+    _, preset_kwargs = captured["preset"]
+    assert preset_kwargs["mounts"] == [f"{cli_project}:{cli_project}"]
+    assert preset_kwargs["writable_mounts"] is True
+    assert capfd.readouterr().out == "Started 'pi-sbx'.\n"
 
 
 def test_cli_flags_override_config(
@@ -1716,6 +1519,10 @@ name = "from-config"
         encoding="utf-8",
     )
 
+    captured: dict[str, object] = {}
+    capture_preset(monkeypatch, captured, vm_id="from-cli")
+    monkeypatch.setattr(cli, "_post_start_actions", lambda **kwargs: 0)
+
     rc = cli.main(
         [
             "--config",
@@ -1730,9 +1537,10 @@ name = "from-config"
     )
 
     assert rc == 0
-    assert capfd.readouterr().out == (
-        "claude start --name from-cli --backend qemu --boot-timeout 60 --attach\n"
-    )
+    preset_name, preset_kwargs = captured["preset"]
+    assert preset_name == "claude"
+    assert preset_kwargs["vm_name"] == "from-cli"
+    assert capfd.readouterr().out == "Started 'from-cli'. Launching claude...\n"
 
 
 def test_invalid_agent_in_config_returns_usage_error(
