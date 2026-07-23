@@ -120,6 +120,26 @@ func TestIngressDevServerOAuthAndNotReady(t *testing.T) {
 	}
 }
 
+func TestReplacementDiscardsQueuedIngressBeforeReadiness(t *testing.T) {
+	listener := tcpListener(t)
+	defer listener.Close()
+	client, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	forwarder := NewIngressForwarder(nil, []RegisteredIngress{{
+		Rule: ingressRule("dev", 3000), Listener: listener,
+	}}, NewFlowQuota(1), 1)
+
+	forwarder.DiscardPending()
+	_ = client.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	var data [1]byte
+	if n, err := client.Read(data[:]); n != 0 || err == nil {
+		t.Fatal("queued stale ingress survived replacement readiness")
+	}
+}
+
 func TestIngressQuotaAndWorkerLossAreBounded(t *testing.T) {
 	listener := tcpListener(t)
 	rule := ingressRule("dev", 3000)

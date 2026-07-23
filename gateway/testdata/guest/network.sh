@@ -91,9 +91,9 @@ print("GATEWAY_INGRESS_READY", flush=True)
 host = "localhost.localdomain"
 ip = socket.gethostbyname(host)
 assert ip.startswith("198.18.") or ip.startswith("198.19."), ip
-with socket.create_connection((host, 18080), timeout=5) as conn:
-    conn.sendall(b"gateway-test")
-    assert conn.recv(64) == b"gateway-test"
+old_tcp = socket.create_connection((host, 18080), timeout=5)
+old_tcp.sendall(b"gateway-test")
+assert old_tcp.recv(64) == b"gateway-test"
 
 for destination in ((host, 18081), ("1.1.1.1", 80)):
     try:
@@ -168,7 +168,43 @@ for root in ("/etc", "/home", "/root", "/run", "/tmp", "/var"):
             assert fake_token not in content and encoded_token not in content, path
 
 print(
-    "GATEWAY_GUEST_FAKE_TOKEN_SCAN_PASS GATEWAY_PACKAGE_AUTH_PASS GATEWAY_TEST_PASS",
+    "GATEWAY_GUEST_FAKE_TOKEN_SCAN_PASS GATEWAY_PACKAGE_AUTH_PASS "
+    "GATEWAY_OLD_FLOW_READY GATEWAY_TEST_PASS",
     flush=True,
 )
+
+old_tcp.settimeout(0.2)
+deadline = __import__("time").monotonic() + 30
+while __import__("time").monotonic() < deadline:
+    try:
+        old_tcp.sendall(b"old-flow")
+        assert old_tcp.recv(64) == b"old-flow"
+    except OSError:
+        break
+else:
+    raise AssertionError("old TCP flow survived worker replacement")
+old_tcp.close()
+
+recovery_results = queue.Queue()
+recovery_ready = queue.Queue()
+threading.Thread(
+    target=ingress_server,
+    args=(3000, "/recovered", b"recovered-ingress", recovery_results, recovery_ready),
+    daemon=True,
+).start()
+assert recovery_ready.get(timeout=10) == 3000
+print("GATEWAY_RECOVERY_INGRESS_READY", flush=True)
+
+for _ in range(100):
+    try:
+        with socket.create_connection((host, 18080), timeout=0.2) as conn:
+            conn.sendall(b"new-flow")
+            if conn.recv(64) == b"new-flow":
+                break
+    except OSError:
+        __import__("time").sleep(0.05)
+else:
+    raise AssertionError("new TCP flow failed after worker replacement")
+assert recovery_results.get(timeout=30) == "/recovered"
+print("GATEWAY_OLD_TCP_FAILED GATEWAY_RECOVERY_PASS", flush=True)
 PY

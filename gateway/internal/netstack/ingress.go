@@ -114,6 +114,24 @@ func (q *FlowQuota) acquireContext(ctx context.Context) bool {
 	}
 }
 
+func (f *IngressForwarder) DiscardPending() {
+	for _, item := range f.listeners {
+		listener, ok := item.Listener.(*net.TCPListener)
+		if !ok {
+			continue
+		}
+		_ = listener.SetDeadline(time.Now())
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				break
+			}
+			conn.Close()
+		}
+		_ = listener.SetDeadline(time.Time{})
+	}
+}
+
 func (f *IngressForwarder) Start() {
 	f.startOnce.Do(func() {
 		for _, item := range f.listeners {

@@ -30,7 +30,7 @@ _QEMU_VERSION_PATTERN = re.compile(r"QEMU emulator version (\d+)\.(\d+)(?:\.(\d+
 
 @dataclass(frozen=True, slots=True)
 class ExternalNetworkBackend:
-    """A worker-owned Unix stream to which QEMU connects."""
+    """A controller-owned Unix stream to which QEMU reconnects."""
 
     kind: Literal["unix-stream"]
     socket_path: Path
@@ -115,7 +115,7 @@ def _replace_network(argv: list[str], backend: ExternalNetworkBackend) -> list[s
 
     result = list(argv)
     result[netdev_values[0]] = (
-        f"stream,id=net0,server=off,addr.type=unix,addr.path={backend.socket_path}"
+        f"stream,id=net0,server=off,reconnect-ms=100,addr.type=unix,addr.path={backend.socket_path}"
     )
     device = result[device_values[0]].split(",")
     mac_values = [index for index, value in enumerate(device) if value.startswith("mac=")]

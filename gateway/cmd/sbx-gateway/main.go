@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -10,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,6 +50,34 @@ func validateIdentity(cfg config.Config, vmID, generation, digest string) error 
 	return nil
 }
 
+func incarnationProof(token []byte, vmID, generation, digest, incarnation string) string {
+	mac := hmac.New(sha256.New, token)
+	fmt.Fprintf(mac, "%s\x00%s\x00%s\x00%s", vmID, generation, digest, incarnation)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func inheritedQEMUListener(fd int, path string) (net.Listener, error) {
+	if fd < 3 {
+		return nil, errors.New("invalid controller QEMU listener descriptor")
+	}
+	file := os.NewFile(uintptr(fd), "controller-qemu-listener")
+	if file == nil {
+		return nil, errors.New("invalid controller QEMU listener descriptor")
+	}
+	listener, err := net.FileListener(file)
+	file.Close()
+	if err != nil {
+		return nil, fmt.Errorf("controller QEMU listener: %w", err)
+	}
+	address, ok := listener.Addr().(*net.UnixAddr)
+	info, pathErr := os.Lstat(path)
+	if !ok || address.Name != path || pathErr != nil || info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 {
+		listener.Close()
+		return nil, errors.New("controller QEMU listener ownership mismatch")
+	}
+	return listener, nil
+}
+
 func run() error {
 	socket := flag.String("socket", "", "controller-owned QEMU Unix socket path")
 	configPath := flag.String("config", "", "immutable worker JSON config")
@@ -53,6 +85,8 @@ func run() error {
 	vmID := flag.String("vm-id", "", "expected VM identity")
 	generation := flag.String("generation", "", "expected VM generation")
 	digest := flag.String("digest", "", "expected immutable config digest")
+	qemuListenerFD := flag.Int("qemu-listener-fd", -1, "inherited controller-owned QEMU listener")
+	incarnationTokenFD := flag.Int("incarnation-token-fd", -1, "inherited fresh worker authentication token")
 	mediatorAddress := flag.String("mediator-address", "", "per-VM mediator loopback endpoint")
 	capabilityKeyFD := flag.Int("capability-key-fd", -1, "inherited mediator capability key descriptor")
 	workerIncarnation := flag.String("worker-incarnation", "", "worker incarnation bound to mediator capabilities")
@@ -83,18 +117,24 @@ func run() error {
 	if err := validateIdentity(cfg, *vmID, *generation, *digest); err != nil {
 		return err
 	}
-	if _, err := os.Lstat(*socket); !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("refusing existing socket path: %w", err)
+	if *workerIncarnation == "" || *incarnationTokenFD < 3 {
+		return errors.New("worker incarnation authentication is required")
 	}
-	listener, err := net.Listen("unix", *socket)
+	tokenFile := os.NewFile(uintptr(*incarnationTokenFD), "worker-incarnation-token")
+	if tokenFile == nil {
+		return errors.New("invalid worker incarnation token descriptor")
+	}
+	token, err := capability.ReadKey(tokenFile)
+	tokenFile.Close()
 	if err != nil {
-		return fmt.Errorf("listen: %w", err)
+		return fmt.Errorf("worker incarnation token: %w", err)
+	}
+	proof := incarnationProof(token, cfg.VMID, cfg.Generation, cfg.Digest, *workerIncarnation)
+	listener, err := inheritedQEMUListener(*qemuListenerFD, *socket)
+	if err != nil {
+		return err
 	}
 	defer listener.Close()
-	defer os.Remove(*socket)
-	if err := os.Chmod(*socket, 0o600); err != nil {
-		return fmt.Errorf("secure socket: %w", err)
-	}
 	network, err := gatewaynet.New()
 	if err != nil {
 		return fmt.Errorf("netstack: %w", err)
@@ -108,6 +148,20 @@ func run() error {
 	ingress := gatewaynet.NewIngressForwarder(network, registeredIngress, totalFlows, cfg.Quotas.IngressFlows)
 	defer ingress.Close()
 	resolver := syntheticdns.New(cfg)
+	primed := make(map[string]bool)
+	for _, rule := range cfg.Rules {
+		if primed[rule.Host] || strings.Contains(rule.Host, "*") || net.ParseIP(rule.Host) != nil {
+			continue
+		}
+		ip, resolveErr := resolver.Resolve(rule.Host)
+		if resolveErr != nil {
+			return fmt.Errorf("prime synthetic DNS: %w", resolveErr)
+		}
+		if err := network.AddLocalAddress(net.ParseIP(ip.String())); err != nil {
+			return fmt.Errorf("prime synthetic DNS address: %w", err)
+		}
+		primed[rule.Host] = true
+	}
 	var mediator *gatewaynet.Mediator
 	for _, rule := range cfg.Rules {
 		if rule.Protocol != "http" {
@@ -144,7 +198,8 @@ func run() error {
 	network.ForwardTCP(cfg, resolver, mediator, totalFlows)
 	if err := json.NewEncoder(os.Stdout).Encode(map[string]any{
 		"status": "ready", "version": 1, "vm_id": cfg.VMID,
-		"generation": cfg.Generation, "digest": cfg.Digest, "mediator": mediator != nil,
+		"generation": cfg.Generation, "digest": cfg.Digest, "incarnation": *workerIncarnation,
+		"incarnation_proof": proof, "mediator": mediator != nil,
 		"ingress": len(registeredIngress),
 	}); err != nil {
 		return fmt.Errorf("readiness: %w", err)
@@ -169,10 +224,11 @@ func run() error {
 			}
 			network.Inject(frame)
 			networkReady.Do(func() {
-				ingress.Start()
+				ingress.DiscardPending()
 				outputMu.Lock()
 				fmt.Fprintln(os.Stdout, `{"status":"network-ready"}`)
 				outputMu.Unlock()
+				ingress.Start()
 			})
 		}
 	}()
