@@ -180,6 +180,7 @@ Do not edit or commit directly to `main/` or `specification/main/`. Do not commi
 
 - [ ] Do not call SmolVM kernel resolution, `ensure_base_kernel`, `BASE_KERNELS`, or guest-agent download/build functions.
 - [ ] Preserve `--cache-dir`, `--name`, `--rootfs-size-mb`, host architecture selection, and friendly Docker failure reporting.
+- [ ] Remove `--ssh-public-key`; local images inject the launching VM's key at boot, so a build-time key is unused and must not be baked into the shared rootfs.
 - [ ] Build to a temporary sibling file and atomically replace `rootfs.ext4` only after success.
 - [ ] Remove partial temporary rootfs output on exception or interruption.
 
@@ -290,7 +291,7 @@ Do not edit or commit directly to `main/` or `specification/main/`. Do not commi
 - [ ] Remove fake `build_debian_ssh_key()` implementations and fake `BASE_KERNELS` modules from `tests/test_build_debian_image.py`.
 - [ ] Fake the new rootfs-only helper and Docker-kernel helper independently.
 - [ ] Assert neither fake receives or returns a published kernel URL.
-- [ ] Keep failure tests for missing SSH key, rootfs build failure, kernel build failure, and friendly CLI errors.
+- [ ] Keep failure tests for rootfs build failure, kernel build failure, and friendly CLI errors.
 
 ### T022 — Replace optional-Docker tests with default-Docker tests
 
@@ -452,7 +453,7 @@ Only on a suitable Docker/QEMU host with disposable resources:
 
 ## Final definition of done
 
-- [ ] `--with-docker` and `--kernel-url` are removed from parser, completion, tests, and docs.
+- [ ] `--with-docker`, `--kernel-url`, and the unused `--ssh-public-key` are removed from parser, completion, tests, and docs.
 - [ ] Packaged builds always include rootless Docker and report `features: ["docker"]`.
 - [ ] Custom Containerfiles remain supported and conservatively report `features: []`.
 - [ ] The six SmolVM recipe files and reviewed Moby checker are packaged with sbx.

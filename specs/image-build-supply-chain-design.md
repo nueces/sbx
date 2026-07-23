@@ -90,7 +90,7 @@ Do not add a cache option for the unused kernel; eliminate the download. Do not 
 
 ### 4. Use SSH only
 
-Omit `/usr/local/bin/smolvm-guest-agent` from local images and force `comm_channel="ssh"`. Local-image readiness, commands, file transfer, environment sync, and attachment must use the existing SSH path. Do not add an agent toggle.
+Omit `/usr/local/bin/smolvm-guest-agent` from local images and force `comm_channel="ssh"`. Local-image readiness, commands, file transfer, environment sync, and attachment must use the existing SSH path. Remove the unused build-time `--ssh-public-key`; SmolVM injects the launching VM's key at boot. Do not add an agent toggle.
 
 ## Failure behavior
 
@@ -107,7 +107,7 @@ The builder must remove partial kernel output after failure. It must not silentl
 
 Automated tests should verify:
 
-- `--with-docker` and `--kernel-url` are no longer accepted;
+- `--with-docker`, `--kernel-url`, and `--ssh-public-key` are no longer accepted;
 - the packaged image always includes the Docker layer and advertises the Docker feature;
 - the build does not request or retain the unused published kernel;
 - custom Containerfiles do not falsely advertise Docker when Docker userland is absent;
@@ -130,7 +130,7 @@ This design is satisfied when:
 - builds no longer download the unused published kernel;
 - no mutable branch script is executed during image construction;
 - all remaining remote executable inputs are content-verified before execution;
-- `--kernel-url` is removed with the discarded published-kernel path;
+- `--kernel-url` and the unused build-time `--ssh-public-key` are removed;
 - the guest agent is removed and local-image communication explicitly uses SSH;
 - the guest-control-plane documentation matches SmolVM 0.0.28 behavior; and
 - focused tests cover integrity failures and SSH-only local-image communication.
