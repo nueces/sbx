@@ -1,9 +1,12 @@
+import hashlib
+import hmac
 import json
 import os
 import socket
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -55,16 +58,21 @@ class FakeListener:
 class FakeProcess:
     next_pid = 900_000
 
-    def __init__(self, payload: bytes = b"", *, exited: bool = False) -> None:
+    def __init__(
+        self, payload: bytes = b"", *, exited: bool = False, hold_stdout: bool = False
+    ) -> None:
         self.pid = FakeProcess.next_pid
         FakeProcess.next_pid += 1
         read_fd, write_fd = os.pipe()
         if payload:
             os.write(write_fd, payload)
-        os.close(write_fd)
+        self.resources: list[Any] = []
+        if hold_stdout:
+            self.resources.append(os.fdopen(write_fd, "wb", buffering=0))
+        else:
+            os.close(write_fd)
         self.stdout = os.fdopen(read_fd, "rb", buffering=0)
         self.returncode = 1 if exited else None
-        self.resources: list[Any] = []
 
     def poll(self) -> int | None:
         return self.returncode
@@ -83,6 +91,10 @@ class FakeProcess:
             raise subprocess.TimeoutExpired("fake", 0)
         return self.returncode
 
+    def crash(self) -> None:
+        self.returncode = 1
+        self._close_resources()
+
     def _close_resources(self) -> None:
         for resource in self.resources:
             resource.close()
@@ -90,28 +102,39 @@ class FakeProcess:
 
 
 class FakeRunner:
-    def __init__(self, failure: str | None = None) -> None:
+    def __init__(
+        self, failure: str | None = None, replacement_failure: str | None = None
+    ) -> None:
         self.failure = failure
+        self.replacement_failure = replacement_failure
         self.calls: list[list[str]] = []
         self.passed_fds: list[int] = []
         self.processes: list[FakeProcess] = []
+        self.worker_starts = 0
 
     def __call__(self, argv: list[str], **kwargs: Any) -> FakeProcess:
         self.calls.append(argv)
         self.passed_fds.extend(kwargs["pass_fds"])
-        component = "mediator" if len(self.calls) == 1 else "worker"
-        if self.failure == f"{component}_spawn":
+        component = "mediator" if argv[0] == "fake-mediator" else "worker"
+        if component == "worker":
+            self.worker_starts += 1
+        behavior = (
+            self.replacement_failure
+            if self.worker_starts > 1 or component == "mediator" and self.worker_starts > 0
+            else self.failure
+        )
+        if behavior == f"{component}_spawn":
             raise OSError(f"{component} spawn failed")
         if component == "mediator":
-            process = FakeProcess(exited=self.failure == "mediator_exit")
+            process = FakeProcess(exited=behavior == "mediator_exit")
             ready_fd = kwargs["pass_fds"][1]
             process.resources.append(os.fdopen(os.dup(kwargs["pass_fds"][2]), "rb", buffering=0))
-            if self.failure == "mediator_timeout":
+            if behavior == "mediator_timeout":
                 process.resources.append(os.fdopen(os.dup(ready_fd), "wb", buffering=0))
-            elif self.failure != "mediator_exit":
+            elif behavior != "mediator_exit":
                 payload: object = {
                     "status": "ready",
-                    "host": "0.0.0.0" if self.failure == "mediator_identity" else "127.0.0.1",
+                    "host": "0.0.0.0" if behavior == "mediator_identity" else "127.0.0.1",
                     "port": 1234,
                     "pid": process.pid,
                     "vm_id": argv[-2],
@@ -120,23 +143,41 @@ class FakeRunner:
                 os.write(ready_fd, json.dumps(payload).encode() + b"\n")
         else:
             policy = json.loads(Path(argv[argv.index("--config") + 1]).read_text())
+            token_fd = int(argv[argv.index("--incarnation-token-fd") + 1])
+            token = os.read(token_fd, 32)
+            vm_id = argv[argv.index("--vm-id") + 1]
+            generation = argv[argv.index("--generation") + 1]
+            incarnation = argv[argv.index("--worker-incarnation") + 1]
+            message = "\0".join((vm_id, generation, policy["digest"], incarnation)).encode()
             ready = {
                 "status": "ready",
                 "version": 1,
-                "vm_id": "wrong-vm" if self.failure == "worker_identity" else argv[-2],
-                "generation": argv[-1],
+                "vm_id": "wrong-vm" if behavior == "worker_identity" else vm_id,
+                "generation": generation,
                 "digest": policy["digest"],
+                "incarnation": incarnation,
+                "incarnation_proof": hmac.new(token, message, hashlib.sha256).hexdigest(),
                 "mediator": True,
                 "ingress": 1,
             }
             payload = json.dumps(ready).encode() + b'\n{"status":"network-ready"}\n'
-            if self.failure == "worker_status":
+            if behavior == "worker_stale":
+                ready["incarnation"] = "stale-worker"
+                payload = json.dumps(ready).encode() + b'\n{"status":"network-ready"}\n'
+            elif behavior == "worker_proof":
+                ready["incarnation_proof"] = "0" * 64
+                payload = json.dumps(ready).encode() + b'\n{"status":"network-ready"}\n'
+            elif behavior == "worker_timeout":
+                payload = b""
+            elif behavior == "worker_status":
                 payload = b'{"status":"wrong"}\n'
-            process = FakeProcess(payload, exited=self.failure == "worker_exit")
-            if self.failure != "worker_socket":
-                listener = socket.socket(socket.AF_UNIX)
-                listener.bind(argv[argv.index("--socket") + 1])
-                process.resources.append(listener)
+            process = FakeProcess(
+                payload,
+                exited=behavior == "worker_exit",
+                hold_stdout=behavior == "worker_timeout",
+            )
+            if behavior == "worker_socket":
+                Path(argv[argv.index("--socket") + 1]).unlink()
         self.processes.append(process)
         return process
 
@@ -147,9 +188,10 @@ def controller(
     monkeypatch: pytest.MonkeyPatch,
     *,
     failure: str | None = None,
+    replacement_failure: str | None = None,
     listener_fail: bool = False,
 ) -> tuple[gateway.GatewayController, FakeRunner, list[FakeListener]]:
-    runner = FakeRunner(failure)
+    runner = FakeRunner(failure, replacement_failure)
     listeners: list[FakeListener] = []
 
     def socket_factory(*args: object) -> FakeListener:
@@ -172,18 +214,24 @@ def controller(
     monkeypatch.setattr(
         gateway.GatewayController,
         "_worker_command",
-        lambda self, key: [
+        lambda self, key, token: [
             "fake-sbx-gateway",
             "--socket",
             str(self.qemu_socket),
             "--config",
             str(self.directory / "policy.json"),
+            "--vm-id",
+            self.vm_id,
+            "--generation",
+            self.generation,
+            "--worker-incarnation",
+            self.worker_incarnation,
+            "--incarnation-token-fd",
+            str(token),
             "--capability-key-fd",
             str(key),
             "--mediator-address",
             str(self.mediator_address),
-            self.vm_id,
-            self.generation,
         ],
     )
     instance = gateway.GatewayController(
@@ -198,6 +246,144 @@ def controller(
     return instance, runner, listeners
 
 
+def test_file_backed_mediator_policy_is_loaded_once_and_secret_free_on_disk(
+    tmp_path: Path,
+) -> None:
+    secret = tmp_path / "token"
+    secret.write_text("task16-file-secret\n")
+    config = gateway.parse_config(
+        {
+            "network": {
+                "http": [{"host": "example.com", "ports": [443]}],
+                "secret": [
+                    {
+                        "name": "TOKEN",
+                        "provider": f"file:{secret}",
+                        "hosts": ["example.com"],
+                        "ports": [443],
+                        "header": "Authorization: Bearer {placeholder}",
+                    }
+                ],
+            }
+        },
+        platform="linux",
+    )
+    assert config is not None
+    instance = gateway.GatewayController(config, "vm1", root=tmp_path / "state")
+
+    policy = instance._mediator_policy()
+
+    assert b"task16-file-secret" in policy
+    instance.directory = gateway.create_state(config, "vm1", "generation1", root=tmp_path / "state")
+    assert b"task16-file-secret" not in (instance.directory / "policy.json").read_bytes()
+    instance.close()
+
+    secret.write_bytes(b"\xff")
+    invalid = gateway.GatewayController(config, "vm1", root=tmp_path / "invalid")
+    with pytest.raises(gateway.GatewayLifecycleError, match="provider is unavailable"):
+        invalid._mediator_policy()
+    secret.unlink()
+    secret.mkdir()
+    with pytest.raises(gateway.GatewayLifecycleError, match="provider is unavailable"):
+        invalid._mediator_policy()
+
+
+def test_command_and_controller_endpoint_failures_are_closed_and_classified(
+    lifecycle_config: gateway.GatewayConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance = gateway.GatewayController(lifecycle_config, "vm1", root=tmp_path / "state")
+    instance.directory = gateway.create_state(
+        lifecycle_config, "vm1", "generation1", root=tmp_path / "state"
+    )
+    monkeypatch.setenv("SBX_GATEWAY_MEDIATOR_PYTHON", str(tmp_path / "missing-python"))
+    monkeypatch.setenv("SBX_GATEWAY_MEDIATOR_LAUNCHER", str(tmp_path / "missing-launcher"))
+    monkeypatch.setenv("SBX_GATEWAY_BIN", str(tmp_path / "missing-worker"))
+    with pytest.raises(gateway.GatewayLifecycleError, match="mediator runtime is missing"):
+        instance._mediator_command(1, 2, 3)
+    with pytest.raises(gateway.GatewayLifecycleError, match="worker artifact is missing"):
+        instance._worker_command(None, 4)
+
+    existing = instance.qemu_socket
+    existing.touch()
+    with pytest.raises(OSError):
+        instance._reserve_qemu_listener()
+    existing.unlink()
+
+    monkeypatch.setattr(
+        gateway.os,
+        "write",
+        lambda *_args: (_ for _ in ()).throw(OSError("pipe write failed")),
+    )
+    with pytest.raises(OSError, match="pipe write failed"):
+        instance._pipe_with(b"token")
+    instance.close()
+
+
+def test_readiness_rejects_invalid_exited_closed_and_oversized_channels(
+    lifecycle_config: gateway.GatewayConfig,
+    tmp_path: Path,
+) -> None:
+    instance = gateway.GatewayController(
+        lifecycle_config, "vm1", root=tmp_path / "state", timeout=0.1
+    )
+    cases = (
+        (FakeProcess(b"not-json\n"), "invalid readiness"),
+        (FakeProcess(exited=True), "exited before readiness"),
+        (FakeProcess(), "closed its readiness"),
+        (FakeProcess(b"x" * 4097), "oversized readiness"),
+    )
+    for process, message in cases:
+        with pytest.raises(gateway.GatewayLifecycleError, match=message):
+            instance._read_json_fd(process.stdout.fileno(), process, "worker")
+        process.terminate()
+
+
+def test_real_commands_bind_fresh_authentication_and_controller_endpoints(
+    lifecycle_config: gateway.GatewayConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = tmp_path / "sbx-gateway"
+    python = tmp_path / "python"
+    launcher = tmp_path / "launch.py"
+    for artifact in (worker, python, launcher):
+        artifact.touch()
+    monkeypatch.setenv("SBX_GATEWAY_BIN", str(worker))
+    monkeypatch.setenv("SBX_GATEWAY_MEDIATOR_PYTHON", str(python))
+    monkeypatch.setenv("SBX_GATEWAY_MEDIATOR_LAUNCHER", str(launcher))
+    instance = gateway.GatewayController(
+        lifecycle_config,
+        "vm1",
+        root=tmp_path / "state",
+        generation="generation1",
+    )
+    instance.directory = gateway.create_state(
+        lifecycle_config, "vm1", "generation1", root=tmp_path / "state"
+    )
+    instance._reserve_qemu_listener()
+    instance._reserve_listeners()
+    instance.mediator_address = "127.0.0.1:1234"
+
+    mediator = instance._mediator_command(11, 12, 13)
+    worker_command = instance._worker_command(14, 15)
+
+    assert mediator[:2] == [str(python), str(launcher)]
+    assert mediator[mediator.index("--incarnation") + 1] == instance.worker_incarnation
+    assert worker_command[worker_command.index("--qemu-listener-fd") + 1] == str(
+        instance.qemu_listener.fileno()  # type: ignore[union-attr]
+    )
+    assert worker_command[worker_command.index("--incarnation-token-fd") + 1] == "15"
+    assert worker_command[worker_command.index("--digest") + 1]
+    assert "vm1/generation1/ingress-1=" in " ".join(worker_command)
+    assert all(
+        value not in " ".join(worker_command).lower()
+        for value in ("slirp", "hostfwd", "-netdev user", "tap")
+    )
+    instance.close()
+
+
 def test_fake_runner_and_socket_normal_lifecycle(
     lifecycle_config: gateway.GatewayConfig,
     tmp_path: Path,
@@ -206,14 +392,16 @@ def test_fake_runner_and_socket_normal_lifecycle(
     instance, runner, listeners = controller(lifecycle_config, tmp_path, monkeypatch)
 
     instance.prepare()
+    with pytest.raises(gateway.GatewayLifecycleError, match="already prepared"):
+        instance.prepare()
     state = gateway.read_state(instance.directory)  # type: ignore[arg-type]
     assert [call[0] for call in runner.calls] == ["fake-mediator", "fake-sbx-gateway"]
     assert state["status"] == "starting"
     assert state["listeners"][0]["host_port"] == 45123
     assert instance.qemu_socket.is_socket()
-    assert runner.passed_fds[-1] == listeners[0].fileno()
+    assert listeners[0].fileno() in runner.passed_fds
     with pytest.raises(OSError):
-        os.fstat(runner.passed_fds[-2])
+        os.fstat(int(runner.calls[1][runner.calls[1].index("--incarnation-token-fd") + 1]))
 
     instance.vm_network_ready(12345)
     state = gateway.read_state(instance.directory)  # type: ignore[arg-type]
@@ -230,6 +418,206 @@ def test_fake_runner_and_socket_normal_lifecycle(
     assert all(process.poll() is not None for process in runner.processes)
 
 
+def test_authenticated_replacement_preserves_endpoints_and_discards_every_old_flow(
+    lifecycle_config: gateway.GatewayConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance, runner, listeners = controller(lifecycle_config, tmp_path, monkeypatch)
+    instance.prepare()
+    old_incarnation = instance.worker_incarnation
+    qemu_inode = instance.qemu_socket.stat().st_ino
+    qemu_fd = instance.qemu_listener.fileno()  # type: ignore[union-attr]
+    ingress_fd = listeners[0].fileno()
+    peers = {}
+    for flow, component in {
+        "tcp": "worker",
+        "ingress": "worker",
+        "http": "mediator",
+        "websocket": "mediator",
+    }.items():
+        owned, peer = socket.socketpair()
+        instance.processes[component].resources.append(owned)
+        peer.settimeout(0.2)
+        peers[flow] = peer
+
+    instance.recover()
+
+    assert instance.worker_incarnation != old_incarnation
+    assert instance.qemu_socket.stat().st_ino == qemu_inode
+    assert instance.qemu_listener.fileno() == qemu_fd  # type: ignore[union-attr]
+    assert listeners[0].fileno() == ingress_fd
+    assert gateway.read_state(instance.directory)["status"] == "ready"  # type: ignore[arg-type]
+    assert runner.worker_starts == 2
+    for flow, peer in peers.items():
+        assert peer.recv(1) == b"", f"stale {flow} flow survived replacement"
+        peer.close()
+    qemu = socket.socket(socket.AF_UNIX)
+    qemu.settimeout(0.2)
+    qemu.connect(str(instance.qemu_socket))
+    qemu.close()
+    commands = " ".join(" ".join(call) for call in runner.calls).lower()
+    assert all(value not in commands for value in ("slirp", "hostfwd", "-netdev user", "tap"))
+    instance.close()
+
+
+@pytest.mark.parametrize(
+    "replacement_failure", ["worker_stale", "worker_identity", "worker_proof"]
+)
+def test_stale_worker_wrong_identity_and_wrong_token_hard_fail_without_retry(
+    lifecycle_config: gateway.GatewayConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_failure: str,
+) -> None:
+    config = replace(
+        lifecycle_config, reconnection=gateway.Reconnection(attempts=3, timeout_seconds=0.3)
+    )
+    instance, runner, listeners = controller(
+        config, tmp_path, monkeypatch, replacement_failure=replacement_failure
+    )
+    instance.prepare()
+    old_worker = runner.processes[-1]
+
+    started = time.monotonic()
+    with pytest.raises(gateway.GatewayLifecycleError, match="reconnection failed"):
+        instance.recover()
+
+    assert time.monotonic() - started < 1
+    assert runner.worker_starts == 2
+    assert old_worker.poll() is not None
+    assert not instance.qemu_socket.exists()
+    assert listeners[0].closed
+    state = gateway.read_state(instance.directory)  # type: ignore[arg-type]
+    assert state["status"] == "failed"
+    assert state["last_failure"]["code"] == "reconnection_failed"
+    instance.close()
+
+
+def test_changed_immutable_config_hard_fails_before_replacement_spawn(
+    lifecycle_config: gateway.GatewayConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance, runner, _ = controller(lifecycle_config, tmp_path, monkeypatch)
+    instance.prepare()
+    policy = instance.directory / "policy.json"  # type: ignore[operator]
+    policy.write_bytes(policy.read_bytes() + b" ")
+
+    with pytest.raises(gateway.GatewayLifecycleError, match="config mismatch"):
+        instance.recover()
+
+    assert runner.worker_starts == 1
+    assert not instance.qemu_socket.exists()
+    instance.close()
+
+
+def test_replacement_retries_and_timeout_are_globally_bounded(
+    lifecycle_config: gateway.GatewayConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retry_config = replace(
+        lifecycle_config, reconnection=gateway.Reconnection(attempts=2, timeout_seconds=0.3)
+    )
+    retrying, retry_runner, _ = controller(
+        retry_config, tmp_path, monkeypatch, replacement_failure="worker_exit"
+    )
+    retrying.prepare()
+    started = time.monotonic()
+    with pytest.raises(gateway.GatewayLifecycleError, match="reconnection failed"):
+        retrying.recover()
+    assert time.monotonic() - started < 1
+    assert retry_runner.worker_starts == 3
+    retrying.close()
+
+    timing_out, timeout_runner, _ = controller(
+        replace(
+            lifecycle_config,
+            reconnection=gateway.Reconnection(attempts=3, timeout_seconds=0.15),
+        ),
+        tmp_path / "timeout",
+        monkeypatch,
+        replacement_failure="worker_timeout",
+    )
+    timing_out.prepare()
+    started = time.monotonic()
+    with pytest.raises(gateway.GatewayLifecycleError, match="timed out"):
+        timing_out.recover()
+    assert 0.1 <= time.monotonic() - started < 0.8
+    assert timeout_runner.worker_starts <= 4
+    timing_out.close()
+
+
+def test_disabled_recovery_and_mediator_loss_fail_closed(
+    lifecycle_config: gateway.GatewayConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    disabled = replace(
+        lifecycle_config,
+        reconnection=gateway.Reconnection(enabled=False, attempts=0, timeout_seconds=0.1),
+    )
+    instance, _, listeners = controller(disabled, tmp_path, monkeypatch)
+    instance.prepare()
+    with pytest.raises(gateway.GatewayLifecycleError, match="disabled"):
+        instance.recover()
+    with pytest.raises(gateway.GatewayLifecycleError, match="not recoverable"):
+        instance.recover()
+    assert listeners[0].closed
+    assert not instance.qemu_socket.exists()
+    instance.close()
+
+    failed, runner, failed_listeners = controller(lifecycle_config, tmp_path, monkeypatch)
+    failed.prepare()
+    failed.processes["mediator"].crash()
+    with pytest.raises(gateway.GatewayLifecycleError, match="mediator exited"):
+        failed.check()
+    with pytest.raises(gateway.GatewayLifecycleError, match="mediator exited"):
+        failed.check()
+    assert failed_listeners[0].closed
+    assert not failed.qemu_socket.exists()
+    assert runner.worker_starts == 1
+    failed.close()
+
+
+def test_check_synchronously_recovers_worker_before_supervisor_start(
+    lifecycle_config: gateway.GatewayConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance, runner, _ = controller(lifecycle_config, tmp_path, monkeypatch)
+    instance.prepare()
+    runner.processes[-1].crash()
+
+    instance.check()
+
+    assert runner.worker_starts == 2
+    assert gateway.read_state(instance.directory)["status"] == "ready"  # type: ignore[arg-type]
+    instance.close()
+
+
+def test_supervisor_automatically_replaces_crashed_worker_with_bounded_wait(
+    lifecycle_config: gateway.GatewayConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance, runner, _ = controller(lifecycle_config, tmp_path, monkeypatch)
+    instance.prepare()
+    instance.vm_network_ready(os.getpid())
+    runner.processes[-1].crash()
+
+    deadline = time.monotonic() + 1
+    state = gateway.read_state(instance.directory)  # type: ignore[arg-type]
+    while (runner.worker_starts < 2 or state["status"] != "ready") and time.monotonic() < deadline:
+        time.sleep(0.01)
+        state = gateway.read_state(instance.directory)  # type: ignore[arg-type]
+
+    assert runner.worker_starts == 2
+    assert state["status"] == "ready"
+    instance.close()
+
+
 @pytest.mark.parametrize(
     ("failure", "message"),
     [
@@ -241,7 +629,6 @@ def test_fake_runner_and_socket_normal_lifecycle(
         ("worker_exit", "exited before readiness"),
         ("worker_status", "unexpected readiness status"),
         ("worker_identity", "readiness identity mismatch"),
-        ("worker_socket", "did not create"),
     ],
 )
 def test_every_child_startup_failure_rolls_back_fake_resources(
@@ -332,6 +719,40 @@ def test_state_startup_failure_opens_no_socket_or_process(
 
     assert runner.calls == []
     assert listeners == []
+
+
+def test_unprepared_network_readiness_and_stubborn_process_termination_fail_bounded(
+    lifecycle_config: gateway.GatewayConfig,
+    tmp_path: Path,
+) -> None:
+    instance = gateway.GatewayController(lifecycle_config, "vm1", root=tmp_path / "state")
+    with pytest.raises(gateway.GatewayLifecycleError, match="has not been prepared"):
+        instance.vm_network_ready(1)
+
+    class StubbornProcess:
+        pid = 987_654
+        returncode: int | None = None
+        terminated = False
+        killed = False
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+
+        def wait(self, timeout: float = 0) -> int:
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired("stubborn", timeout)
+            return self.returncode
+
+    process = StubbornProcess()
+    instance._terminate(process)
+    assert process.terminated and process.killed and process.poll() == -9
 
 
 def test_post_qemu_readiness_failure_rolls_back_everything(
@@ -525,24 +946,28 @@ os.write(int(sys.argv[1]), (json.dumps(ready)+'\\n').encode())
 signal.pause()
 """
 WORKER = """
-import json, signal, socket, sys
-listener=socket.socket(socket.AF_UNIX)
-listener.bind(sys.argv[1])
+import hashlib, hmac, json, os, signal, sys
 policy=json.load(open(sys.argv[2]))
-print(json.dumps({'status':'ready','version':1,'vm_id':'vm-direct',
-                  'generation':'generation1','digest':policy['digest'],'mediator':True,
-                  'ingress':1}), flush=True)
+token=os.read(int(sys.argv[6]), 32)
+message='\\0'.join((sys.argv[3], sys.argv[4], policy['digest'], sys.argv[5])).encode()
+print(json.dumps({'status':'ready','version':1,'vm_id':sys.argv[3],
+                  'generation':sys.argv[4],'digest':policy['digest'],
+                  'incarnation':sys.argv[5],
+                  'incarnation_proof':hmac.new(token,message,hashlib.sha256).hexdigest(),
+                  'mediator':True,'ingress':1}), flush=True)
 print('{"status":"network-ready"}', flush=True)
 signal.pause()
 """
 WORKER_STATS_ONLY = """
-import json, socket, sys, time
-listener=socket.socket(socket.AF_UNIX)
-listener.bind(sys.argv[1])
+import hashlib, hmac, json, os, sys, time
 policy=json.load(open(sys.argv[2]))
-print(json.dumps({'status':'ready','version':1,'vm_id':'vm-direct',
-                  'generation':'generation1','digest':policy['digest'],'mediator':True,
-                  'ingress':1}), flush=True)
+token=os.read(int(sys.argv[6]), 32)
+message='\\0'.join((sys.argv[3], sys.argv[4], policy['digest'], sys.argv[5])).encode()
+print(json.dumps({'status':'ready','version':1,'vm_id':sys.argv[3],
+                  'generation':sys.argv[4],'digest':policy['digest'],
+                  'incarnation':sys.argv[5],
+                  'incarnation_proof':hmac.new(token,message,hashlib.sha256).hexdigest(),
+                  'mediator':True,'ingress':1}), flush=True)
 while True:
     print('{"status":"stats"}', flush=True)
     time.sleep(0.01)
@@ -575,12 +1000,16 @@ def direct_controller(
     monkeypatch.setattr(
         gateway.GatewayController,
         "_worker_command",
-        lambda self, key: [
+        lambda self, key, token: [
             sys.executable,
             "-c",
             worker,
             str(self.qemu_socket),
             str(self.directory / "policy.json"),
+            self.vm_id,
+            self.generation,
+            self.worker_incarnation,
+            str(token),
             "sbx-gateway",
             str(self.directory),
         ],

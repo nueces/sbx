@@ -20,6 +20,9 @@ func (n *Network) ServeDNS(resolver *syntheticdns.Resolver) (net.PacketConn, err
 	go func() {
 		buf := make([]byte, 1232)
 		known := make(map[string]bool)
+		for _, mapping := range resolver.Snapshot() {
+			known[mapping.IP] = true
+		}
 		for {
 			read, peer, err := conn.ReadFrom(buf)
 			if err != nil {

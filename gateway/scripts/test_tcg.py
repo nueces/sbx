@@ -129,11 +129,15 @@ def package_server(runtime: Path) -> tuple[ThreadingHTTPServer, Path]:
 
 
 def start_mediator(
-    runtime: Path, upstream_ca: Path, upstream_port: int, key: bytes
+    runtime: Path,
+    upstream_ca: Path,
+    upstream_port: int,
+    key: bytes,
+    incarnation: str = "worker1",
 ) -> tuple[subprocess.Popen[str], dict[str, object], Path]:
     mediator_dir = Path(__file__).parents[1] / "mediator"
     confdir = runtime / "mediator"
-    confdir.mkdir(mode=0o700)
+    confdir.mkdir(mode=0o700, exist_ok=True)
     helper = runtime / "token-helper"
     helper.write_text(
         "#!/bin/sh\nprintf '%s%s%s\\n' 'fake-' 'real-token-' 'task10'\n",
@@ -164,7 +168,7 @@ def start_mediator(
             "--vm-id",
             "tcg-test",
             "--incarnation",
-            "worker1",
+            incarnation,
             "--key-fd",
             str(key_read),
             "--ready-fd",
@@ -191,6 +195,82 @@ def start_mediator(
     os.close(ready_read)
     require(bool(payload), "mediator readiness timed out")
     return process, json.loads(payload), confdir
+
+
+def start_worker(
+    gateway: Path,
+    qemu_socket: Path,
+    qemu_listener: socket.socket,
+    config: Path,
+    digest: str,
+    mediator_ready: dict[str, object],
+    key: bytes,
+    incarnation: str,
+    ingress_listeners: list[socket.socket],
+) -> subprocess.Popen[str]:
+    key_read, key_write = os.pipe()
+    token_read, token_write = os.pipe()
+    os.write(key_write, key)
+    os.write(token_write, os.urandom(32))
+    os.close(key_write)
+    os.close(token_write)
+    process = subprocess.Popen(
+        [
+            str(gateway),
+            "--socket",
+            str(qemu_socket),
+            "--config",
+            str(config),
+            "--vm-id",
+            "tcg-test",
+            "--generation",
+            "g1",
+            "--digest",
+            digest,
+            "--qemu-listener-fd",
+            str(qemu_listener.fileno()),
+            "--incarnation-token-fd",
+            str(token_read),
+            "--mediator-address",
+            f"{mediator_ready['host']}:{mediator_ready['port']}",
+            "--capability-key-fd",
+            str(key_read),
+            "--worker-incarnation",
+            incarnation,
+            "--ingress-fd",
+            f"tcg-test/g1/dev-server={ingress_listeners[0].fileno()}",
+            "--ingress-fd",
+            f"tcg-test/g1/oauth-callback={ingress_listeners[1].fileno()}",
+        ],
+        pass_fds=(
+            qemu_listener.fileno(),
+            token_read,
+            key_read,
+            *(item.fileno() for item in ingress_listeners),
+        ),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    os.close(token_read)
+    os.close(key_read)
+    PROCESSES.append(process)
+    assert process.stdout is not None
+    readable, _, _ = select.select([process.stdout], [], [], COMMAND_TIMEOUT)
+    payload = process.stdout.readline() if readable else ""
+    require(bool(payload), "worker authenticated readiness timed out")
+    ready = json.loads(payload)
+    require(
+        ready.get("status") == "ready"
+        and ready.get("vm_id") == "tcg-test"
+        and ready.get("generation") == "g1"
+        and ready.get("digest") == digest
+        and ready.get("incarnation") == incarnation
+        and len(str(ready.get("incarnation_proof", ""))) == 64,
+        "worker authenticated readiness mismatch",
+    )
+    return process
 
 
 def terminate(process: subprocess.Popen[str] | None) -> None:
@@ -261,6 +341,10 @@ def main() -> int:
         raw = runtime / "raw.json"
         config = runtime / "config.json"
         qemu_socket = runtime / "qemu.sock"
+        qemu_listener = socket.socket(socket.AF_UNIX)
+        qemu_listener.bind(str(qemu_socket))
+        os.chmod(qemu_socket, 0o600)
+        qemu_listener.listen()
         ingress_listeners = []
         for _ in range(2):
             ingress_listener = socket.socket()
@@ -341,47 +425,18 @@ def main() -> int:
         )
         config.write_text(prepared)
         digest = json.loads(prepared)["digest"]
-        worker_key_read, worker_key_write = os.pipe()
-        os.write(worker_key_write, key)
-        os.close(worker_key_write)
-        worker = subprocess.Popen(
-            [
-                str(gateway),
-                "--socket",
-                str(qemu_socket),
-                "--config",
-                str(config),
-                "--vm-id",
-                "tcg-test",
-                "--generation",
-                "g1",
-                "--digest",
-                digest,
-                "--mediator-address",
-                f"{mediator_ready['host']}:{mediator_ready['port']}",
-                "--capability-key-fd",
-                str(worker_key_read),
-                "--worker-incarnation",
-                "worker1",
-                "--ingress-fd",
-                f"tcg-test/g1/dev-server={ingress_listeners[0].fileno()}",
-                "--ingress-fd",
-                f"tcg-test/g1/oauth-callback={ingress_listeners[1].fileno()}",
-            ],
-            pass_fds=(worker_key_read, *(item.fileno() for item in ingress_listeners)),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
+        worker = start_worker(
+            gateway,
+            qemu_socket,
+            qemu_listener,
+            config,
+            digest,
+            mediator_ready,
+            key,
+            "worker1",
+            ingress_listeners,
         )
-        os.close(worker_key_read)
-        PROCESSES.append(worker)
-        for _ in range(200):
-            require(worker.poll() is None, "worker exited before readiness")
-            if qemu_socket.is_socket():
-                break
-            time.sleep(0.025)
-        require(qemu_socket.is_socket(), "worker socket readiness timed out")
+        require(qemu_socket.is_socket(), "controller QEMU socket disappeared")
 
         boot_args = manifest.get(
             "boot_args", "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init"
@@ -414,7 +469,7 @@ def main() -> int:
             "-drive",
             f"file={rootfs},if=none,format=raw,id=rootdisk",
             "-netdev",
-            f"stream,id=net0,server=off,addr.type=unix,addr.path={qemu_socket}",
+            f"stream,id=net0,server=off,reconnect-ms=100,addr.type=unix,addr.path={qemu_socket}",
             "-device",
             "virtio-net-device,netdev=net0,mac=52:54:00:12:34:56",
             "-device",
@@ -442,6 +497,13 @@ def main() -> int:
         os.set_blocking(qemu_process.stdout.fileno(), False)
         selector.register(qemu_process.stdout, selectors.EVENT_READ)
         ingress_complete = False
+        initial_complete = False
+        recovery_ingress_complete = False
+        old_logs = ""
+        forbidden_secrets = (
+            FAKE_TOKEN.encode(),
+            base64.b64encode(f"aws:{FAKE_TOKEN}".encode()),
+        )
         while time.monotonic() < deadline:
             require(qemu_process.poll() is None, "QEMU exited before test completion")
             if not selector.select(timeout=1):
@@ -470,9 +532,8 @@ def main() -> int:
                     "GATEWAY_DEV_SERVER_PASS GATEWAY_OAUTH_CALLBACK_PASS "
                     "GATEWAY_PORT0_PASS\n"
                 )
-            if "GATEWAY_TEST_PASS" in output:
+            if "GATEWAY_TEST_PASS" in output and not initial_complete:
                 require(ingress_complete, "guest completed without ingress workloads")
-                output = "".join(transcript)
                 expected_auth = "Basic " + base64.b64encode(f"aws:{FAKE_TOKEN}".encode()).decode()
                 require(
                     package.records  # type: ignore[attr-defined]
@@ -491,10 +552,6 @@ def main() -> int:
                 state_material = b"".join(
                     path.read_bytes() for path in runtime.rglob("*") if path.is_file()
                 )
-                forbidden_secrets = (
-                    FAKE_TOKEN.encode(),
-                    base64.b64encode(f"aws:{FAKE_TOKEN}".encode()),
-                )
                 status_material = (
                     prepared.encode() + json.dumps(mediator_ready).encode() + output.encode()
                 )
@@ -505,6 +562,7 @@ def main() -> int:
                     )
                     require(secret not in state_material, "fake token leaked into host state")
                     require(secret not in status_material, "fake token leaked into status output")
+
                 terminate(worker)
                 require(worker.poll() is not None, "worker did not stop")
                 for ingress_listener in ingress_listeners:
@@ -517,21 +575,78 @@ def main() -> int:
                         pass
                     finally:
                         probe.close()
-                transcript.append("GATEWAY_INGRESS_WORKER_LOSS_PASS\n")
                 worker_stdout, _ = worker.communicate(timeout=PROCESS_STOP_TIMEOUT)
                 require(qemu_process.poll() is None, "QEMU did not survive worker loss")
                 terminate(mediator)
                 mediator_stdout, mediator_stderr = mediator.communicate(
                     timeout=PROCESS_STOP_TIMEOUT
                 )
-                logs = (mediator_stdout + mediator_stderr + worker_stdout + output).encode()
+                old_logs = mediator_stdout + mediator_stderr + worker_stdout
+                transcript.append(
+                    "GATEWAY_INGRESS_WORKER_LOSS_PASS GATEWAY_WORKER_LOSS_PASS\n"
+                )
+
+                replacement_key = os.urandom(32)
+                mediator, mediator_ready, _ = start_mediator(
+                    runtime, upstream_ca, package.server_port, replacement_key, "worker2"
+                )
+                worker = start_worker(
+                    gateway,
+                    qemu_socket,
+                    qemu_listener,
+                    config,
+                    digest,
+                    mediator_ready,
+                    replacement_key,
+                    "worker2",
+                    ingress_listeners,
+                )
+                assert worker.stdout is not None
+                readable, _, _ = select.select([worker.stdout], [], [], COMMAND_TIMEOUT)
+                network_ready = worker.stdout.readline() if readable else ""
+                require(
+                    json.loads(network_ready).get("status") == "network-ready",
+                    "replacement worker network readiness timed out",
+                )
+                transcript.append("GATEWAY_AUTHENTICATED_REPLACEMENT_READY\n")
+                initial_complete = True
+
+            if "GATEWAY_RECOVERY_INGRESS_READY" in output and not recovery_ingress_complete:
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1", ingress_listeners[0].getsockname()[1], timeout=10
+                )
+                connection.request("GET", "/recovered")
+                response = connection.getresponse()
+                require(
+                    response.status == 200 and response.read() == b"recovered-ingress",
+                    "replacement ingress flow failed",
+                )
+                connection.close()
+                recovery_ingress_complete = True
+                transcript.append("GATEWAY_RECOVERY_INGRESS_PASS\n")
+
+            if "GATEWAY_RECOVERY_PASS" in output:
+                require(initial_complete, "guest reported recovery before replacement")
+                require(recovery_ingress_complete, "guest recovery omitted new ingress flow")
+                terminate(worker)
+                terminate(mediator)
+                worker_stdout, _ = worker.communicate(timeout=PROCESS_STOP_TIMEOUT)
+                mediator_stdout, mediator_stderr = mediator.communicate(
+                    timeout=PROCESS_STOP_TIMEOUT
+                )
+                logs = (
+                    old_logs + mediator_stdout + mediator_stderr + worker_stdout + output
+                ).encode()
                 for secret in (*forbidden_secrets, PLACEHOLDER.encode()):
                     require(secret not in logs, "secret leaked into host or guest logs")
-                transcript.append("GATEWAY_WORKER_LOSS_PASS\n")
-                transcript.append("GATEWAY_FAKE_TOKEN_SCAN_PASS\n")
+                transcript.append(
+                    "GATEWAY_NEW_FLOW_PASS GATEWAY_OLD_FLOW_DISCARD_PASS "
+                    "GATEWAY_FAKE_TOKEN_SCAN_PASS\n"
+                )
                 stop.set()
                 listener.close()
                 ca_listener.close()
+                qemu_listener.close()
                 for ingress_listener in ingress_listeners:
                     ingress_listener.close()
                 print("".join(transcript), end="")

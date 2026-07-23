@@ -55,6 +55,19 @@ def completed(stdout: str, *, returncode: int = 0) -> subprocess.CompletedProces
     return subprocess.CompletedProcess([], returncode, stdout, "")
 
 
+def test_qemu_probe_os_error_and_timeout_are_classified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for error in (OSError("missing"), subprocess.TimeoutExpired(["qemu"], 5)):
+        monkeypatch.setattr(
+            smolvm_network.subprocess,
+            "run",
+            lambda *_args, error=error, **_kwargs: (_ for _ in ()).throw(error),
+        )
+        with pytest.raises(ConfigError, match="could not inspect QEMU"):
+            smolvm_network._capture(["qemu", "--version"])
+
+
 def support_capture(argv: list[str]) -> subprocess.CompletedProcess[str]:
     if argv[-1] == "--version":
         return completed("QEMU emulator version 10.0.11 (Debian)\n")
@@ -102,7 +115,7 @@ def test_external_network_builds_exact_single_stream_argv(
             "id=rootdisk0-drive,node-name=rootdisk0"
         ),
         "-netdev",
-        f"stream,id=net0,server=off,addr.type=unix,addr.path={unix_socket}",
+        f"stream,id=net0,server=off,reconnect-ms=100,addr.type=unix,addr.path={unix_socket}",
         "-nographic",
         "-no-reboot",
         "-rtc",
@@ -122,7 +135,9 @@ def test_external_network_builds_exact_single_stream_argv(
         for index, value in enumerate(argv[:-1])
         if value == "-device" and "netdev=" in argv[index + 1]
     ]
-    assert netdevs == [f"stream,id=net0,server=off,addr.type=unix,addr.path={unix_socket}"]
+    assert netdevs == [
+        f"stream,id=net0,server=off,reconnect-ms=100,addr.type=unix,addr.path={unix_socket}"
+    ]
     assert len(nics) == 1
     assert not any(mode in " ".join(argv) for mode in ("user,id=", "tap,id=", "hostfwd="))
 

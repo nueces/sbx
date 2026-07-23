@@ -439,6 +439,12 @@ class CapabilityTests(unittest.TestCase):
         )
         self.assertIsNone(verifier.verify(username.removesuffix("443") + "80", password))
 
+    def test_replacement_rejects_every_old_worker_capability(self) -> None:
+        username, password = credential(key=KEY, incarnation="worker1", flow="old-flow")
+        replacement = CapabilityVerifier(b"r" * 32, "vm1", "worker2")
+
+        self.assertIsNone(replacement.verify(username, password))
+
     def test_rejects_expired_malformed_and_altered_credentials(self) -> None:
         now = int(time.time())
         verifier = CapabilityVerifier(KEY, "vm1", "worker1")
