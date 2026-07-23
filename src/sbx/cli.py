@@ -22,6 +22,7 @@ from sbx import (
     auth_ports,
     bootstrap,
     doctor,
+    gateway,
     guest_setup,
     lifecycle_warnings,
     runtime,
@@ -1833,6 +1834,15 @@ def build_parser() -> argparse.ArgumentParser:
     network_status.add_argument("--json", action="store_true", help="Print JSON.")
     network_status.set_defaults(func=network.cmd_status)
 
+    network_diagnostics = network_sub.add_parser(
+        "diagnostics",
+        help="Show redacted gateway configuration and state diagnostics.",
+    )
+    network_diagnostics.add_argument(
+        "name", nargs="?", help="Sandbox name or ID. Defaults to [sbx].name."
+    )
+    network_diagnostics.set_defaults(func=network.cmd_diagnostics)
+
     image = sub.add_parser("image", help="Advanced local image helpers.")
     image_sub = image.add_subparsers(dest="image_action", required=True)
     build_parser = image_sub.add_parser("build", help="Build the curated local image for sbx.")
@@ -1871,6 +1881,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         try:
             args.config_data = load_config(args.config)
+            args.gateway_config = gateway.parse_config(args.config_data)
         except ConfigError as exc:
             print(f"sbx: {exc}", file=sys.stderr)
             return 2

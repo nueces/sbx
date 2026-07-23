@@ -11,8 +11,9 @@ from collections.abc import Mapping, Sequence
 from contextlib import contextmanager, suppress
 from typing import Any
 
-from sbx import auth_ports
+from sbx import auth_ports, gateway
 from sbx.constants import SBX_STATE_DIR, TUNNELS_FILE
+from sbx.gateway import parse_port_forward
 from sbx.runtime import (
     ConfigError,
     debug,
@@ -26,39 +27,7 @@ from sbx.runtime import (
     write_json_object,
 )
 
-
-def _validate_port(value: str, spec: str) -> int:
-    try:
-        port = int(value)
-    except ValueError as exc:
-        raise ConfigError(f"invalid port forward {spec!r}: ports must be numbers") from exc
-    if not 1 <= port <= 65535:
-        raise ConfigError(f"invalid port forward {spec!r}: ports must be between 1 and 65535")
-    return port
-
-
-def parse_port_forward(spec: str) -> tuple[str, int, int]:
-    parts = spec.split(":")
-    if len(parts) == 1:
-        port = _validate_port(parts[0], spec)
-        return "127.0.0.1", port, port
-    if len(parts) in {2, 3}:
-        host = "127.0.0.1" if len(parts) == 2 else parts[0]
-        if not host:
-            raise ConfigError(f"invalid port forward {spec!r}: host address is empty")
-        host_port, guest_port = (_validate_port(part, spec) for part in parts[-2:])
-        return host, host_port, guest_port
-    raise ConfigError(
-        f"invalid port forward {spec!r}: use GUEST_PORT, HOST_PORT:GUEST_PORT, "
-        "or BIND_HOST:HOST_PORT:GUEST_PORT"
-    )
-
-
-def port_forwards_from_specs(specs: Sequence[str]) -> list[dict[str, Any]]:
-    return [
-        {"host_address": host, "host_port": host_port, "guest_port": guest_port}
-        for host, host_port, guest_port in (parse_port_forward(spec) for spec in specs)
-    ]
+port_forwards_from_specs = gateway.port_forwards_from_specs
 
 
 @contextmanager
@@ -451,4 +420,23 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("Port forwards: " + (", ".join(port_forwards) if port_forwards else "-"))
         print(f"Auth callback: {auth_status}")
         print(f"Auth detail: {auth_detail}")
+        for line in gateway.diagnostic_lines(
+            name, configured=getattr(args, "gateway_config", None)
+        ):
+            print(line)
+    return 0
+
+
+def cmd_diagnostics(args: argparse.Namespace) -> int:
+    name = vm_name_from_arg_or_config(
+        args, getattr(args, "config_data", None), "network diagnostics"
+    )
+    if name is None:
+        return 2
+    for line in gateway.diagnostic_lines(
+        name,
+        configured=getattr(args, "gateway_config", None),
+        include_disabled=True,
+    ):
+        print(line)
     return 0
