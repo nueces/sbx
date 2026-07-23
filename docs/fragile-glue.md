@@ -31,3 +31,13 @@ Why: SmolVM 0.0.28 has public VM lifecycle and preset application APIs, but no p
 Fragility: both methods are private and may change. The SmolVM dependency remains pinned to `smolvm==0.0.28`, and all preset-specific private access is contained in `smolvm_preset.py`.
 
 Exit: replace this module with an upstream public preset creation API that accepts explicit VM resources, mounts, port forwards, timeouts, and host credential/environment inputs; then remove this entry and the adjacent `ponytail:` comment.
+
+## SmolVM external QEMU network backend facade
+
+Used by `src/sbx/smolvm_network.py` for gateway-mode QEMU argv construction.
+
+Why: SmolVM 0.0.28's pure `build_qemu_argv()` supports only SLIRP/user and TAP backends. The sbx facade delegates stock argv construction to that function, then replaces its one typed network attachment with a worker-owned Unix stream. It rejects unexpected SmolVM argv shapes and supports only the pinned SmolVM release; non-gateway calls remain byte-for-byte stock SmolVM behavior.
+
+Upstream status: the matching API is prepared but not yet submitted. It adds an optional typed `ExternalNetworkBackend(kind="unix-stream", socket_path=..., role="qemu-connects", mac=...)` input to SmolVM's QEMU argv builder/runtime path, preserving the existing NIC model and making the typed backend mutually exclusive with SLIRP, TAP, and host forwards. Required upstream tests are the same exact-argv, malformed-path, unsupported-backend, and unchanged-default cases in `tests/test_smolvm_network.py`. No SmolVM checkout or unreleased package is a runtime dependency.
+
+Exit: after a released SmolVM exposes that API, delegate to it, expand the accepted SmolVM version, and remove only the local argv replacement.
