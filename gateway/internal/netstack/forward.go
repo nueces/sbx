@@ -30,11 +30,30 @@ type Mediator struct {
 	dialer                     net.Dialer
 }
 
+type FlowQuota struct {
+	tokens chan struct{}
+}
+
+func NewFlowQuota(limit int) *FlowQuota {
+	return &FlowQuota{tokens: make(chan struct{}, limit)}
+}
+
+func (q *FlowQuota) acquire() bool {
+	select {
+	case q.tokens <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (q *FlowQuota) release() { <-q.tokens }
+
 type TCPForwarder struct {
 	config     config.Config
 	resolver   *syntheticdns.Resolver
 	mediator   *Mediator
-	total      chan struct{}
+	total      *FlowQuota
 	mu         sync.Mutex
 	perDest    map[string]int
 	dialer     net.Dialer
@@ -64,9 +83,9 @@ func NewMediator(address string, key []byte, vmID, incarnation string) (*Mediato
 	return &Mediator{address: address, vmID: vmID, incarnation: incarnation, issuer: issuer, dialer: net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}}, nil
 }
 
-func (n *Network) ForwardTCP(cfg config.Config, resolver *syntheticdns.Resolver, mediator *Mediator) *TCPForwarder {
+func (n *Network) ForwardTCP(cfg config.Config, resolver *syntheticdns.Resolver, mediator *Mediator, total *FlowQuota) *TCPForwarder {
 	f := &TCPForwarder{
-		config: cfg, resolver: resolver, mediator: mediator, total: make(chan struct{}, cfg.Quotas.TCPFlows),
+		config: cfg, resolver: resolver, mediator: mediator, total: total,
 		perDest: make(map[string]int), dialer: net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second},
 	}
 	forwarder := tcp.NewForwarder(n.Stack, 0, cfg.Quotas.TCPFlows, f.handle)
@@ -104,15 +123,13 @@ func (f *TCPForwarder) handle(request *tcp.ForwarderRequest) {
 }
 
 func (f *TCPForwarder) acquire(host string) bool {
-	select {
-	case f.total <- struct{}{}:
-	default:
+	if !f.total.acquire() {
 		return false
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.perDest[host] >= f.config.Quotas.FlowsPerDestination {
-		<-f.total
+		f.total.release()
 		return false
 	}
 	f.perDest[host]++
@@ -126,7 +143,7 @@ func (f *TCPForwarder) release(host string) {
 		delete(f.perDest, host)
 	}
 	f.mu.Unlock()
-	<-f.total
+	f.total.release()
 }
 
 func (f *TCPForwarder) forward(request *tcp.ForwarderRequest, rule config.Rule, host string, port uint16, syntheticIP netip.Addr, synthetic bool) {

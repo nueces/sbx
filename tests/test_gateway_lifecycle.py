@@ -45,6 +45,9 @@ class FakeListener:
     def getsockname(self) -> tuple[str, int]:
         return self.address
 
+    def fileno(self) -> int:
+        return 900_100
+
     def close(self) -> None:
         self.closed = True
 
@@ -124,6 +127,7 @@ class FakeRunner:
                 "generation": argv[-1],
                 "digest": policy["digest"],
                 "mediator": True,
+                "ingress": 1,
             }
             payload = json.dumps(ready).encode() + b'\n{"status":"network-ready"}\n'
             if self.failure == "worker_status":
@@ -207,8 +211,9 @@ def test_fake_runner_and_socket_normal_lifecycle(
     assert state["status"] == "starting"
     assert state["listeners"][0]["host_port"] == 45123
     assert instance.qemu_socket.is_socket()
+    assert runner.passed_fds[-1] == listeners[0].fileno()
     with pytest.raises(OSError):
-        os.fstat(runner.passed_fds[-1])
+        os.fstat(runner.passed_fds[-2])
 
     instance.vm_network_ready(12345)
     state = gateway.read_state(instance.directory)  # type: ignore[arg-type]
@@ -256,6 +261,44 @@ def test_every_child_startup_failure_rolls_back_fake_resources(
     assert instance.directory is not None and not instance.directory.exists()
     assert listeners[0].closed
     assert all(process.poll() is not None for process in runner.processes)
+
+
+def test_port_zero_listener_is_reserved_without_probe_release(tmp_path: Path) -> None:
+    config = gateway.parse_config(
+        {"network": {"ingress": [{"guest_port": 3000}]}}, platform="linux"
+    )
+    assert config is not None
+    instance = gateway.GatewayController(config, "vm1", root=tmp_path / "state")
+    instance._reserve_listeners()
+    try:
+        host, port = instance.listener_rules[0].listen_host, instance.listener_rules[0].host_port
+        assert host == "127.0.0.1" and port != 0
+        competing = socket.socket()
+        try:
+            with pytest.raises(OSError):
+                competing.bind((host, port))
+        finally:
+            competing.close()
+    finally:
+        instance.drain()
+
+
+def test_explicit_non_loopback_bind_warns_and_is_exact(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = gateway.parse_config(
+        {"network": {"ingress": [{"listen": "0.0.0.0:0", "guest_port": 4180}]}},
+        platform="linux",
+    )
+    assert config is not None
+    instance = gateway.GatewayController(config, "vm1", root=tmp_path / "state")
+    instance._reserve_listeners()
+    try:
+        assert instance.listener_rules[0].listen_host == "0.0.0.0"
+        warning = capsys.readouterr().err
+        assert "warning" in warning and "reachable" in warning and "0.0.0.0" in warning
+    finally:
+        instance.drain()
 
 
 def test_listener_startup_failure_prevents_children_and_removes_state(
@@ -487,8 +530,8 @@ listener=socket.socket(socket.AF_UNIX)
 listener.bind(sys.argv[1])
 policy=json.load(open(sys.argv[2]))
 print(json.dumps({'status':'ready','version':1,'vm_id':'vm-direct',
-                  'generation':'generation1','digest':policy['digest'],'mediator':True}),
-      flush=True)
+                  'generation':'generation1','digest':policy['digest'],'mediator':True,
+                  'ingress':1}), flush=True)
 print('{"status":"network-ready"}', flush=True)
 signal.pause()
 """
@@ -498,8 +541,8 @@ listener=socket.socket(socket.AF_UNIX)
 listener.bind(sys.argv[1])
 policy=json.load(open(sys.argv[2]))
 print(json.dumps({'status':'ready','version':1,'vm_id':'vm-direct',
-                  'generation':'generation1','digest':policy['digest'],'mediator':True}),
-      flush=True)
+                  'generation':'generation1','digest':policy['digest'],'mediator':True,
+                  'ingress':1}), flush=True)
 while True:
     print('{"status":"stats"}', flush=True)
     time.sleep(0.01)

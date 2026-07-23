@@ -104,6 +104,7 @@ class IngressRule:
 class Quotas:
     tcp_flows: int = 512
     flows_per_destination: int = 64
+    ingress_flows: int = 64
     dns_mappings: int = 1024
     open_files: int = 4096
 
@@ -169,6 +170,16 @@ class GatewayConfig:
             "vm_id": vm_id,
             "generation": generation,
             "rules": rules,
+            "ingress": [
+                {
+                    "id": rule.id,
+                    "listen_host": rule.listen_host,
+                    "host_port": rule.host_port,
+                    "guest_address": rule.guest_address,
+                    "guest_port": rule.guest_port,
+                }
+                for rule in sorted(self.ingress, key=lambda rule: rule.id)
+            ],
             "quotas": asdict(self.quotas),
         }
         digest = hashlib.sha256(_compact_json(data)).hexdigest()
@@ -463,12 +474,19 @@ def _quotas(value: object) -> Quotas:
     table = _mapping(value, "[network.quotas]")
     _reject_unknown(
         table,
-        {"tcp_flows", "flows_per_destination", "dns_mappings", "open_files"},
+        {
+            "tcp_flows",
+            "flows_per_destination",
+            "ingress_flows",
+            "dns_mappings",
+            "open_files",
+        },
         "[network.quotas]",
     )
     return Quotas(
         _quota_int(table, "tcp_flows", 512),
         _quota_int(table, "flows_per_destination", 64),
+        _quota_int(table, "ingress_flows", 64),
         _quota_int(table, "dns_mappings", 1024),
         _quota_int(table, "open_files", 4096, 64),
     )
@@ -999,11 +1017,20 @@ class GatewayController:
                 listener.bind((rule.listen_host, rule.host_port))
                 listener.listen()
                 host, port = listener.getsockname()[:2]
+                host = ipaddress.ip_address(host).compressed
+                if host != rule.listen_host or (rule.host_port and port != rule.host_port):
+                    raise GatewayLifecycleError("ingress listener did not bind the exact address")
             except BaseException:
                 listener.close()
                 raise
             self.listeners.append(listener)
-            rules.append(replace(rule, listen_host=str(host), host_port=int(port)))
+            rules.append(replace(rule, listen_host=host, host_port=int(port)))
+            if not ipaddress.ip_address(host).is_loopback:
+                print(
+                    f"sbx: warning: gateway ingress {host}:{port} is reachable from "
+                    "the corresponding host networks",
+                    file=sys.stderr,
+                )
         self.listener_rules = tuple(rules)
 
     @staticmethod
@@ -1140,6 +1167,13 @@ class GatewayController:
                     self.mediator_address,
                 )
             )
+        for rule, listener in zip(self.listener_rules, self.listeners, strict=True):
+            command.extend(
+                (
+                    "--ingress-fd",
+                    f"{self.vm_id}/{self.generation}/{rule.id}={listener.fileno()}",
+                )
+            )
         return command
 
     def _read_json_fd(
@@ -1248,12 +1282,15 @@ class GatewayController:
             has_http = any(rule.protocol == "http" for rule in self.config.rules)
             worker_key = self._pipe_with(key) if has_http else None
             try:
+                ingress_fds = tuple(listener.fileno() for listener in self.listeners)
                 worker = self.runner(
                     self._worker_command(worker_key),
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=self._open_log("worker.log"),
-                    pass_fds=() if worker_key is None else (worker_key,),
+                    pass_fds=ingress_fds
+                    if worker_key is None
+                    else (worker_key, *ingress_fds),
                     start_new_session=True,
                 )
                 self.processes["worker"] = worker
@@ -1269,6 +1306,7 @@ class GatewayController:
                 or ready.get("generation") != self.generation
                 or ready.get("digest") != policy.get("digest")
                 or ready.get("mediator") is not has_http
+                or ready.get("ingress") != len(self.listener_rules)
             ):
                 raise GatewayLifecycleError("worker readiness identity mismatch")
             if not self.qemu_socket.exists() or not stat.S_ISSOCK(self.qemu_socket.lstat().st_mode):
@@ -1334,6 +1372,8 @@ class GatewayController:
     def drain(self) -> None:
         """Stop accepting ingress before QEMU teardown."""
         for listener in self.listeners:
+            with suppress(Exception):
+                listener.shutdown(socket.SHUT_RDWR)
             with suppress(Exception):
                 listener.close()
         self.listeners.clear()
