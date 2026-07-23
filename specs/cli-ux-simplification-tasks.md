@@ -2,12 +2,12 @@
 
 ## Implementation status
 
-Implemented and committed in `feature/cli-ux-simplification`.
+Implemented in `feature/cli-ux-simplification`; curated-image default-user follow-up pending commit.
 
 Latest validation:
 
-- full suite: 204 passed;
-- coverage: 91.58% (90% required);
+- full suite: 207 passed;
+- coverage: 91.64% (90% required);
 - Ruff check and `git diff --check`: passed;
 - full format check: only pre-existing `main` drift remains in `.github/scripts/generate_complexity_report.py`, `tests/test_build_debian_image.py`, `tests/test_check_image_build_inputs.py`, and `tests/test_smolvm_preset.py`; and
 - website review: no changed flag or behavior is described there, so no website branch/diff was needed.
@@ -96,6 +96,11 @@ Do not edit or commit directly to `main`, `specification/main`, or `webpage/main
 - [x] Verify generated config keeps `copy_host_credentials = false` when that value is written.
 - [x] Add a stderr warning only when `copy_host_credentials = true` is about to provision a preset-backed VM.
 - [x] Verify the warning is absent for an existing VM and a local-image path where credentials are not copied.
+- [x] Add `sbx.run_user = "agent"` to manifests produced by `sbx image build`.
+- [x] Use manifest `sbx.run_user` only when CLI and config omit `run_user`, validating it with the existing guest-user rules.
+- [x] Persist a manifest-selected user in automatically generated `.sbx.toml`.
+- [x] Keep root behavior for generic presets and custom manifests without `sbx.run_user`.
+- [x] Keep `project_path` explicit; do not infer a writable current-directory mount from the image.
 
 ### T007 — Preserve config-writing rules
 
@@ -178,6 +183,7 @@ Do not edit or commit directly to `main`, `specification/main`, or `webpage/main
 
 - [x] Replace the exhaustive README reference with a friendly curated workflow: image build, first sandbox/config creation, daily commands, adding mounts with stop/run, and installing persistent per-VM tools through `sbx shell`.
 - [x] Explain that the curated image contains Pi, OpenCode launches from a shell, and agent npm commands use vendor-supported install flags.
+- [x] Remove `--run-user agent` from the curated first-run example after the manifest supplies it; retain explicit `--project-path .`.
 - [x] Point complete command/config detail to `sbx --help`, `sbx.toml.example`, and focused docs.
 - [x] Replace security CLI examples with reproducible `.sbx.toml` examples.
 - [x] Update `docs/ergonomics.md` to match accepted name, list, config, and first-run behavior.

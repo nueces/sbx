@@ -96,6 +96,18 @@ sbx network forward --name OTHER_VM SPEC...
 
 Its `--name` selects another existing VM and removes the current positional guessing heuristic.
 
+## Curated-image defaults
+
+Add `"run_user": "agent"` under `sbx` in manifests produced by `sbx image build`. When a VM is configured with a local image, resolve `run_user` in this order:
+
+1. `--run-user`;
+2. `[sbx].run_user`; then
+3. manifest `sbx.run_user`.
+
+Validate a manifest-provided user with the existing guest-user validation and copy the effective value into generated `.sbx.toml`. Reuse the manifest default for an existing VM when the manifest remains readable; existing-VM reuse must not fail only because an old image path or manifest is unavailable. A manifest without `sbx.run_user` keeps the existing root behavior, so generic presets and custom images remain unchanged.
+
+Do not infer `project_path = "."` from the image or current directory. A project mount grants writable host access and remains explicit on first creation through `--project-path`; automatic config creation persists it for later runs.
+
 ## JSON contract
 
 Errors remain human-readable on stderr with nonzero exit status; this feature does not add a JSON error schema.
@@ -215,7 +227,7 @@ At minimum inspect and update:
 - shell-completion examples/tests; and
 - `webpage/main/index.html` or its matching website feature worktree if it mentions changed behavior.
 
-Make the README a friendly guide rather than a complete reference. Lead with installation, `sbx image build`, first project creation with the curated image, subsequent short commands, adding mounts through `.sbx.toml` plus `sbx stop`/`sbx run`, and installing extra tools through `sbx shell`. Explain that VM-disk changes survive stop/start but not `recreate` or `rm`; note that the curated image includes Pi, OpenCode launches from a shell, and npm agent commands should follow vendor-supported installation flags. Link focused docs and `sbx --help` for complete details.
+Make the README a friendly guide rather than a complete reference. Lead with installation, `sbx image build`, first project creation with the curated image, subsequent short commands, adding mounts through `.sbx.toml` plus `sbx stop`/`sbx run`, and installing extra tools through `sbx shell`. The curated first-run command omits `--run-user agent` because the image manifest supplies it, but keeps `--project-path .` explicit. Explain that VM-disk changes survive stop/start but not `recreate` or `rm`; note that the curated image includes Pi, OpenCode launches from a shell, and npm agent commands should follow vendor-supported installation flags. Link focused docs and `sbx --help` for complete details.
 
 Document security policy as reproducible `.sbx.toml` configuration. Remove examples for deleted flags and show the new list, forwarding, JSON, and first-run behavior.
 

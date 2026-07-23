@@ -1,6 +1,6 @@
 # sbx CLI UX simplification
 
-Status: implemented and committed in `feature/cli-ux-simplification`.
+Status: implemented in `feature/cli-ux-simplification`; curated-image default-user follow-up pending commit.
 
 ## Goal
 
@@ -123,6 +123,8 @@ Do not add another namespace or a required setup command.
 8. Improve first-run output after automatic `.sbx.toml` creation with concise next-step commands shown only on initial project creation. **Decision: accepted.**
 9. Keep `sbx image ls` and add the visible `sbx image list` alias for consistency with top-level listing. **Decision: accepted.**
 10. Replace the exhaustive README reference with a friendly guide centered on the curated image, first project creation, durable `.sbx.toml`, adding mounts after creation, and installing extra tools through `sbx shell`. Keep full detail in focused docs and command help. **Decision: accepted.**
+11. Make the curated image declare `run_user = "agent"` in its manifest. Use that value only when neither CLI nor configuration selects a user, and persist the effective user in generated `.sbx.toml`. Do not make `agent` the global default for generic presets or custom images. **Decision: accepted.**
+12. Keep `--project-path .` explicit on first creation because it grants the VM writable access to a host directory. Persist it in generated `.sbx.toml` so later commands remain short. **Decision: accepted.**
 
 ## Configuration wizard decision
 
@@ -152,3 +154,5 @@ Removed syntax is not a permanent behavior contract. Do not keep tests that enum
 - Top-level listing exposes `list`/`ls`, removal exposes `remove`/`rm`, and image listing exposes `image list`/`image ls`.
 - First-run use still requires no initialization command.
 - The README leads with the curated image and project workflow, including the stop/run cycle required to add mounts to an existing sandbox.
+- The curated image defaults to guest user `agent`, while generic presets and manifests without `sbx.run_user` preserve the existing root behavior.
+- Host project mounting remains an explicit first-run choice through `--project-path`.
