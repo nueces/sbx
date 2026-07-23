@@ -14,10 +14,18 @@ import (
 )
 
 func TestForwarderQuotas(t *testing.T) {
-	f := &TCPForwarder{config: config.Config{Quotas: config.Quotas{FlowsPerDestination: 1}}, total: NewFlowQuota(1), perDest: make(map[string]int)}
+	total := NewFlowQuota(2)
+	f := &TCPForwarder{config: config.Config{Quotas: config.Quotas{FlowsPerDestination: 1}}, total: total, perDest: make(map[string]int)}
 	if !f.acquire("example.com") || f.acquire("example.com") {
-		t.Fatal("flow quota not enforced")
+		t.Fatal("per-destination quota not enforced")
 	}
+	if total.Active() != 1 || f.Stats().PerDestinationRejected != 1 {
+		t.Fatal("per-destination quota was not classified or released")
+	}
+	if !f.acquire("other.example") || f.acquire("third.example") || total.Rejected() != 1 {
+		t.Fatal("total flow quota not enforced or classified")
+	}
+	f.release("other.example")
 	f.release("example.com")
 	if !f.acquire("example.com") {
 		t.Fatal("flow quota was not released")

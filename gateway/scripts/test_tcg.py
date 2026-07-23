@@ -156,6 +156,8 @@ def start_mediator(
     upstream_port: int,
     key: bytes,
     incarnation: str = "worker1",
+    vm_id: str = "tcg-test",
+    open_files: int = 2048,
 ) -> tuple[subprocess.Popen[str], dict[str, object], Path]:
     mediator_dir = Path(__file__).parents[1] / "mediator"
     python = tool(
@@ -193,7 +195,7 @@ def start_mediator(
             python,
             str(mediator_dir / "launch.py"),
             "--vm-id",
-            "tcg-test",
+            vm_id,
             "--incarnation",
             incarnation,
             "--key-fd",
@@ -207,7 +209,7 @@ def start_mediator(
             "--upstream-ca",
             str(upstream_ca),
             "--open-files",
-            "4096",
+            str(open_files),
         ],
         pass_fds=(key_read, ready_write, auth_read),
         text=True,
@@ -223,7 +225,11 @@ def start_mediator(
     readable, _, _ = select.select([ready_read], [], [], COMMAND_TIMEOUT)
     payload = os.read(ready_read, 4096) if readable else b""
     os.close(ready_read)
-    require(bool(payload), "mediator readiness timed out")
+    if not payload:
+        terminate(process)
+        stdout, stderr = process.communicate(timeout=PROCESS_STOP_TIMEOUT)
+        files = sorted(path.name for path in confdir.iterdir())
+        raise SystemExit(f"mediator readiness timed out ({files}): {(stdout + stderr)[-4000:]}")
     return process, json.loads(payload), confdir
 
 
@@ -237,6 +243,10 @@ def start_worker(
     key: bytes,
     incarnation: str,
     ingress_listeners: list[socket.socket],
+    *,
+    vm_id: str = "tcg-test",
+    generation: str = "g1",
+    ingress_ids: tuple[str, ...] = ("dev-server", "oauth-callback"),
 ) -> subprocess.Popen[str]:
     key_read, key_write = os.pipe()
     token_read, token_write = os.pipe()
@@ -244,34 +254,34 @@ def start_worker(
     os.write(token_write, os.urandom(32))
     os.close(key_write)
     os.close(token_write)
+    command = [
+        str(gateway),
+        "--socket",
+        str(qemu_socket),
+        "--config",
+        str(config),
+        "--vm-id",
+        vm_id,
+        "--generation",
+        generation,
+        "--digest",
+        digest,
+        "--qemu-listener-fd",
+        str(qemu_listener.fileno()),
+        "--incarnation-token-fd",
+        str(token_read),
+        "--mediator-address",
+        f"{mediator_ready['host']}:{mediator_ready['port']}",
+        "--capability-key-fd",
+        str(key_read),
+        "--worker-incarnation",
+        incarnation,
+    ]
+    require(len(ingress_ids) == len(ingress_listeners), "ingress listener identity mismatch")
+    for ingress_id, listener in zip(ingress_ids, ingress_listeners, strict=True):
+        command.extend(("--ingress-fd", f"{vm_id}/{generation}/{ingress_id}={listener.fileno()}"))
     process = subprocess.Popen(
-        [
-            str(gateway),
-            "--socket",
-            str(qemu_socket),
-            "--config",
-            str(config),
-            "--vm-id",
-            "tcg-test",
-            "--generation",
-            "g1",
-            "--digest",
-            digest,
-            "--qemu-listener-fd",
-            str(qemu_listener.fileno()),
-            "--incarnation-token-fd",
-            str(token_read),
-            "--mediator-address",
-            f"{mediator_ready['host']}:{mediator_ready['port']}",
-            "--capability-key-fd",
-            str(key_read),
-            "--worker-incarnation",
-            incarnation,
-            "--ingress-fd",
-            f"tcg-test/g1/dev-server={ingress_listeners[0].fileno()}",
-            "--ingress-fd",
-            f"tcg-test/g1/oauth-callback={ingress_listeners[1].fileno()}",
-        ],
+        command,
         pass_fds=(
             qemu_listener.fileno(),
             token_read,
@@ -294,8 +304,8 @@ def start_worker(
     ready = json.loads(payload)
     require(
         ready.get("status") == "ready"
-        and ready.get("vm_id") == "tcg-test"
-        and ready.get("generation") == "g1"
+        and ready.get("vm_id") == vm_id
+        and ready.get("generation") == generation
         and ready.get("digest") == digest
         and ready.get("incarnation") == incarnation
         and len(str(ready.get("incarnation_proof", ""))) == 64,

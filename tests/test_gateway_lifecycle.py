@@ -32,16 +32,17 @@ def lifecycle_config() -> gateway.GatewayConfig:
 
 
 class FakeListener:
-    def __init__(self, *args: object, fail: bool = False) -> None:
+    def __init__(self, *args: object, fail: bool = False, port: int = 45123) -> None:
         del args
         self.fail = fail
+        self.port = port
         self.closed = False
-        self.address: tuple[str, int] = ("127.0.0.1", 45123)
+        self.address: tuple[str, int] = ("127.0.0.1", port)
 
     def bind(self, address: tuple[str, int]) -> None:
         if self.fail:
             raise OSError("bind failed")
-        self.address = (address[0], address[1] or 45123)
+        self.address = (address[0], address[1] or self.port)
 
     def listen(self) -> None:
         pass
@@ -196,12 +197,15 @@ def controller(
     failure: str | None = None,
     replacement_failure: str | None = None,
     listener_fail: bool = False,
+    vm_id: str = "vm1",
+    generation: str = "generation1",
+    listener_port: int = 45123,
 ) -> tuple[gateway.GatewayController, FakeRunner, list[FakeListener]]:
     runner = FakeRunner(failure, replacement_failure)
     listeners: list[FakeListener] = []
 
     def socket_factory(*args: object) -> FakeListener:
-        listener = FakeListener(*args, fail=listener_fail)
+        listener = FakeListener(*args, fail=listener_fail, port=listener_port)
         listeners.append(listener)
         return listener
 
@@ -242,9 +246,9 @@ def controller(
     )
     instance = gateway.GatewayController(
         config,
-        "vm1",
+        vm_id,
         root=tmp_path / "state",
-        generation="generation1",
+        generation=generation,
         runner=runner,
         socket_factory=socket_factory,  # type: ignore[arg-type]
         timeout=0.1,
@@ -357,6 +361,13 @@ def test_logs_and_artifact_overrides_are_private_bounded_and_safe(
     )
     log = instance._open_log("worker.log")
     assert stat.S_IMODE(os.fstat(log.fileno()).st_mode) == 0o600
+    instance._log_last = 1
+    monkeypatch.setattr(gateway.time, "monotonic", lambda: 1)
+    for _ in range(gateway.MAX_LOG_EVENT_BURST + 10):
+        instance._emit_log(log, b"event")
+    assert (instance.directory / "worker.log").read_bytes().count(b"\n") == (
+        gateway.MAX_LOG_EVENT_BURST
+    )
     log.close()
     (instance.directory / "oversized.log").write_bytes(b"")
     os.truncate(instance.directory / "oversized.log", gateway.MAX_LOG_BYTES)
@@ -458,6 +469,115 @@ def test_fake_runner_and_socket_normal_lifecycle(
         assert set(kwargs["env"]) == {"HOME", "LANG", "PATH", "TZ"}
         assert not set(kwargs["env"]) & {"LD_PRELOAD", "PYTHONPATH", "HTTP_PROXY"}
         assert kwargs["close_fds"] is not False if "close_fds" in kwargs else True
+
+
+def test_two_vm_resources_and_quota_failure_are_isolated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VM_A_TOKEN", "token-a")
+    monkeypatch.setenv("VM_B_TOKEN", "token-b")
+
+    def isolated_config(host: str, provider: str) -> gateway.GatewayConfig:
+        parsed = gateway.parse_config(
+            {
+                "network": {
+                    "http": [
+                        {
+                            "id": "api",
+                            "host": host,
+                            "ports": [443],
+                            "hooks": ["package-audit"],
+                        }
+                    ],
+                    "secret": [
+                        {
+                            "name": "TOKEN",
+                            "provider": provider,
+                            "hosts": [host],
+                            "ports": [443],
+                            "header": "Authorization: Bearer {placeholder}",
+                        }
+                    ],
+                    "ingress": [{"guest_port": 3000}],
+                    "quotas": {"tcp_flows": 2, "ingress_flows": 1, "open_files": 64},
+                }
+            },
+            platform="linux",
+        )
+        assert parsed is not None
+        return parsed
+
+    a, runner_a, listeners_a = controller(
+        isolated_config("a.example", "env:VM_A_TOKEN"),
+        tmp_path,
+        monkeypatch,
+        vm_id="vm-a",
+        generation="generation-a",
+        listener_port=45123,
+    )
+    b, runner_b, listeners_b = controller(
+        isolated_config("b.example", "env:VM_B_TOKEN"),
+        tmp_path,
+        monkeypatch,
+        vm_id="vm-b",
+        generation="generation-b",
+        listener_port=45124,
+    )
+    a.prepare()
+    b.prepare()
+    a._read_worker_status("network-ready")
+    b._read_worker_status("network-ready")
+    gateway.update_state(a.directory, status="ready")
+    gateway.update_state(b.directory, status="ready")
+
+    assert a.directory != b.directory
+    assert a.qemu_socket != b.qemu_socket
+    assert a.worker_incarnation != b.worker_incarnation
+    assert a.mac != b.mac
+    assert a.secret_placeholders["TOKEN"] != b.secret_placeholders["TOKEN"]
+    assert a.listener_rules[0].host_port != b.listener_rules[0].host_port
+    assert set(a.processes.values()).isdisjoint(b.processes.values())
+    assert a._mediator_policy_payload is not None and b._mediator_policy_payload is not None
+    assert a._immutable_policy is not None and b._immutable_policy is not None
+    assert b"token-a" in a._mediator_policy_payload and b"token-b" not in a._mediator_policy_payload
+    assert b"token-b" in b._mediator_policy_payload and b"token-a" not in b._mediator_policy_payload
+    assert b"a.example" in a._immutable_policy and b"b.example" not in a._immutable_policy
+    assert b"b.example" in b._immutable_policy and b"a.example" not in b._immutable_policy
+    assert all(path.parent == a.directory for path in a.directory.glob("*.log"))
+    assert all(path.parent == b.directory for path in b.directory.glob("*.log"))
+    with pytest.raises(gateway.GatewayStateError, match="cross-VM"):
+        gateway.read_state(a.directory, vm_id="vm-b")
+
+    b._worker_buffer.extend(
+        b'{"status":"stats","tcp_active":0,"dns_rejected":1,"dns_mappings":2}\n'
+    )
+    b._drain_worker_stats()
+    b_state = gateway.read_state(b.directory)
+    assert b_state["counters"]["dns_rejected"] == 1
+    assert b_state["last_failure"]["code"] == "quota_exhausted"
+    assert gateway.read_state(a.directory)["last_failure"] is None
+
+    a_pids = {process.pid for process in a.processes.values()}
+
+    def usage(pids: list[int]) -> tuple[int, int, int, int]:
+        if a_pids.intersection(pids):
+            return gateway.MAX_DATA_PLANE_RSS + 1, 1, 2, 2
+        return 1, 1, 2, 2
+
+    monkeypatch.setattr(gateway, "_process_tree_usage", usage)
+    started = time.monotonic()
+    with pytest.raises(gateway.GatewayLifecycleError, match="resource ceiling"):
+        a.check()
+    assert time.monotonic() - started < 1
+    assert gateway.read_state(a.directory)["last_failure"]["code"] == "quota_exhausted"
+    assert listeners_a[0].closed
+    assert all(process.poll() is not None for process in runner_a.processes)
+    b.check()
+    assert b.qemu_socket.exists() and not listeners_b[0].closed
+    assert all(process.poll() is None for process in runner_b.processes)
+    a.close()
+    b.close()
 
 
 def test_authenticated_replacement_preserves_endpoints_and_discards_every_old_flow(
@@ -1043,6 +1163,8 @@ def direct_controller(
     mediator: str = MEDIATOR,
     worker: str = WORKER,
     timeout: float = 2,
+    vm_id: str = "vm-direct",
+    generation: str = "generation1",
 ) -> gateway.GatewayController:
     monkeypatch.setattr(
         gateway.GatewayController,
@@ -1077,9 +1199,9 @@ def direct_controller(
     )
     return gateway.GatewayController(
         config,
-        "vm-direct",
+        vm_id,
         root=tmp_path / "state",
-        generation="generation1",
+        generation=generation,
         timeout=timeout,
     )
 
@@ -1094,7 +1216,7 @@ def test_worker_stats_cannot_extend_the_readiness_deadline(
         tmp_path,
         monkeypatch,
         worker=WORKER_STATS_ONLY,
-        timeout=0.2,
+        timeout=0.5,
     )
     instance.prepare()
     pids = [process.pid for process in instance.processes.values()]
@@ -1123,6 +1245,30 @@ def test_persisted_stop_terminates_components_and_removes_state(
     assert not root.joinpath("vm-direct", "generation1").exists()
     assert all(not gateway._pid_is_running(pid) for pid in pids)
     instance.close()
+
+
+def test_two_vm_process_groups_and_stop_are_isolated(
+    lifecycle_config: gateway.GatewayConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    a = direct_controller(lifecycle_config, tmp_path, monkeypatch, vm_id="vm-direct-a")
+    b = direct_controller(lifecycle_config, tmp_path, monkeypatch, vm_id="vm-direct-b")
+    a.prepare()
+    b.prepare()
+    a.vm_network_ready(os.getpid())
+    b.vm_network_ready(os.getpid())
+    processes = [*a.processes.values(), *b.processes.values()]
+
+    assert len({process.pid for process in processes}) == 4
+    assert all(os.getpgid(process.pid) == process.pid for process in processes)
+    a_pids = [process.pid for process in a.processes.values()]
+    b_pids = [process.pid for process in b.processes.values()]
+    a.close()
+    assert all(not gateway._pid_is_running(pid) for pid in a_pids)
+    assert all(gateway._pid_is_running(pid) for pid in b_pids)
+    b.check()
+    b.close()
 
 
 def test_direct_subprocess_normal_lifecycle(

@@ -35,6 +35,13 @@ GATEWAY_MEDIATOR_PYTHON = GATEWAY_SOURCE_DIR / "mediator" / ".venv" / "bin" / "p
 GATEWAY_MEDIATOR_LAUNCHER = GATEWAY_SOURCE_DIR / "mediator" / "launch.py"
 MAX_CONFIG_BYTES = 1 << 20
 MAX_LOG_BYTES = 100 * 1024 * 1024
+MAX_LOG_TOTAL_BYTES = MAX_LOG_BYTES
+MAX_LOG_EVENTS_PER_SECOND = 1000
+MAX_LOG_EVENT_BURST = 2000
+MAX_LOG_EVENT_BYTES = 64 * 1024
+MAX_DATA_PLANE_RSS = 512 * 1024 * 1024
+MAX_DATA_PLANE_PROCESSES = 16
+MAX_DATA_PLANE_THREADS = 256
 GUEST_ADDRESS = "192.0.2.2"
 APPROVED_HOOKS = frozenset({"package-audit"})
 _ALLOWED_NETWORK_KEYS = frozenset(
@@ -635,11 +642,14 @@ def parse_config(config: Mapping[str, Any], *, platform: str | None = None) -> G
             )
         listeners.add(listener)
 
+    quotas = _quotas(network.get("quotas"))
+    if len(ingress) > quotas.ingress_flows or len(ingress) + 16 > quotas.open_files:
+        raise ConfigError("network ingress listeners exceed the per-VM resource ceilings")
     return GatewayConfig(
         tuple(sorted(rules, key=lambda rule: rule.id)),
         tuple(sorted(secrets, key=lambda binding: binding.name)),
         tuple(ingress),
-        _quotas(network.get("quotas")),
+        quotas,
         _reconnection(network.get("reconnection")),
         selected_platform,
     )
@@ -1007,6 +1017,36 @@ def _hardening_ready(value: object, platform: str) -> bool:
     )
 
 
+def _process_tree_usage(root_pids: Sequence[int]) -> tuple[int, int, int, int]:
+    """Return RSS bytes, descriptors, processes, and threads for owned process trees."""
+    pending = list(root_pids)
+    seen: set[int] = set()
+    rss = descriptors = threads = 0
+    while pending:
+        pid = pending.pop()
+        if pid in seen or pid <= 0:
+            continue
+        seen.add(pid)
+        process = Path("/proc") / str(pid)
+        try:
+            status = process.joinpath("status").read_text().splitlines()
+        except OSError:
+            continue
+        for line in status:
+            if line.startswith("VmRSS:"):
+                rss += int(line.split()[1]) * 1024
+            elif line.startswith("Threads:"):
+                threads += int(line.split()[1])
+        with suppress(OSError):
+            descriptors += sum(1 for _ in process.joinpath("fd").iterdir())
+        with suppress(OSError):
+            tasks = process.joinpath("task").iterdir()
+            for task in tasks:
+                children = task.joinpath("children").read_text().split()
+                pending.extend(int(value) for value in children)
+    return rss, descriptors, len(seen), threads
+
+
 class GatewayController:
     """Own one gateway incarnation from reserved listeners through teardown."""
 
@@ -1039,6 +1079,11 @@ class GatewayController:
         self._worker_stdout: BinaryIO | None = None
         self._worker_buffer = bytearray()
         self._logs: list[BinaryIO] = []
+        self._log_threads: list[threading.Thread] = []
+        self._log_lock = threading.Lock()
+        self._log_tokens = float(MAX_LOG_EVENT_BURST)
+        self._log_last = time.monotonic()
+        self._log_bytes = 0
         self._closed = False
         self._draining = False
         self._lock = threading.Lock()
@@ -1082,6 +1127,7 @@ class GatewayController:
         )
         if size >= MAX_LOG_BYTES:
             raise GatewayLifecycleError("gateway log limit is exhausted")
+        self._log_bytes = size
         fd = os.open(
             self.directory / name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
@@ -1091,6 +1137,59 @@ class GatewayController:
         stream = os.fdopen(fd, "wb", buffering=0)
         self._logs.append(stream)
         return stream
+
+    def _emit_log(self, destination: BinaryIO, event: bytes) -> None:
+        now = time.monotonic()
+        with self._log_lock:
+            self._log_tokens = min(
+                MAX_LOG_EVENT_BURST,
+                self._log_tokens + (now - self._log_last) * MAX_LOG_EVENTS_PER_SECOND,
+            )
+            self._log_last = now
+            if self._log_tokens < 1 or self._log_bytes >= MAX_LOG_BYTES:
+                return
+            self._log_tokens -= 1
+            event = event[:MAX_LOG_EVENT_BYTES].rstrip(b"\n") + b"\n"
+            event = event[: MAX_LOG_BYTES - self._log_bytes]
+            if event:
+                destination.write(event)
+                self._log_bytes += len(event)
+
+    def _route_log(self, source: BinaryIO | None, destination: BinaryIO) -> None:
+        if source is None:
+            return
+
+        def route() -> None:
+            buffered = bytearray()
+            try:
+                while chunk := os.read(source.fileno(), 4096):
+                    buffered.extend(chunk)
+                    while b"\n" in buffered:
+                        event, _, remainder = bytes(buffered).partition(b"\n")
+                        buffered.clear()
+                        buffered.extend(remainder)
+                        self._emit_log(destination, event)
+                    if len(buffered) > MAX_LOG_EVENT_BYTES:
+                        self._emit_log(destination, bytes(buffered))
+                        buffered.clear()
+                if buffered:
+                    self._emit_log(destination, bytes(buffered))
+            except (OSError, ValueError):
+                return
+            finally:
+                with suppress(Exception):
+                    source.close()
+
+        thread = threading.Thread(
+            target=route, name=f"sbx-gateway-log-{self.vm_id}", daemon=True
+        )
+        self._log_threads.append(thread)
+        thread.start()
+
+    def _reap_log_threads(self) -> None:
+        for thread in self._log_threads:
+            thread.join(timeout=0.1)
+        self._log_threads = [thread for thread in self._log_threads if thread.is_alive()]
 
     def _reserve_qemu_listener(self) -> None:
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1243,7 +1342,7 @@ class GatewayController:
             "--confdir",
             str(self.directory),
             "--open-files",
-            str(self.config.quotas.open_files),
+            str(self.config.quotas.open_files // 2),
         ]
 
     def _worker_command(self, key_fd: int | None, token_fd: int) -> list[str]:
@@ -1378,10 +1477,11 @@ class GatewayController:
         ready_read, ready_write = os.pipe()
         try:
             try:
+                mediator_log = self._open_log(f"mediator-{self.worker_incarnation}.log")
                 mediator = self.runner(
                     self._mediator_command(mediator_key, ready_write, mediator_policy_fd),
                     stdin=subprocess.DEVNULL,
-                    stdout=self._open_log(f"mediator-{self.worker_incarnation}.log"),
+                    stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     pass_fds=(mediator_key, ready_write, mediator_policy_fd),
                     close_fds=True,
@@ -1389,6 +1489,7 @@ class GatewayController:
                     env=_sanitized_child_environment(self.directory),
                 )
                 self.processes["mediator"] = mediator
+                self._route_log(getattr(mediator, "stdout", None), mediator_log)
             finally:
                 os.close(mediator_key)
                 os.close(mediator_policy_fd)
@@ -1439,11 +1540,12 @@ class GatewayController:
         qemu_fd = self.qemu_listener.fileno() if self.qemu_listener is not None else -1
         ingress_fds = tuple(listener.fileno() for listener in self.listeners)
         try:
+            worker_log = self._open_log(f"worker-{self.worker_incarnation}.log")
             worker = self.runner(
                 self._worker_command(worker_key, token_fd),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
-                stderr=self._open_log(f"worker-{self.worker_incarnation}.log"),
+                stderr=subprocess.PIPE,
                 pass_fds=(qemu_fd, token_fd, *ingress_fds)
                 if worker_key is None
                 else (qemu_fd, token_fd, worker_key, *ingress_fds),
@@ -1453,6 +1555,7 @@ class GatewayController:
             )
             self.processes["worker"] = worker
             self._worker_stdout = worker.stdout
+            self._route_log(getattr(worker, "stderr", None), worker_log)
             self._worker_buffer.clear()
         finally:
             os.close(token_fd)
@@ -1485,6 +1588,7 @@ class GatewayController:
         self._worker_stdout = None
         self._worker_buffer.clear()
         self.mediator_address = None
+        self._reap_log_threads()
 
     def prepare(self) -> None:
         """Reserve controller endpoints and authenticate the initial data plane."""
@@ -1591,6 +1695,108 @@ class GatewayController:
             self._fail_recovery(error)
             raise error
 
+    def _resource_ceiling_exceeded(self) -> bool:
+        if self.config.platform != "linux":
+            return False
+        rss, descriptors, processes, threads = _process_tree_usage(
+            [process.pid for process in self.processes.values()]
+        )
+        log_bytes = 0
+        if self.directory is not None:
+            with suppress(OSError):
+                log_bytes = sum(
+                    entry.stat(follow_symlinks=False).st_size
+                    for entry in os.scandir(self.directory)
+                    if entry.is_file(follow_symlinks=False) and entry.name.endswith(".log")
+                )
+        return (
+            rss > MAX_DATA_PLANE_RSS
+            or descriptors > self.config.quotas.open_files
+            or processes > MAX_DATA_PLANE_PROCESSES
+            or threads > MAX_DATA_PLANE_THREADS
+            or log_bytes > MAX_LOG_TOTAL_BYTES
+        )
+
+    def _drain_worker_stats(self) -> None:
+        if self._worker_stdout is None or self.directory is None:
+            return
+        fd = self._worker_stdout.fileno()
+        readable, _, _ = select.select([fd], [], [], 0)
+        if readable:
+            chunk = os.read(fd, 4096)
+            if chunk:
+                self._worker_buffer.extend(chunk)
+        if len(self._worker_buffer) > 8192:
+            raise GatewayLifecycleError("worker returned oversized statistics")
+        while b"\n" in self._worker_buffer:
+            line, _, remainder = bytes(self._worker_buffer).partition(b"\n")
+            self._worker_buffer.clear()
+            self._worker_buffer.extend(remainder)
+            try:
+                payload = json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise GatewayLifecycleError("worker returned invalid statistics") from exc
+            if not isinstance(payload, dict) or payload.get("status") != "stats":
+                raise GatewayLifecycleError("worker returned unexpected status")
+            names = (
+                "frames_read",
+                "frames_written",
+                "frames_rejected",
+                "tcp_active",
+                "tcp_rejected",
+                "destination_rejected",
+                "ingress_active",
+                "dns_active",
+                "dns_rejected",
+                "dns_mappings",
+                "bytes_in",
+                "bytes_out",
+            )
+            counters = {
+                name: payload[name]
+                for name in names
+                if type(payload.get(name)) is int and payload[name] >= 0
+            }
+            if counters:
+                exhausted = any(
+                    counters.get(name, 0) > 0
+                    for name in ("tcp_rejected", "destination_rejected", "dns_rejected")
+                )
+                update_state(
+                    self.directory,
+                    counters=counters,
+                    failure=("worker", "quota_exhausted") if exhausted else None,
+                )
+
+    def _fail_quota(self) -> None:
+        error = GatewayLifecycleError("gateway resource ceiling exhausted")
+        self._supervisor_failure = error
+        self._draining = True
+        self._discard_data_plane()
+        self._close_endpoints()
+        if self.directory is not None:
+            with suppress(Exception):
+                update_state(
+                    self.directory,
+                    status="failed",
+                    pids=self._process_ids(),
+                    failure=("controller", "quota_exhausted"),
+                )
+
+    def _fail_supervision(self) -> None:
+        self._supervisor_failure = GatewayLifecycleError("gateway supervision failed")
+        self._draining = True
+        self._discard_data_plane()
+        self._close_endpoints()
+        if self.directory is not None:
+            with suppress(Exception):
+                update_state(
+                    self.directory,
+                    status="failed",
+                    pids=self._process_ids(),
+                    failure=("controller", "worker_failed"),
+                )
+
     def _supervise(self) -> None:
         while not self._supervisor_stop.wait(0.05):
             if self._closed or self._draining:
@@ -1610,7 +1816,16 @@ class GatewayController:
                         error = GatewayLifecycleError("gateway mediator exited")
                         self._fail_recovery(error)
                         return
+                else:
+                    self._drain_worker_stats()
+                    if self._resource_ceiling_exceeded():
+                        with self._lock:
+                            self._fail_quota()
+                        return
             except (GatewayLifecycleError, GatewayStateError):
+                if not self._draining:
+                    with self._lock:
+                        self._fail_supervision()
                 return
 
     def check(self) -> None:
@@ -1625,6 +1840,12 @@ class GatewayController:
             error = GatewayLifecycleError("gateway mediator exited")
             self._fail_recovery(error)
             raise error
+        if self.directory is not None and read_state(self.directory)["status"] == "ready":
+            self._drain_worker_stats()
+            if self._resource_ceiling_exceeded():
+                with self._lock:
+                    self._fail_quota()
+                raise self._supervisor_failure
 
     @staticmethod
     def _terminate(process: Any) -> None:

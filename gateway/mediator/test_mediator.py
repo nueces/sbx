@@ -37,9 +37,14 @@ os.environ["SBX_GATEWAY_INCARNATION"] = "worker1"
 
 from launch import command  # noqa: E402
 from sbx_gateway_mediator import (  # noqa: E402
+    _PROVIDER_SLOTS,
     MAX_ACTIVE_REQUESTS,
+    MAX_PROVIDER_OUTPUT,
+    MAX_PROVIDER_WORKERS,
     MAX_RETAINED_BODY,
     MAX_RETAINED_TOTAL,
+    MAX_TLS_CONTEXTS,
+    MAX_TLS_HANDSHAKES,
     Admission,
     AwsCodeArtifactTokenProvider,
     CapabilityVerifier,
@@ -817,6 +822,59 @@ class LimitTests(unittest.TestCase):
         self.assertFalse(budget.reserve("overflow", 1))
         budget.release("one")
         self.assertTrue(budget.reserve("overflow", 1))
+
+    def test_provider_concurrency_and_combined_output_are_bounded(self) -> None:
+        provider = CommandTokenProvider((sys.executable, "-c", "print('x')"))
+        for _ in range(MAX_PROVIDER_WORKERS):
+            self.assertTrue(_PROVIDER_SLOTS.acquire(blocking=False))
+        try:
+            with self.assertRaisesRegex(CredentialProviderError, "capacity exhausted"):
+                provider.get_token()
+        finally:
+            for _ in range(MAX_PROVIDER_WORKERS):
+                _PROVIDER_SLOTS.release()
+
+        oversized = CommandTokenProvider(
+            (sys.executable, "-c", f"import sys; sys.stderr.write('x'*{MAX_PROVIDER_OUTPUT + 1})")
+        )
+        started = time.monotonic()
+        with self.assertRaisesRegex(CredentialProviderError, "oversized"):
+            oversized.get_token()
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_tls_handshake_and_context_caches_are_bounded(self) -> None:
+        addon = GatewayAddon(CapabilityVerifier(KEY, "vm1", "worker1"))
+
+        def hello(index: int, host: str):
+            client = type("Client", (), {"id": f"client-{index}"})()
+            context = type("Context", (), {"client": client})()
+            data = type(
+                "Hello",
+                (),
+                {"context": context, "client_hello": type("CH", (), {"sni": host})()},
+            )()
+            addon._admissions[client.id] = Admission(
+                "vm1", "worker1", f"flow-{index}", "rule", host, 443, 1, 2
+            )
+            return data
+
+        handshakes = [hello(index, f"h{index}.example") for index in range(MAX_TLS_HANDSHAKES)]
+        for data in handshakes:
+            addon.tls_clienthello(data)
+        denied = hello(MAX_TLS_HANDSHAKES, "denied.example")
+        addon.tls_clienthello(denied)
+        self.assertIn(denied.context.client.id, addon._invalid_tls)
+        addon.tls_established_client(handshakes[0])
+        admitted = hello(MAX_TLS_HANDSHAKES + 1, "admitted.example")
+        addon.tls_clienthello(admitted)
+        self.assertNotIn(admitted.context.client.id, addon._invalid_tls)
+
+        for index in range(MAX_TLS_HANDSHAKES + 2, MAX_TLS_CONTEXTS + MAX_TLS_HANDSHAKES + 4):
+            data = hello(index, f"cache-{index}.example")
+            addon.tls_established_client(admitted)
+            addon.tls_clienthello(data)
+            admitted = data
+        self.assertEqual(len(addon._tls_contexts), MAX_TLS_CONTEXTS)
 
     def test_active_request_limit_is_global_and_releases(self) -> None:
         addon = GatewayAddon(CapabilityVerifier(KEY, "vm1", "worker1"))

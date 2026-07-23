@@ -8,12 +8,60 @@ dhclient -1 "$iface"
 package_port=
 package_placeholder=
 gateway_ca_port=
+capacity_id=
+capacity_echo_port=
+capacity_requests=1
 for value in $(cat /proc/cmdline); do
   case "$value" in
     sbx.package_port=*) package_port=${value#*=} ;;
     sbx.gateway_ca_port=*) gateway_ca_port=${value#*=} ;;
+    sbx.capacity_id=*) capacity_id=${value#*=} ;;
+    sbx.capacity_echo_port=*) capacity_echo_port=${value#*=} ;;
+    sbx.capacity_requests=*) capacity_requests=${value#*=} ;;
   esac
 done
+if [ -n "$capacity_id" ]; then
+  python3 - "$capacity_id" "$capacity_echo_port" "$capacity_requests" <<'PY' >/dev/ttyS0 2>&1
+import socket
+import sys
+
+vm_id, echo_port, request_count = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+host = "localhost.localdomain"
+ip = socket.gethostbyname(host)
+assert ip.startswith(("198.18.", "198.19.")), ip
+with socket.create_connection((host, echo_port), timeout=10) as conn:
+    payload = f"vm-{vm_id}".encode()
+    conn.sendall(payload)
+    assert conn.recv(64) == payload
+try:
+    socket.create_connection(("1.1.1.1", 80), timeout=1)
+except OSError:
+    pass
+else:
+    raise AssertionError("capacity guest obtained direct IP access")
+listener = socket.socket()
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("0.0.0.0", 3000))
+listener.listen()
+listener.settimeout(60)
+print(f"GATEWAY_CAPACITY_READY {vm_id}", flush=True)
+for _ in range(request_count):
+    conn, _ = listener.accept()
+    with conn:
+        conn.settimeout(5)
+        request = b""
+        while b"\r\n\r\n" not in request:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            request += chunk
+        body = f"capacity-{vm_id}".encode()
+        conn.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+listener.close()
+print(f"GATEWAY_CAPACITY_PASS {vm_id}", flush=True)
+PY
+  exit 0
+fi
 if [ -n "$gateway_ca_port" ]; then
   python3 - "$gateway_ca_port" <<'PY'
 import socket

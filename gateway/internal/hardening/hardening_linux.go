@@ -85,8 +85,8 @@ func lowerLimit(kind int, value uint64) error {
 }
 
 func limits(openFiles int) error {
-	if openFiles < 64 || openFiles > 4096 {
-		return errors.New("open-file limit must be between 64 and 4096")
+	if openFiles < 32 || openFiles > 4096 {
+		return errors.New("open-file limit must be between 32 and 4096")
 	}
 	if err := unix.Setrlimit(unix.RLIMIT_CORE, &unix.Rlimit{}); err != nil {
 		return err

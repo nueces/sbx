@@ -14,8 +14,8 @@ from cryptography.x509.oid import NameOID
 from sbx import gateway_ca
 
 
-def ca_state(tmp_path: Path) -> tuple[Path, bytes]:
-    directory = tmp_path / "vm" / "mediator"
+def ca_state(tmp_path: Path, vm: str = "vm") -> tuple[Path, bytes]:
+    directory = tmp_path / vm / "mediator"
     directory.mkdir(parents=True, mode=0o700)
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "sbx VM test CA")])
@@ -59,6 +59,20 @@ def test_ca_state_exports_only_owner_only_public_certificate(tmp_path: Path) -> 
     assert b"PRIVATE KEY" not in ca.public_certificate.read_bytes()
     assert private not in ca.public_certificate.read_bytes()
     assert gateway_ca.certificate_fingerprint(ca.public_certificate.read_bytes()) == ca.fingerprint
+
+
+def test_two_vm_ca_keys_and_certificates_are_distinct(tmp_path: Path) -> None:
+    directory_a, private_a = ca_state(tmp_path, "vm-a")
+    directory_b, private_b = ca_state(tmp_path, "vm-b")
+
+    ca_a = gateway_ca.finalize_ca_state(directory_a)
+    ca_b = gateway_ca.finalize_ca_state(directory_b)
+
+    assert private_a != private_b
+    assert ca_a.fingerprint != ca_b.fingerprint
+    assert ca_a.public_certificate.parent != ca_b.public_certificate.parent
+    assert private_a not in ca_b.public_certificate.read_bytes()
+    assert private_b not in ca_a.public_certificate.read_bytes()
 
 
 def test_ca_state_rejects_non_owner_state_and_changed_export(tmp_path: Path) -> None:

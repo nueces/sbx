@@ -155,6 +155,13 @@ def test_gateway_full_config_normalizes_and_preserves_legacy_ingress(
         ),
         ({"quotas": {"tcp_flows": 513}}, "between 1 and 512"),
         (
+            {
+                "ingress": [{"guest_port": 80}, {"guest_port": 81}],
+                "quotas": {"ingress_flows": 1},
+            },
+            "listeners exceed",
+        ),
+        (
             {"reconnection": {"enabled": False, "attempts": 1}},
             "when enabled",
         ),
