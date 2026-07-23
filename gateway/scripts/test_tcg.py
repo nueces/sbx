@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import os
 import platform
@@ -260,6 +261,23 @@ def main() -> int:
         raw = runtime / "raw.json"
         config = runtime / "config.json"
         qemu_socket = runtime / "qemu.sock"
+        ingress_listeners = []
+        for _ in range(2):
+            ingress_listener = socket.socket()
+            ingress_listener.bind(("127.0.0.1", 0))
+            ingress_listener.listen()
+            ingress_listeners.append(ingress_listener)
+        for ingress_listener in ingress_listeners:
+            contender = socket.socket()
+            try:
+                try:
+                    contender.bind(ingress_listener.getsockname())
+                except OSError:
+                    pass
+                else:
+                    raise SystemExit("controller-released port 0 ingress reservation")
+            finally:
+                contender.close()
         raw.write_text(
             json.dumps(
                 {
@@ -290,9 +308,26 @@ def main() -> int:
                             "allow_ranges": ["127.0.0.0/8"],
                         },
                     ],
+                    "ingress": [
+                        {
+                            "id": "dev-server",
+                            "listen_host": "127.0.0.1",
+                            "host_port": 0,
+                            "guest_address": "192.0.2.2",
+                            "guest_port": 3000,
+                        },
+                        {
+                            "id": "oauth-callback",
+                            "listen_host": "127.0.0.1",
+                            "host_port": 0,
+                            "guest_address": "192.0.2.2",
+                            "guest_port": 4180,
+                        },
+                    ],
                     "quotas": {
                         "tcp_flows": 512,
                         "flows_per_destination": 64,
+                        "ingress_flows": 64,
                         "dns_mappings": 1024,
                         "open_files": 4096,
                     },
@@ -328,8 +363,12 @@ def main() -> int:
                 str(worker_key_read),
                 "--worker-incarnation",
                 "worker1",
+                "--ingress-fd",
+                f"tcg-test/g1/dev-server={ingress_listeners[0].fileno()}",
+                "--ingress-fd",
+                f"tcg-test/g1/oauth-callback={ingress_listeners[1].fileno()}",
             ],
-            pass_fds=(worker_key_read,),
+            pass_fds=(worker_key_read, *(item.fileno() for item in ingress_listeners)),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -402,13 +441,37 @@ def main() -> int:
         assert qemu_process.stdout is not None
         os.set_blocking(qemu_process.stdout.fileno(), False)
         selector.register(qemu_process.stdout, selectors.EVENT_READ)
+        ingress_complete = False
         while time.monotonic() < deadline:
             require(qemu_process.poll() is None, "QEMU exited before test completion")
             if not selector.select(timeout=1):
                 continue
             chunk = os.read(qemu_process.stdout.fileno(), 65536).decode(errors="replace")
             transcript.append(chunk)
-            if "GATEWAY_TEST_PASS" in "".join(transcript):
+            output = "".join(transcript)
+            if "GATEWAY_INGRESS_READY" in output and not ingress_complete:
+                workloads = (
+                    (0, "/dev", b"guest-dev-server"),
+                    (1, "/oauth/callback?code=visible-to-guest", b"oauth-ok"),
+                )
+                for index, path, expected in workloads:
+                    connection = http.client.HTTPConnection(
+                        "127.0.0.1", ingress_listeners[index].getsockname()[1], timeout=10
+                    )
+                    connection.request("GET", path)
+                    response = connection.getresponse()
+                    require(
+                        response.status == 200 and response.read() == expected,
+                        f"ingress workload failed: {path}",
+                    )
+                    connection.close()
+                ingress_complete = True
+                transcript.append(
+                    "GATEWAY_DEV_SERVER_PASS GATEWAY_OAUTH_CALLBACK_PASS "
+                    "GATEWAY_PORT0_PASS\n"
+                )
+            if "GATEWAY_TEST_PASS" in output:
+                require(ingress_complete, "guest completed without ingress workloads")
                 output = "".join(transcript)
                 expected_auth = "Basic " + base64.b64encode(f"aws:{FAKE_TOKEN}".encode()).decode()
                 require(
@@ -444,6 +507,17 @@ def main() -> int:
                     require(secret not in status_material, "fake token leaked into status output")
                 terminate(worker)
                 require(worker.poll() is not None, "worker did not stop")
+                for ingress_listener in ingress_listeners:
+                    probe = socket.create_connection(ingress_listener.getsockname(), timeout=1)
+                    probe.settimeout(0.2)
+                    probe.sendall(b"GET /dev HTTP/1.0\r\n\r\n")
+                    try:
+                        require(not probe.recv(1), "worker loss left ingress forwarding")
+                    except TimeoutError:
+                        pass
+                    finally:
+                        probe.close()
+                transcript.append("GATEWAY_INGRESS_WORKER_LOSS_PASS\n")
                 worker_stdout, _ = worker.communicate(timeout=PROCESS_STOP_TIMEOUT)
                 require(qemu_process.poll() is None, "QEMU did not survive worker loss")
                 terminate(mediator)
@@ -458,6 +532,8 @@ def main() -> int:
                 stop.set()
                 listener.close()
                 ca_listener.close()
+                for ingress_listener in ingress_listeners:
+                    ingress_listener.close()
                 print("".join(transcript), end="")
                 return 0
         print("".join(transcript), end="", file=sys.stderr)

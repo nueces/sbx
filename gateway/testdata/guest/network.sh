@@ -40,8 +40,53 @@ python3 - <<'PY' >/dev/ttyS0 2>&1 &
 import base64
 import http.client
 import os
+import queue
 import socket
 import ssl
+import threading
+
+
+def ingress_server(port, expected, body, results, ready):
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("0.0.0.0", port))
+    listener.listen()
+    listener.settimeout(30)
+    ready.put(port)
+    try:
+        conn, _ = listener.accept()
+        with conn:
+            conn.settimeout(10)
+            request = b""
+            while b"\r\n\r\n" not in request:
+                request += conn.recv(4096)
+            target = request.split(b" ", 2)[1].decode()
+            assert target == expected, (target, expected)
+            conn.sendall(
+                b"HTTP/1.0 200 OK\r\nContent-Length: "
+                + str(len(body)).encode()
+                + b"\r\n\r\n"
+                + body
+            )
+            results.put(target)
+    finally:
+        listener.close()
+
+
+results = queue.Queue()
+ready = queue.Queue()
+threading.Thread(
+    target=ingress_server,
+    args=(3000, "/dev", b"guest-dev-server", results, ready),
+    daemon=True,
+).start()
+threading.Thread(
+    target=ingress_server,
+    args=(4180, "/oauth/callback?code=visible-to-guest", b"oauth-ok", results, ready),
+    daemon=True,
+).start()
+assert sorted(ready.get(timeout=10) for _ in range(2)) == [3000, 4180]
+print("GATEWAY_INGRESS_READY", flush=True)
 
 host = "localhost.localdomain"
 ip = socket.gethostbyname(host)
@@ -105,6 +150,11 @@ for process in os.listdir("/proc"):
         except OSError:
             continue
         assert fake_token not in content and encoded_token not in content, (process, name)
+assert sorted(results.get(timeout=30) for _ in range(2)) == [
+    "/dev",
+    "/oauth/callback?code=visible-to-guest",
+]
+
 for root in ("/etc", "/home", "/root", "/run", "/tmp", "/var"):
     for directory, _, names in os.walk(root):
         for name in names:

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/netip"
 	"path"
 	"slices"
@@ -26,24 +27,34 @@ type Rule struct {
 	AllowRanges []string `json:"allow_ranges,omitempty"`
 }
 
+type Ingress struct {
+	ID           string `json:"id"`
+	ListenHost   string `json:"listen_host"`
+	HostPort     uint16 `json:"host_port"`
+	GuestAddress string `json:"guest_address"`
+	GuestPort    uint16 `json:"guest_port"`
+}
+
 type Quotas struct {
 	TCPFlows            int `json:"tcp_flows"`
 	FlowsPerDestination int `json:"flows_per_destination"`
+	IngressFlows        int `json:"ingress_flows"`
 	DNSMappings         int `json:"dns_mappings"`
 	OpenFiles           int `json:"open_files"`
 }
 
 type Config struct {
-	Version    int    `json:"version"`
-	VMID       string `json:"vm_id"`
-	Generation string `json:"generation"`
-	Digest     string `json:"digest,omitempty"`
-	Rules      []Rule `json:"rules"`
-	Quotas     Quotas `json:"quotas"`
+	Version    int       `json:"version"`
+	VMID       string    `json:"vm_id"`
+	Generation string    `json:"generation"`
+	Digest     string    `json:"digest,omitempty"`
+	Rules      []Rule    `json:"rules"`
+	Ingress    []Ingress `json:"ingress"`
+	Quotas     Quotas    `json:"quotas"`
 }
 
 func DefaultQuotas() Quotas {
-	return Quotas{TCPFlows: 512, FlowsPerDestination: 64, DNSMappings: 1024, OpenFiles: 4096}
+	return Quotas{TCPFlows: 512, FlowsPerDestination: 64, IngressFlows: 64, DNSMappings: 1024, OpenFiles: 4096}
 }
 
 func decode(data []byte) (Config, error) {
@@ -94,9 +105,29 @@ func (c *Config) normalize() error {
 	if !validID(c.VMID) || !validID(c.Generation) {
 		return errors.New("invalid VM identity or generation")
 	}
-	if c.Quotas.TCPFlows < 1 || c.Quotas.TCPFlows > 512 || c.Quotas.FlowsPerDestination < 1 || c.Quotas.FlowsPerDestination > 64 || c.Quotas.DNSMappings < 1 || c.Quotas.DNSMappings > 1024 || c.Quotas.OpenFiles < 64 || c.Quotas.OpenFiles > 4096 {
+	if c.Quotas.TCPFlows < 1 || c.Quotas.TCPFlows > 512 || c.Quotas.FlowsPerDestination < 1 || c.Quotas.FlowsPerDestination > 64 || c.Quotas.IngressFlows < 1 || c.Quotas.IngressFlows > 64 || c.Quotas.DNSMappings < 1 || c.Quotas.DNSMappings > 1024 || c.Quotas.OpenFiles < 64 || c.Quotas.OpenFiles > 4096 {
 		return errors.New("quota outside allowed range")
 	}
+	seenIngress := make(map[string]bool)
+	seenListeners := make(map[string]bool)
+	for i := range c.Ingress {
+		r := &c.Ingress[i]
+		if !validID(r.ID) || seenIngress[r.ID] {
+			return errors.New("invalid or duplicate ingress ID")
+		}
+		seenIngress[r.ID] = true
+		listen, err := netip.ParseAddr(r.ListenHost)
+		if err != nil || r.GuestAddress != "192.0.2.2" || r.GuestPort == 0 {
+			return fmt.Errorf("ingress %q: invalid address or port", r.ID)
+		}
+		r.ListenHost = listen.String()
+		listener := net.JoinHostPort(r.ListenHost, fmt.Sprint(r.HostPort))
+		if r.HostPort != 0 && seenListeners[listener] {
+			return errors.New("duplicate ingress listener")
+		}
+		seenListeners[listener] = true
+	}
+	slices.SortFunc(c.Ingress, func(a, b Ingress) int { return strings.Compare(a.ID, b.ID) })
 	seen := make(map[string]string)
 	for i := range c.Rules {
 		r := &c.Rules[i]

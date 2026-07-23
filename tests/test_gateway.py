@@ -88,6 +88,8 @@ def test_gateway_full_config_normalizes_and_preserves_legacy_ingress(
     assert worker["digest"]
     assert "secrets" not in json.dumps(worker)
     assert worker["rules"][0]["host"] == "registry.npmjs.org"
+    assert [rule["id"] for rule in worker["ingress"]] == ["ingress-1", "legacy-1"]
+    assert worker["quotas"]["ingress_flows"] == 64
 
 
 @pytest.mark.parametrize(

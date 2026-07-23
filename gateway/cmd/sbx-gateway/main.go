@@ -31,6 +31,14 @@ func readConfig(path string) ([]byte, error) {
 	return os.ReadFile(path)
 }
 
+type stringFlags []string
+
+func (values *stringFlags) String() string { return fmt.Sprint([]string(*values)) }
+func (values *stringFlags) Set(value string) error {
+	*values = append(*values, value)
+	return nil
+}
+
 func validateIdentity(cfg config.Config, vmID, generation, digest string) error {
 	if vmID == "" || generation == "" || digest == "" || cfg.VMID != vmID || cfg.Generation != generation || cfg.Digest != digest {
 		return errors.New("worker identity or config digest mismatch")
@@ -48,6 +56,8 @@ func run() error {
 	mediatorAddress := flag.String("mediator-address", "", "per-VM mediator loopback endpoint")
 	capabilityKeyFD := flag.Int("capability-key-fd", -1, "inherited mediator capability key descriptor")
 	workerIncarnation := flag.String("worker-incarnation", "", "worker incarnation bound to mediator capabilities")
+	var ingressFDs stringFlags
+	flag.Var(&ingressFDs, "ingress-fd", "controller-owned VM/generation/rule=descriptor listener")
 	flag.Parse()
 	if *configPath == "" || !filepath.IsAbs(*configPath) {
 		return errors.New("--config must be an absolute path")
@@ -90,6 +100,13 @@ func run() error {
 		return fmt.Errorf("netstack: %w", err)
 	}
 	defer network.Close()
+	registeredIngress, err := gatewaynet.RegisterIngress(cfg, ingressFDs)
+	if err != nil {
+		return fmt.Errorf("ingress: %w", err)
+	}
+	totalFlows := gatewaynet.NewFlowQuota(cfg.Quotas.TCPFlows)
+	ingress := gatewaynet.NewIngressForwarder(network, registeredIngress, totalFlows, cfg.Quotas.IngressFlows)
+	defer ingress.Close()
 	resolver := syntheticdns.New(cfg)
 	var mediator *gatewaynet.Mediator
 	for _, rule := range cfg.Rules {
@@ -124,10 +141,11 @@ func run() error {
 		return fmt.Errorf("DNS: %w", err)
 	}
 	defer dns.Close()
-	network.ForwardTCP(cfg, resolver, mediator)
+	network.ForwardTCP(cfg, resolver, mediator, totalFlows)
 	if err := json.NewEncoder(os.Stdout).Encode(map[string]any{
 		"status": "ready", "version": 1, "vm_id": cfg.VMID,
 		"generation": cfg.Generation, "digest": cfg.Digest, "mediator": mediator != nil,
+		"ingress": len(registeredIngress),
 	}); err != nil {
 		return fmt.Errorf("readiness: %w", err)
 	}
@@ -149,12 +167,13 @@ func run() error {
 				errs <- err
 				return
 			}
+			network.Inject(frame)
 			networkReady.Do(func() {
+				ingress.Start()
 				outputMu.Lock()
 				fmt.Fprintln(os.Stdout, `{"status":"network-ready"}`)
 				outputMu.Unlock()
 			})
-			network.Inject(frame)
 		}
 	}()
 	go func() {

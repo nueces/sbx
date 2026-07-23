@@ -14,7 +14,7 @@ import (
 )
 
 func TestForwarderQuotas(t *testing.T) {
-	f := &TCPForwarder{config: config.Config{Quotas: config.Quotas{FlowsPerDestination: 1}}, total: make(chan struct{}, 1), perDest: make(map[string]int)}
+	f := &TCPForwarder{config: config.Config{Quotas: config.Quotas{FlowsPerDestination: 1}}, total: NewFlowQuota(1), perDest: make(map[string]int)}
 	if !f.acquire("example.com") || f.acquire("example.com") {
 		t.Fatal("flow quota not enforced")
 	}
