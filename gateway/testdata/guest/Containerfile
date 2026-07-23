@@ -1,0 +1,8 @@
+ARG BASE_IMAGE=debian:stable-slim
+FROM ${BASE_IMAGE}
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates iproute2 isc-dhcp-client openssh-server python3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY network.sh /etc/smolvm/network.sh
+RUN chmod 0755 /etc/smolvm/network.sh
