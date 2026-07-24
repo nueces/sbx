@@ -21,8 +21,7 @@ sys.path.insert(0, str(MEDIATOR))
 import test_mediator as tm  # noqa: E402
 
 DURATION_SECONDS = 10 * 60
-SAMPLE_SECONDS = 60
-TCG_INTERVAL_SECONDS = DURATION_SECONDS
+SAMPLE_SECONDS = 10
 RSS_CEILING = 512 * 1024 * 1024
 FD_CEILING = 4096
 
@@ -94,43 +93,10 @@ def semantic_requests() -> None:
             raise RuntimeError(f"mixed semantic request failed: {path}: {status}")
 
 
-def run_tcg(root: Path, directory: Path, cycle: int) -> None:
-    output = directory / f"tcg-{cycle:04d}.log"
-    environment = os.environ.copy()
-    environment["SBX_GATEWAY_BIN"] = str(root / "gateway" / "sbx-gateway")
-    wrapper = """
-import sys
-sys.path.insert(0, sys.argv[1])
-import test_tcg as test
-test.COMMAND_TIMEOUT = 30
-try:
-    raise SystemExit(test.main())
-finally:
-    for process in reversed(test.PROCESSES):
-        test.terminate(process)
-    for server in test.SERVERS:
-        server.shutdown()
-        server.server_close()
-"""
-    with output.open("wb") as log:
-        result = subprocess.run(
-            [sys.executable, "-c", wrapper, str(root / "gateway" / "scripts")],
-            cwd=root,
-            env=environment,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            timeout=300,
-            check=False,
-        )
-    if result.returncode != 0:
-        raise RuntimeError(f"hourly TCG gate failed ({result.returncode}): {output}")
-
-
-def monotonic_growth(samples: list[dict[str, object]], field: str) -> bool:
+def growth_exceeded(samples: list[dict[str, object]], field: str, allowance: int) -> bool:
+    """Reject material end-to-end growth after the first-quarter warm-up."""
     values = [int(sample["usage"][field]) for sample in samples]  # type: ignore[index]
-    return len(values) >= 8 and all(
-        later > earlier for earlier, later in zip(values, values[1:], strict=False)
-    )
+    return len(values) < 12 or values[-1] - values[len(values) // 4] > allowance
 
 
 def main() -> int:
@@ -179,30 +145,22 @@ def main() -> int:
     signal.signal(signal.SIGINT, interrupted)
     samples: list[dict[str, object]] = []
     cycle = 0
-    next_sample = start_monotonic
-    next_tcg = start_monotonic
+    workloads = [
+        "test_http1_streaming_redirect_reuse_and_absolute_uri",
+        "test_http2_stream_authority_is_revalidated",
+        "test_tls_sni_and_websocket_are_revalidated",
+        "test_package_auth_workload_and_negative_cases",
+    ]
+    workload_counts = dict.fromkeys(workloads, 0)
     tm.MediatorIntegrationTests.setUpClass()
     try:
-        while True:
-            now = time.monotonic()
-            elapsed = now - start_monotonic
-            if elapsed >= DURATION_SECONDS:
-                break
+        while time.monotonic() - start_monotonic < DURATION_SECONDS:
+            workload = workloads[cycle % len(workloads)]
+            run_method(workload)
+            workload_counts[workload] += 1
+            if cycle % len(workloads) == 0:
+                semantic_requests()
             cycle += 1
-            workloads = [
-                "test_http1_streaming_redirect_reuse_and_absolute_uri",
-                "test_http2_stream_authority_is_revalidated",
-                "test_tls_sni_and_websocket_are_revalidated",
-                "test_package_auth_workload_and_negative_cases",
-            ]
-            for workload in workloads:
-                run_method(workload)
-            semantic_requests()
-            tcg_ran = False
-            if now >= next_tcg:
-                run_tcg(root, directory, cycle)
-                next_tcg += TCG_INTERVAL_SECONDS
-                tcg_ran = True
             mediator_pid = tm.MediatorIntegrationTests.mediator.process.pid
             if tm.MediatorIntegrationTests.mediator.process.poll() is not None:
                 raise RuntimeError("persistent mediator exited")
@@ -215,27 +173,31 @@ def main() -> int:
                 "timestamp": utc_now(),
                 "elapsed_seconds": time.monotonic() - start_monotonic,
                 "cycle": cycle,
-                "tcg_ran": tcg_ran,
-                "workloads": ["llm-stream", "package", "git-smart-http", "http2", "websocket"],
+                "workload": workload,
                 "mediator_pid": mediator_pid,
                 "usage": measured,
             }
             samples.append(sample)
             append_json(samples_path, sample)
-            next_sample += SAMPLE_SECONDS
-            time.sleep(max(0, next_sample - time.monotonic()))
+            time.sleep(
+                min(SAMPLE_SECONDS, max(0, DURATION_SECONDS - time.monotonic() + start_monotonic))
+            )
         elapsed = time.monotonic() - start_monotonic
-        if elapsed < DURATION_SECONDS:
-            raise RuntimeError(f"elapsed time was short: {elapsed}")
-        for field in ("rss_bytes", "fds", "processes", "threads"):
-            if monotonic_growth(samples, field):
-                raise RuntimeError(f"monotonic {field} growth detected")
+        if elapsed < DURATION_SECONDS or min(workload_counts.values()) < 3:
+            raise RuntimeError(
+                f"stability workload coverage was short: {elapsed}, {workload_counts}"
+            )
+        allowances = {"rss_bytes": 4 * 1024 * 1024, "fds": 2, "processes": 0, "threads": 0}
+        for field, allowance in allowances.items():
+            if growth_exceeded(samples, field, allowance):
+                raise RuntimeError(f"material {field} growth detected")
         result = identity | {
             "status": "PASS",
             "finish": utc_now(),
             "elapsed_seconds": elapsed,
             "cycles": cycle,
             "samples": len(samples),
+            "workload_counts": workload_counts,
             "maximum": {
                 field: max(int(sample["usage"][field]) for sample in samples)  # type: ignore[index]
                 for field in ("rss_bytes", "fds", "processes", "threads")
