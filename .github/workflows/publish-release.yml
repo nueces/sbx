@@ -84,9 +84,17 @@ jobs:
 
       - name: Create GitHub release
         run: |
+          set -euo pipefail
+          mkdir -p dist/gateway
+          cp src/sbx/gateway_runtime/bin/sbx-gateway-* src/sbx/gateway_runtime/SHA256SUMS dist/gateway/
+          tar -C dist -czf "sbx-gateway-artifacts-$RELEASE_TAG.tar.gz" gateway
           git tag "$RELEASE_TAG"
           git push origin "$RELEASE_TAG"
-          gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --generate-notes
+          gh release create "$RELEASE_TAG" \
+            --title "$RELEASE_TAG" \
+            --generate-notes \
+            "sbx-gateway-artifacts-$RELEASE_TAG.tar.gz" \
+            src/sbx/gateway_runtime/SHA256SUMS
 
       - name: Open website release PR
         run: |

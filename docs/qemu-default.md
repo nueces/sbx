@@ -12,7 +12,7 @@ The default path should work for local developer usage without requiring per-VM 
 
 ## QEMU user-mode networking
 
-With QEMU, SmolVM can use user-mode networking/slirp.
+With QEMU, SmolVM can use user-mode networking/slirp when gateway mode is disabled.
 
 In this mode:
 
@@ -64,9 +64,19 @@ host localhost:1455 -> SSH tunnel -> guest localhost:1455
 
 This uses the existing SmolVM SSH path and avoids additional host firewall/NAT configuration.
 
+## Rootless gateway networking
+
+Gateway mode replaces slirp with QEMU 7.2+ `-netdev stream` over a controller-owned Unix socket:
+
+```text
+QEMU virtio-net -> sbx-gateway worker -> per-VM mediator -> host sockets
+```
+
+The final QEMU argv must contain exactly one stream NIC and no `user`, slirp, TAP, bridge, passt, vmnet, or second NIC backend. Tests run with explicit `-accel tcg` in the constrained Linux environment. If the gateway cannot start, startup fails closed rather than falling back to slirp.
+
 ## Trade-offs
 
-QEMU/slirp may be slower than Firecracker/TAP networking. That trade-off is acceptable for now because it avoids privileged host networking requirements and lets us focus on the agent sandbox UX.
+QEMU/slirp and gateway networking may be slower than privileged TAP networking. That trade-off is acceptable for now because it avoids privileged host networking requirements and lets us focus on the agent sandbox UX. Task 19 proved a ten-minute stability smoke; readiness, absolute throughput, 128-active concurrency, and repeat four-VM performance are deferred, not passed.
 
 ## Current constraint
 

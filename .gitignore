@@ -20,3 +20,4 @@ wheels/
 
 # SBX
 .sbx.toml
+gateway/sbx-gateway

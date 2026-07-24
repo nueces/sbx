@@ -193,6 +193,12 @@ sbx network forward 8080:3000  # host 8080 -> guest 3000
 
 These commands use the sandbox named in `.sbx.toml`. Use `--name OTHER_VM` only when forwarding from a different sandbox.
 
+### Rootless network gateway
+
+Gateway mode replaces SLIRP with a default-deny path through a per-VM worker and mediator. Linux amd64 packages include the worker; macOS artifacts are built and checksummed but runtime remains unverified.
+
+See [`docs/rootless-network-gateway.md`](docs/rootless-network-gateway.md) for configuration, security status, performance deferrals, release, and rollback notes.
+
 ## Other operations
 
 ```bash

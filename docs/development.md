@@ -21,6 +21,18 @@ UV_PROJECT_ENVIRONMENT=/tmp/sbx-test-venv uv run --extra dev pytest --no-cov tes
 # Lint/format.
 UV_PROJECT_ENVIRONMENT=/tmp/sbx-test-venv uv run --extra dev ruff check .
 UV_PROJECT_ENVIRONMENT=/tmp/sbx-test-venv uv run --extra dev ruff format .
+
+## Gateway release checks
+
+Use the pinned tools when touching gateway packaging:
+
+```bash
+GO=/tmp/go1.26.5/bin/go gateway/scripts/build_release_artifacts.sh
+uvx --from uv==0.11.30 uv sync --directory gateway/mediator --locked --no-build --no-dev --managed-python --python 3.12.13
+uvx --from uv==0.11.30 uv audit --directory gateway/mediator --locked
+```
+
+Then run the explicit-TCG functional/security acceptance from `docs/rootless-network-gateway.md`. macOS artifacts are build checks only unless run on macOS.
 ```
 
 Before making code changes in a fresh environment, first run the full test suite
