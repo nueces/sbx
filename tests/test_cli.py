@@ -1195,6 +1195,33 @@ def test_run_existing_error_vm_suggests_recreate(
     assert "sbx recreate vm1 --force" in capsys.readouterr().err
 
 
+def test_start_existing_vm_with_missing_kernel_suggests_recreate(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    missing_kernel = "/tmp/sbx-no-credentials-deleted/.smolvm/images/sbx/vmlinux.bin"
+    monkeypatch.setattr(
+        vm_state,
+        "existing_vm_start_config",
+        lambda vm_id: (
+            "stopped",
+            {"kernel_path": missing_kernel, "rootfs_path": "/tmp/not-checked.ext4"},
+        ),
+    )
+    monkeypatch.setattr(
+        cli.runtime,
+        "run_smolvm_capture",
+        lambda argv: (_ for _ in ()).throw(AssertionError("must not start QEMU")),
+    )
+
+    rc = cli._start_existing_vm_if_needed("vm1", "stopped", 60)
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert missing_kernel in err
+    assert "sbx recreate vm1 --force" in err
+
+
 def test_failed_managed_run_hides_json_and_prints_hint(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -187,7 +187,7 @@ def _docker_run_kernel_builder(
             "run",
             "--rm",
             "-v",
-            f"{work_dir}:/work",
+            f"{work_dir}:/work:z",
             "-w",
             "/work",
             tag,
