@@ -275,7 +275,9 @@ def test_build_docker_kernel_uses_only_verified_inputs(
         runs.append(command)
         if command[:3] == ["docker", "run", "--rm"] and "bash" in command:
             assert check is True
-            work_dir = Path(command[command.index("-v") + 1].split(":", 1)[0])
+            volume = command[command.index("-v") + 1]
+            assert volume.endswith(":/work:z")
+            work_dir = Path(volume.split(":", 1)[0])
             assert (work_dir / "build.sh").is_file()
             assert (work_dir / "check-config.sh").is_file()
             assert "CONFIG_VETH=y" in (work_dir / "config.fragment").read_text()
