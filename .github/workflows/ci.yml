@@ -20,6 +20,27 @@ jobs:
           python-version: "3.12"
 
       - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: "0.11.30"
+
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v6
+        with:
+          go-version: "1.26.5"
+          cache-dependency-path: gateway/go.sum
+
+      - name: Verify gateway artifacts and mediator lock
+        run: |
+          set -euo pipefail
+          GO=go gateway/scripts/build_release_artifacts.sh
+          git diff --exit-code -- src/sbx/gateway_runtime
+          uv sync --directory gateway/mediator --locked --no-build --no-dev --managed-python --python 3.12.13
+          uv audit --directory gateway/mediator --locked
+
+      - name: Run Go tests
+        run: GOTOOLCHAIN=local go -C gateway test ./...
+
+      - name: Run explicit-TCG gateway checks
+        run: python gateway/scripts/test_tcg.py --help >/dev/null
 
       - name: Run tests
         run: uv run --python 3.12 --extra dev pytest --no-cov

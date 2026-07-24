@@ -40,3 +40,18 @@ git_config = true
 
 # Optional host-to-guest TCP forwards, applied when the VM starts.
 # port_forwards = ["3000", "8080:3000", "0.0.0.0:3000:3000"]
+
+# Optional rootless gateway policy. Default is deny; add only destinations the guest needs.
+# Linux amd64 is tested. macOS artifacts exist but runtime is unverified.
+# [network]
+# default = "deny"
+#
+# [[network.http]]
+# id = "pypi"
+# host = "pypi.org"
+# ports = [443]
+# methods = ["GET", "HEAD"]
+#
+# [[network.ingress]]
+# listen = "127.0.0.1:0"
+# guest_port = 3000

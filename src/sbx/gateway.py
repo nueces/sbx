@@ -5,6 +5,7 @@ import hmac
 import ipaddress
 import json
 import os
+import platform
 import posixpath
 import re
 import secrets
@@ -30,9 +31,15 @@ from sbx.runtime import ConfigError, pid_is_alive
 
 GATEWAY_STATE_DIR = SBX_STATE_DIR / "gateway"
 GATEWAY_SOURCE_DIR = Path(__file__).resolve().parents[2] / "gateway"
-GATEWAY_WORKER = GATEWAY_SOURCE_DIR / "sbx-gateway"
-GATEWAY_MEDIATOR_PYTHON = GATEWAY_SOURCE_DIR / "mediator" / ".venv" / "bin" / "python"
-GATEWAY_MEDIATOR_LAUNCHER = GATEWAY_SOURCE_DIR / "mediator" / "launch.py"
+GATEWAY_RUNTIME_DIR = Path(__file__).with_name("gateway_runtime")
+GATEWAY_MEDIATOR_DIR = GATEWAY_RUNTIME_DIR / "mediator"
+_GATEWAY_ARCH = platform.machine().lower().replace("x86_64", "amd64").replace("aarch64", "arm64")
+GATEWAY_WORKER = GATEWAY_RUNTIME_DIR / "bin" / f"sbx-gateway-{sys.platform}-{_GATEWAY_ARCH}"
+GATEWAY_DEV_WORKER = GATEWAY_SOURCE_DIR / "sbx-gateway"
+GATEWAY_DEV_MEDIATOR_PYTHON = GATEWAY_SOURCE_DIR / "mediator" / ".venv" / "bin" / "python"
+GATEWAY_MEDIATOR_LAUNCHER = GATEWAY_MEDIATOR_DIR / "launch.py"
+GATEWAY_UV_VERSION = "0.11.30"
+GATEWAY_PYTHON_VERSION = "3.12.13"
 MAX_CONFIG_BYTES = 1 << 20
 MAX_LOG_BYTES = 100 * 1024 * 1024
 MAX_LOG_TOTAL_BYTES = MAX_LOG_BYTES
@@ -1000,6 +1007,56 @@ def _resolve_artifact(
     raise GatewayLifecycleError(f"{label} is missing or unsafe")
 
 
+def _gateway_checksums() -> dict[str, str]:
+    path = GATEWAY_RUNTIME_DIR / "SHA256SUMS"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    checksums: dict[str, str] = {}
+    for line in lines:
+        digest, _, name = line.partition("  ")
+        if re.fullmatch(r"[0-9a-f]{64}", digest) and name:
+            checksums[name] = digest
+    return checksums
+
+
+def _verify_packaged_artifact(path: Path) -> None:
+    try:
+        relative = path.resolve(strict=True).relative_to(GATEWAY_RUNTIME_DIR.resolve(strict=True))
+    except (OSError, ValueError) as error:
+        if path.exists():
+            return
+        raise GatewayLifecycleError("packaged gateway artifact is missing") from error
+    expected = _gateway_checksums().get(relative.as_posix())
+    if expected is None:
+        raise GatewayLifecycleError(f"packaged gateway artifact checksum is missing: {relative}")
+    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    if not hmac.compare_digest(actual, expected):
+        raise GatewayLifecycleError(f"packaged gateway artifact checksum mismatch: {relative}")
+
+
+def _resolve_uv() -> Path:
+    uv = _resolve_artifact(
+        "SBX_UV_BIN",
+        (shutil.which("uv"),),
+        executable=True,
+        label=f"uv {GATEWAY_UV_VERSION}",
+    )
+    try:
+        version = subprocess.run(
+            [str(uv), "--version"], check=True, capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        raise GatewayLifecycleError("failed to verify uv version") from error
+    expected = f"uv {GATEWAY_UV_VERSION}"
+    if not version.startswith(f"{expected} ") and version != expected:
+        raise GatewayLifecycleError(
+            f"gateway mediator requires uv {GATEWAY_UV_VERSION}; found {version}"
+        )
+    return uv
+
+
 def _sanitized_child_environment(directory: Path) -> dict[str, str]:
     return {
         "HOME": str(directory),
@@ -1312,20 +1369,60 @@ class GatewayController:
             raise GatewayLifecycleError("gateway mediator policy is too large")
         return payload
 
-    def _mediator_command(self, key_fd: int, ready_fd: int, policy_fd: int) -> list[str]:
+    def _mediator_python(self) -> Path:
         assert self.directory is not None
-        python = _resolve_artifact(
+        override = os.environ.get("SBX_GATEWAY_MEDIATOR_PYTHON")
+        if override is not None:
+            return _resolve_artifact(
+                "SBX_GATEWAY_MEDIATOR_PYTHON",
+                (),
+                executable=True,
+                label="pinned gateway mediator runtime",
+            )
+        packaged_python = self.directory / "mediator-venv" / "bin" / "python"
+        if not packaged_python.exists() and GATEWAY_MEDIATOR_DIR.exists():
+            _verify_packaged_artifact(GATEWAY_MEDIATOR_DIR / "uv.lock")
+            env = _sanitized_child_environment(self.directory)
+            env["UV_PROJECT_ENVIRONMENT"] = str(self.directory / "mediator-venv")
+            subprocess.run(
+                [
+                    str(_resolve_uv()),
+                    "sync",
+                    "--directory",
+                    str(GATEWAY_MEDIATOR_DIR),
+                    "--locked",
+                    "--no-build",
+                    "--no-dev",
+                    "--managed-python",
+                    "--python",
+                    GATEWAY_PYTHON_VERSION,
+                ],
+                check=True,
+                env=env,
+                timeout=120,
+            )
+            with suppress(OSError):
+                packaged_python.resolve(strict=True).chmod(0o555)
+        with suppress(OSError):
+            packaged_python.resolve(strict=True).chmod(0o555)
+        return _resolve_artifact(
             "SBX_GATEWAY_MEDIATOR_PYTHON",
-            (GATEWAY_MEDIATOR_PYTHON, shutil.which("python3.12")),
+            (packaged_python, GATEWAY_DEV_MEDIATOR_PYTHON, shutil.which("python3.12")),
             executable=True,
             label="pinned gateway mediator runtime",
         )
+
+    def _mediator_command(self, key_fd: int, ready_fd: int, policy_fd: int) -> list[str]:
+        assert self.directory is not None
+        python = self._mediator_python()
         launcher = _resolve_artifact(
             "SBX_GATEWAY_MEDIATOR_LAUNCHER",
-            (GATEWAY_MEDIATOR_LAUNCHER,),
+            (GATEWAY_MEDIATOR_LAUNCHER, GATEWAY_SOURCE_DIR / "mediator" / "launch.py"),
             executable=False,
             label="gateway mediator launcher",
         )
+        if launcher.is_relative_to(GATEWAY_RUNTIME_DIR):
+            _verify_packaged_artifact(GATEWAY_MEDIATOR_DIR / "uv.lock")
         return [
             str(python),
             str(launcher),
@@ -1349,10 +1446,12 @@ class GatewayController:
         assert self.directory is not None
         worker = _resolve_artifact(
             "SBX_GATEWAY_BIN",
-            (GATEWAY_WORKER, shutil.which("sbx-gateway")),
+            (GATEWAY_WORKER, GATEWAY_DEV_WORKER, shutil.which("sbx-gateway")),
             executable=True,
             label="exact gateway worker artifact",
         )
+        if worker.is_relative_to(GATEWAY_RUNTIME_DIR):
+            _verify_packaged_artifact(worker)
         policy = _read_json(self.directory / "policy.json")
         digest = policy.get("digest")
         if not isinstance(digest, str):
