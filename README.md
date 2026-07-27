@@ -7,7 +7,7 @@ Host credentials are not copied by default. `sbx` forwards only selected environ
 ## Install
 
 ```bash
-uv tool install git+https://github.com/nueces/sbx.git@v0.2.4
+uv tool install git+https://github.com/nueces/sbx.git@v0.2.5
 ```
 
 Alternatively, install an editable clone:
