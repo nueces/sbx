@@ -380,6 +380,22 @@ def _start_existing_vm_if_needed(
         )
         print(f"sbx: If it still fails, run `sbx recreate {vm_id} --force`.", file=sys.stderr)
         return 1
+    current = vm_state.existing_vm_start_config(vm_id)
+    if current is not None:
+        config = current[1]
+        for key in ("kernel_path", "rootfs_path"):
+            value = config.get(key)
+            if value is not None and not Path(str(value)).expanduser().exists():
+                print(
+                    f"sbx: VM '{vm_id}' references missing boot artifact: {value}",
+                    file=sys.stderr,
+                )
+                print(
+                    "sbx: This VM was likely created from a temporary or removed image.",
+                    file=sys.stderr,
+                )
+                print(f"sbx: Run `sbx recreate {vm_id} --force`.", file=sys.stderr)
+                return 1
     command = ["sandbox", "start", vm_id, "--boot-timeout", f"{boot_timeout:g}"]
     completed = runtime.run_smolvm_capture(command)
     if completed is None:
