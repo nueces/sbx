@@ -726,22 +726,6 @@ def test_manifest_run_user() -> None:
             "'sbx' must be an object",
         ),
         (
-            {
-                "kernel": "vmlinux.bin",
-                "rootfs": "rootfs.ext4",
-                "sbx": {"agent": "codex"},
-            },
-            "obsolete field.*sbx.agent",
-        ),
-        (
-            {
-                "kernel": "vmlinux.bin",
-                "rootfs": "rootfs.ext4",
-                "sbx": {"launch_command": []},
-            },
-            "launch_command",
-        ),
-        (
             {"kernel": "vmlinux.bin", "rootfs": "rootfs.ext4", "boot_args": []},
             "boot_args",
         ),
@@ -773,6 +757,21 @@ def test_start_local_image_validation_errors(
             cwd=None,
             git_config_text=None,
         )
+
+
+def test_obsolete_manifest_fields_warn_and_are_ignored(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    manifest = {"sbx": {"agent": "pi", "launch_command": "pi", "run_user": "agent"}}
+
+    cli._warn_obsolete_manifest_fields(manifest)
+
+    assert cli._manifest_run_user(manifest) == "agent"
+    assert capsys.readouterr().err == (
+        "sbx: warning: image manifest contains obsolete field(s) "
+        "sbx.agent, sbx.launch_command; ignoring them; "
+        "rebuild the image to remove this warning\n"
+    )
 
 
 def test_local_image_manifest_errors(tmp_path: Path) -> None:

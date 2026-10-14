@@ -593,11 +593,18 @@ def _manifest_sbx(manifest: Mapping[str, Any]) -> Mapping[str, Any]:
     sbx = manifest.get("sbx", {})
     if not isinstance(sbx, Mapping):
         raise ConfigError("image manifest field 'sbx' must be an object")
-    obsolete = [key for key in ("agent", "launch_command") if key in sbx]
+    return sbx
+
+
+def _warn_obsolete_manifest_fields(manifest: Mapping[str, Any]) -> None:
+    obsolete = [key for key in ("agent", "launch_command") if key in _manifest_sbx(manifest)]
     if obsolete:
         fields = ", ".join(f"sbx.{key}" for key in obsolete)
-        raise ConfigError(f"image manifest contains obsolete field(s) {fields}; rebuild the image")
-    return sbx
+        print(
+            f"sbx: warning: image manifest contains obsolete field(s) {fields}; "
+            "ignoring them; rebuild the image to remove this warning",
+            file=sys.stderr,
+        )
 
 
 def _manifest_run_user(manifest: Mapping[str, Any]) -> str | None:
@@ -776,7 +783,7 @@ def _start_local_image(
     from smolvm import SmolVM, VMConfig
     from smolvm.utils import ensure_ssh_key
 
-    _manifest_sbx(manifest)
+    _warn_obsolete_manifest_fields(manifest)
 
     kernel_path = lifecycle_warnings.manifest_path(image_dir, manifest, "kernel")
     rootfs_path = lifecycle_warnings.manifest_path(image_dir, manifest, "rootfs")
@@ -1007,7 +1014,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         if existing_status is not None:
             if image is not None:
                 existing_manifest = lifecycle_warnings.local_image_manifest(image)
-                _manifest_sbx(existing_manifest)
+                _warn_obsolete_manifest_fields(existing_manifest)
                 if run_user is None:
                     run_user = _manifest_run_user(existing_manifest)
             if run_user is None:
@@ -1231,7 +1238,7 @@ def cmd_shell(args: argparse.Namespace) -> int:
     image = lifecycle_warnings.path_from_config(_cfg(config, "sbx", "image"))
     if image is not None:
         shell_manifest = lifecycle_warnings.local_image_manifest(image)
-        _manifest_sbx(shell_manifest)
+        _warn_obsolete_manifest_fields(shell_manifest)
         if run_user is None and not args.root:
             run_user = _manifest_run_user(shell_manifest)
     if run_user is not None:
