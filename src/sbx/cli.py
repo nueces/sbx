@@ -601,8 +601,8 @@ def _warn_obsolete_manifest_fields(manifest: Mapping[str, Any]) -> None:
     if obsolete:
         fields = ", ".join(f"sbx.{key}" for key in obsolete)
         print(
-            f"sbx: warning: image manifest contains obsolete field(s) {fields}; "
-            "ignoring them; rebuild the image to remove this warning",
+            f"sbx: warning: obsolete image manifest field(s) {fields} are ignored; "
+            "remove them from the manifest or rebuild the image",
             file=sys.stderr,
         )
 
