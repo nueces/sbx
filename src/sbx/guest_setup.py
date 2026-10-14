@@ -443,32 +443,42 @@ def install_runtime_tools(
     for tool in tools:
         if command_path(vm_id, user, tool, run_capture=run_capture, ssh=ssh):
             continue
-        if tool != "pi":
-            raise ConfigError(f"no runtime installer is registered for {tool!r}")
         quoted_user = shlex.quote(user)
-        install_command = (
-            "if [ -r /etc/profile.d/smolvm_env.sh ]; then "
-            ". /etc/profile.d/smolvm_env.sh; fi; "
-            f"exec timeout --signal=TERM --kill-after=10s {install_timeout}s "
-            'npm install --global --prefix "$HOME/.local" --ignore-scripts '
-            "@earendil-works/pi-coding-agent </dev/null"
-        )
+        if tool == "pi":
+            install_env = "NPM_CONFIG_USERCONFIG=/dev/stdin NPM_CONFIG_GLOBALCONFIG=/dev/null"
+            install_command = (
+                "if [ -r /etc/profile.d/smolvm_env.sh ]; then "
+                ". /etc/profile.d/smolvm_env.sh; fi; "
+                f"exec timeout --signal=TERM --kill-after=10s {install_timeout}s "
+                'npm install --global --prefix "$HOME/.local" --ignore-scripts '
+                "@earendil-works/pi-coding-agent </dev/null"
+            )
+        elif tool == "specify":
+            install_env = ""
+            install_command = (
+                f"exec timeout --signal=TERM --kill-after=10s {install_timeout}s "
+                "uv tool install specify-cli "
+                "--from git+https://github.com/github/spec-kit.git"
+            )
+        else:
+            raise ConfigError(f"no runtime installer is registered for {tool!r}")
         script = f"""
 set -eu
 home="$(getent passwd {quoted_user} | cut -d: -f6)"
 [ -n "$home" ] || {{ echo "user {quoted_user} has no home" >&2; exit 1; }}
 sudo -iu {quoted_user} env HOME="$home" PATH="$home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
-  NPM_CONFIG_USERCONFIG=/dev/stdin NPM_CONFIG_GLOBALCONFIG=/dev/null \
-  sh -lc {shlex.quote(install_command)}
+  {install_env} sh -lc {shlex.quote(install_command)}
 """
         completed = run_capture([*ssh(vm_id), "bash -lc " + shlex.quote(script)])
         if completed is None:
-            raise ConfigError("failed to install Pi: ssh command not found")
+            raise ConfigError(f"failed to install {tool!r}: ssh command not found")
         if completed.returncode != 0:
             details = "\n".join(
                 value.strip() for value in (completed.stdout, completed.stderr) if value.strip()
             )
-            raise ConfigError(f"failed to install Pi as {user!r}: {details or 'npm failed'}")
+            raise ConfigError(
+                f"failed to install {tool!r} as {user!r}: {details or 'installer failed'}"
+            )
 
 
 def attach(

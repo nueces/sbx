@@ -22,12 +22,12 @@ src/sbx/image/resources/Containers/Debian/
 
 - starts from `debian:stable-slim`
 - configures the NodeSource Node.js 22.x apt repository directly
-- installs Node.js, npm, uv, Specify, and basic tools on the system PATH
+- installs Node.js, npm, uv, and basic tools on the system PATH
 - remains user-neutral so `sbx` can create the selected runtime user after boot
 
 The build command reads these packaged resources with `importlib.resources` and combines them into a temporary Containerfile. An optional `--agent-containerfile` can add custom build-time tooling, but the packaged image has no Pi-specific layer or installer helper.
 
-At first startup, `sbx` creates the configured user or a user matching the current host username. If Pi was explicitly requested, npm installs it directly under that user's `$HOME/.local`.
+At first startup, `sbx` creates the configured user or a user matching the current host username. Explicit runtime requests install Pi with npm or Specify with uv directly under that user's `$HOME/.local`.
 
 ## 2. Install the tools
 
@@ -271,6 +271,16 @@ sbx run --reprovision --no-attach
 ```
 
 Alternatively use `--runtime-install pi`, which implies reprovisioning for an existing VM. Installation requires npm registry access and writes directly to `/home/<run-user>/.local` without creating or changing `.npmrc`.
+
+### `specify` was not found
+
+The image intentionally contains no Specify package. Add `runtime_install = ["specify"]` or combine it with Pi as `runtime_install = ["pi", "specify"]`, then run:
+
+```bash
+sbx run --reprovision --no-attach
+```
+
+Specify installation uses the image's system `uv`, requires GitHub access, and lets uv manage `$HOME/.local/bin/specify` and its tool tree.
 
 ### `e2fsck and resize2fs are needed to grow the disk`
 

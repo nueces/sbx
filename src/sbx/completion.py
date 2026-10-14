@@ -125,7 +125,7 @@ _sbx_complete() {{
             return 0
             ;;
         --runtime-install)
-            COMPREPLY=( $(compgen -W "pi" -- "$cur") )
+            COMPREPLY=( $(compgen -W "pi specify" -- "$cur") )
             return 0
             ;;
         --config|--image|--mount|--project-path)

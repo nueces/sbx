@@ -122,6 +122,8 @@ def test_packaged_image_is_user_neutral() -> None:
     assert "1000" not in docker
     assert "/opt/sbx/user-home" not in base + docker
     assert "pi-coding-agent" not in base + docker
+    assert "specify-cli" not in base + docker
+    assert "github/spec-kit" not in base + docker
     assert "UV_INSTALL_DIR=/usr/local/bin" in base
     assert "SBX_DOCKER_USER:?" in helper
     assert "start-stop-daemon --start --background" in helper

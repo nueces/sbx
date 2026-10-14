@@ -33,7 +33,7 @@ The build command:
 4. downloads the kernel recipe and checker from immutable commits, verifies each SHA-256, and builds a Docker-capable QEMU kernel from SHA-256-verified Linux source;
 5. writes `smolvm-image.json` next to the generated kernel and rootfs.
 
-The resulting rootfs contains Node.js, npm, uv, Specify, and Docker, but no Pi package. Local-image runtime tools are installed only when explicitly requested during VM provisioning.
+The resulting rootfs contains Node.js, npm, uv, and Docker, but no Pi or Specify package. Local-image runtime tools are installed only when explicitly requested during VM provisioning.
 
 ## Manifest
 
@@ -60,7 +60,7 @@ A typical `.sbx.toml` uses the local image directory:
 ```toml
 [sbx]
 agent = "pi"
-runtime_install = ["pi"]
+runtime_install = ["pi", "specify"]
 name = "the-quest"
 image = "~/.smolvm/images/sbx"
 memory = 8192
@@ -84,6 +84,8 @@ When `sbx run` starts a missing VM from this image, `sbx`:
 8. records successful provisioning and launches the independently configured agent command.
 
 In code this path is handled by `src/sbx/cli.py` in `_start_local_image()`.
+
+Images built before Specify became a runtime installer retain their baked-in copy. Rebuild the image and recreate the VM to remove it; deleting `specify` from `runtime_install` does not uninstall existing user state.
 
 ## SmolVM pieces used
 

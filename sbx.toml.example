@@ -1,6 +1,8 @@
 [sbx]
 agent = "pi"
 runtime_install = ["pi"]
+# Add "specify" to install the Specify CLI with uv during provisioning.
+# runtime_install = ["pi", "specify"]
 name = "pi"
 image = "~/.smolvm/images/debian-sbx"
 memory = 2048

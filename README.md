@@ -109,7 +109,20 @@ If you try to run with different mounts while the VM is already running, `sbx` k
 
 ### Install more tools
 
-The curated image installs Pi only when `runtime_install = ["pi"]` or `--runtime-install pi` is requested. For other tools, install directly on the sandbox disk instead of rebuilding the image:
+The curated image contains neither Pi nor Specify. Install either explicitly during creation or reprovisioning:
+
+```toml
+[sbx]
+runtime_install = ["pi", "specify"]
+```
+
+Repeated CLI options provide the same request for one invocation:
+
+```bash
+sbx run --runtime-install pi --runtime-install specify --no-attach
+```
+
+For other tools, install directly on the sandbox disk instead of rebuilding the image:
 
 ```bash
 sbx shell
@@ -123,7 +136,7 @@ exit
 
 Claude Code and OpenCode require their npm postinstall scripts to prepare native binaries; do not install either with `--ignore-scripts`.
 
-Installed software survives `sbx stop` and remains available on later runs:
+Runtime installation is additive: removing a tool from `runtime_install` does not uninstall it. Installed software survives `sbx stop` and remains available on later runs:
 
 ```bash
 sbx run --agent claude

@@ -55,9 +55,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -LsSf https://astral.sh/uv/install.sh \
-      | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh && \
-    UV_TOOL_DIR=/opt/sbx/uv-tools UV_TOOL_BIN_DIR=/usr/local/bin \
-      uv tool install specify-cli --from git+https://github.com/github/spec-kit.git
+      | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
 
 USER root
 WORKDIR /root

@@ -1887,17 +1887,39 @@ def test_root_shell_requires_host_identity(
 
 
 def test_runtime_install_is_strict_and_cli_replaces_config() -> None:
-    configured = {"sbx": {"runtime_install": ["pi"]}}
-    assert cli._runtime_install(SimpleNamespace(runtime_install=None), configured) == ["pi"]
+    configured = {"sbx": {"runtime_install": ["pi", "specify"]}}
+    assert cli._runtime_install(SimpleNamespace(runtime_install=None), configured) == [
+        "pi",
+        "specify",
+    ]
     assert cli._runtime_install(SimpleNamespace(runtime_install=[]), configured) == []
+    assert cli._runtime_install(SimpleNamespace(runtime_install=["specify"]), configured) == [
+        "specify"
+    ]
+    assert cli._cfg_agent({"sbx": {"agent": "codex", "runtime_install": ["specify"]}}) == "codex"
 
-    for value in ("pi", ["pi", "pi"], ["unknown"]):
+    for value in ("pi", ["pi", "pi"], ["specify", "specify"], ["unknown"]):
         with pytest.raises(cli.ConfigError):
             cli._runtime_install(
                 SimpleNamespace(runtime_install=None), {"sbx": {"runtime_install": value}}
             )
     with pytest.raises(cli.ConfigError, match="positive integer"):
         cli._install_timeout(0)
+
+
+def test_empty_runtime_install_does_nothing() -> None:
+    calls: list[list[str]] = []
+
+    guest_setup.install_runtime_tools(
+        "vm1",
+        "agent",
+        [],
+        600,
+        run_capture=lambda argv: calls.append(argv),
+        ssh=lambda vm_id: ["ssh", vm_id],
+    )
+
+    assert calls == []
 
 
 @pytest.mark.parametrize("user", ["agent", "root"])
@@ -1938,17 +1960,49 @@ def test_runtime_pi_install_uses_explicit_user_prefix_without_npm_config(user: s
     assert "npm config" not in install_script
 
 
-def test_runtime_pi_install_preserves_existing_command() -> None:
+def test_runtime_specify_install_uses_uv_as_selected_user() -> None:
+    calls: list[list[str]] = []
+    results = iter(
+        [
+            subprocess.CompletedProcess([], 127, "", ""),
+            subprocess.CompletedProcess([], 0, "installed\n", ""),
+        ]
+    )
+
+    def run_capture(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return next(results)
+
+    guest_setup.install_runtime_tools(
+        "vm1",
+        "developer",
+        ["specify"],
+        123,
+        run_capture=run_capture,
+        ssh=lambda vm_id: ["ssh", vm_id],
+    )
+
+    assert len(calls) == 2
+    install_script = calls[1][-1]
+    assert "sudo -iu developer" in install_script
+    assert "123s uv tool install specify-cli" in install_script
+    assert "--from git+https://github.com/github/spec-kit.git" in install_script
+    assert "NPM_CONFIG" not in install_script
+    assert "chown" not in install_script
+
+
+@pytest.mark.parametrize("tool", ["pi", "specify"])
+def test_runtime_install_preserves_existing_command(tool: str) -> None:
     calls: list[list[str]] = []
 
     def run_capture(argv: list[str]) -> subprocess.CompletedProcess[str]:
         calls.append(argv)
-        return subprocess.CompletedProcess(argv, 0, "/custom/bin/pi\n", "")
+        return subprocess.CompletedProcess(argv, 0, f"/custom/bin/{tool}\n", "")
 
     guest_setup.install_runtime_tools(
         "vm1",
         "agent",
-        ["pi"],
+        [tool],
         600,
         run_capture=run_capture,
         ssh=lambda vm_id: ["ssh", vm_id],
@@ -1956,10 +2010,31 @@ def test_runtime_pi_install_preserves_existing_command() -> None:
 
     assert len(calls) == 1
     assert "npm install" not in calls[0][-1]
+    assert "uv tool install" not in calls[0][-1]
 
 
+def test_runtime_specify_install_failure_is_actionable() -> None:
+    results = iter(
+        [
+            subprocess.CompletedProcess([], 127, "", ""),
+            subprocess.CompletedProcess([], 127, "", "timeout: failed to run command 'uv'"),
+        ]
+    )
+
+    with pytest.raises(cli.ConfigError, match="failed to install 'specify'.*failed to run"):
+        guest_setup.install_runtime_tools(
+            "vm1",
+            "agent",
+            ["specify"],
+            600,
+            run_capture=lambda argv: next(results),
+            ssh=lambda vm_id: ["ssh", vm_id],
+        )
+
+
+@pytest.mark.parametrize("tool", ["pi", "specify"])
 def test_cli_runtime_install_implies_existing_vm_reprovision(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tool: str
 ) -> None:
     config = tmp_path / "config.toml"
     config.write_text('[sbx]\nname = "vm1"\n', encoding="utf-8")
@@ -1980,14 +2055,14 @@ def test_cli_runtime_install_implies_existing_vm_reprovision(
                 "run",
                 "--no-attach",
                 "--runtime-install",
-                "pi",
+                tool,
             ]
         )
         == 0
     )
     assert captured["provision"] is True
     assert captured["was_provisioned"] is True
-    assert captured["runtime_install"] == ["pi"]
+    assert captured["runtime_install"] == [tool]
 
 
 def test_failed_reprovision_preserves_success_and_prints_guidance(
