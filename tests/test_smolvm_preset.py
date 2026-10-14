@@ -107,12 +107,11 @@ def test_create_preset(
         disk_size_mib=disk,
         mounts=["/host:/guest"],
         writable_mounts=True,
-        port_forwards=[
-            {"host_address": "0.0.0.0", "host_port": 3000, "guest_port": 30}
-        ],
+        port_forwards=[{"host_address": "0.0.0.0", "host_port": 3000, "guest_port": 30}],
         boot_timeout=75,
         install_timeout=900,
         host_env={"HOME": "/isolated", "ALLOWED_SECRET": "secret"},
+        before_provision=lambda vm_id: events.append(f"claim:{vm_id}"),
     )
 
     assert result is vm
@@ -130,15 +129,22 @@ def test_create_preset(
     assert captured["apply_env"] == {"HOME": "/isolated", "ALLOWED_SECRET": "secret"}
     assert os.environ["ORIGINAL"] == "kept"
     assert "ALLOWED_SECRET" not in os.environ
-    assert events == ["build", "update", "construct", "start:75", "wait:75", "channel", "apply:900"]
+    assert events == [
+        "build",
+        "update",
+        "construct",
+        "start:75",
+        "wait:75",
+        "claim:demo",
+        "channel",
+        "apply:900",
+    ]
     assert config.updates.get("vcpu_count") == cpus
     if cpus is None:
         assert "vcpu_count" not in config.updates
     forwards = config.updates["port_forwards"]
     assert isinstance(forwards, list)
-    assert forwards[0] == PortForwardConfig(
-        host_address="0.0.0.0", host_port=3000, guest_port=30
-    )
+    assert forwards[0] == PortForwardConfig(host_address="0.0.0.0", host_port=3000, guest_port=30)
     assert captured["construct"] == (
         (config,),
         {

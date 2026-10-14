@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -32,9 +33,7 @@ def _fake_build(
         def __init__(self, cache_dir: Path | None = None) -> None:
             super().__init__(cache_dir or tmp_path)
 
-    def fake_base(
-        base_image: str, containerfile: Path, *, context_dir: Path | None = None
-    ) -> str:
+    def fake_base(base_image: str, containerfile: Path, *, context_dir: Path | None = None) -> str:
         del base_image, context_dir
         combined.append(containerfile.read_text(encoding="utf-8"))
         return "sbx-debian-base:test"
@@ -53,7 +52,7 @@ def _fake_build(
         kernel.write_text("kernel", encoding="utf-8")
         return kernel
 
-    monkeypatch.setattr(build_debian, "SbxImageBuilder", Builder)
+    monkeypatch.setattr(build_debian, "ImageBuilder", Builder)
     monkeypatch.setattr(build_debian, "_build_containerfile_base_image", fake_base)
     monkeypatch.setattr(build_debian, "_build_rootfs", fake_rootfs)
     monkeypatch.setattr(build_debian, "_build_docker_kernel", fake_kernel)
@@ -98,9 +97,7 @@ def test_download_verified_rejects_mismatch_before_writing(tmp_path: Path) -> No
 def test_linux_digest_mismatch_is_actionable(tmp_path: Path) -> None:
     expected = hashlib.sha256(b"expected").hexdigest()
     (tmp_path / "linux.version").write_text("6.12.85\n", encoding="utf-8")
-    (tmp_path / "linux.sha256").write_text(
-        f"{expected}  linux-6.12.85.tar.xz\n", encoding="utf-8"
-    )
+    (tmp_path / "linux.sha256").write_text(f"{expected}  linux-6.12.85.tar.xz\n", encoding="utf-8")
     (tmp_path / "linux-6.12.85.tar.xz").write_bytes(b"changed")
 
     with pytest.raises(RuntimeError) as error:
@@ -112,14 +109,89 @@ def test_linux_digest_mismatch_is_actionable(tmp_path: Path) -> None:
     assert f"actual:   {hashlib.sha256(b'changed').hexdigest()}" in message
 
 
-def test_packaged_pi_containerfile_uses_npm_global_install() -> None:
+def test_packaged_image_is_user_neutral() -> None:
     with build_debian._packaged_resources() as resources:
-        content = (resources / build_debian.DEFAULT_AGENT_CONTAINERFILE).read_text(
-            encoding="utf-8"
+        base = (resources / build_debian.DEFAULT_BASE_CONTAINERFILE).read_text(encoding="utf-8")
+        docker = (resources / build_debian.DEFAULT_DOCKER_CONTAINERFILE).read_text(encoding="utf-8")
+        helper = (resources / "scripts/sbx-start-rootless-docker").read_text(encoding="utf-8")
+        assert not (resources / "Containers/Agents/Pi.Containerfile").exists()
+
+    assert "useradd" not in base
+    assert "/home/agent" not in base + docker
+    assert "USER agent" not in base + docker
+    assert "1000" not in docker
+    assert "/opt/sbx/user-home" not in base + docker
+    assert "pi-coding-agent" not in base + docker
+    assert "specify-cli" not in base + docker
+    assert "github/spec-kit" not in base + docker
+    assert "UV_INSTALL_DIR=/usr/local/bin" in base
+    assert "SBX_DOCKER_USER:?" in helper
+    assert "start-stop-daemon --start --background" in helper
+    assert "--exec /usr/bin/dockerd-rootless.sh" in helper
+    assert "daemon_running" in helper
+    assert "running but unresponsive" in helper
+    assert "kill" not in helper
+    assert "nohup" not in helper
+
+
+def test_rootless_docker_helper_detaches_and_waits_for_readiness(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    state_dir = tmp_path / "state"
+    bin_dir.mkdir()
+    state_dir.mkdir()
+
+    def stub(name: str, body: str) -> None:
+        path = bin_dir / name
+        path.write_text("#!/bin/sh\nset -eu\n" + body, encoding="utf-8")
+        path.chmod(0o755)
+
+    stub(
+        "id",
+        'case "${1-}" in\n'
+        '  -u) [ "$#" -eq 1 ] && echo 0 || echo 1234 ;;\n'
+        "  -gn) echo developer ;;\n"
+        "esac\n",
+    )
+    stub(
+        "sudo",
+        'shift 2\n[ "${1-}" = env ] && shift\n'
+        'while [ "$#" -gt 0 ] && [ "${1#*=}" != "$1" ]; do export "$1"; shift; done\n'
+        'command="$1"; shift\nexec "$SBX_TEST_BIN/$command" "$@"\n',
+    )
+    stub(
+        "docker",
+        'printf "call\\n" >> "$SBX_TEST_STATE/docker-calls"\n[ -f "$SBX_TEST_STATE/started" ]\n',
+    )
+    stub(
+        "start-stop-daemon",
+        'printf "%s\\n" "$*" > "$SBX_TEST_STATE/launch"\n: > "$SBX_TEST_STATE/started"\n',
+    )
+    stub("pgrep", "exit 1\n")
+    for name in ("awk", "chmod", "chown", "mkdir", "mknod", "mount", "sleep", "touch"):
+        stub(name, ":\n")
+
+    with build_debian._packaged_resources() as resources:
+        helper = resources / "scripts/sbx-start-rootless-docker"
+        completed = subprocess.run(
+            ["sh", str(helper), str(tmp_path / "dockerd.log")],
+            check=False,
+            text=True,
+            capture_output=True,
+            env={
+                **os.environ,
+                "PATH": f"{bin_dir}:/usr/bin:/bin",
+                "SBX_DOCKER_RESOLV_CONF": str(tmp_path / "resolv.conf"),
+                "SBX_DOCKER_USER": "developer",
+                "SBX_TEST_BIN": str(bin_dir),
+                "SBX_TEST_STATE": str(state_dir),
+            },
         )
 
-    assert 'ENV PATH="/home/agent/.local/bin:/home/agent/.nodejs/bin:${PATH}"' in content
-    assert "npm install --global --ignore-scripts @earendil-works/pi-coding-agent" in content
+    assert completed.returncode == 0, completed.stderr
+    launch = (state_dir / "launch").read_text(encoding="utf-8")
+    assert "--background" in launch
+    assert "--exec /usr/bin/dockerd-rootless.sh" in launch
+    assert (state_dir / "docker-calls").read_text(encoding="utf-8").count("call") == 2
 
 
 def test_compose_containerfiles_includes_docker_between_base_and_agent(tmp_path: Path) -> None:
@@ -149,6 +221,7 @@ def test_default_build_always_uses_docker_kernel_and_feature(
 
     assert rc == 0
     assert "# ---- Docker layer ----" in combined[0]
+    assert "# ---- Optional tooling layer ----" not in combined[0]
     rootfs_call = calls["rootfs"]
     assert isinstance(rootfs_call, dict)
     assert rootfs_call["name"] == "sbx"
@@ -157,12 +230,12 @@ def test_default_build_always_uses_docker_kernel_and_feature(
     assert rootfs_call["arch"] == "amd64"
     manifest = json.loads((tmp_path / "sbx" / "smolvm-image.json").read_text())
     assert manifest["kernel"] == "vmlinux.bin"
-    assert manifest["sbx"]["features"] == ["docker"]
-    assert manifest["sbx"]["run_user"] == "agent"
+    assert manifest["sbx"] == {"features": ["docker"]}
     output = capsys.readouterr().out
     assert "kernel:" in output
     assert "sbx run the-quest" in output
     assert f"--image {tmp_path / 'sbx'}" in output
+    assert "--runtime-install pi" in output
     assert "--write-config" in output
 
 
@@ -259,6 +332,22 @@ def test_build_rootfs_omits_guest_agent_and_reuses_fingerprint(
     assert "smolvm-guest-agent" not in context
 
 
+@pytest.mark.parametrize(
+    ("security_options", "expected"),
+    [('["name=rootless"]', "0:0"), ('["name=seccomp"]', f"{os.getuid()}:{os.getgid()}")],
+)
+def test_docker_bind_mount_owner(
+    monkeypatch: pytest.MonkeyPatch, security_options: str, expected: str
+) -> None:
+    monkeypatch.setattr(
+        build_debian.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, security_options, ""),
+    )
+
+    assert build_debian._docker_bind_mount_owner() == expected
+
+
 def test_build_docker_kernel_uses_only_verified_inputs(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -287,6 +376,9 @@ def test_build_docker_kernel_uses_only_verified_inputs(
             (out / "vmlinux-amd64.config").write_text("config", encoding="utf-8")
 
     monkeypatch.setattr(build_debian.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        build_debian, "_docker_bind_mount_owner", lambda: f"{os.getuid()}:{os.getgid()}"
+    )
 
     kernel = build_debian._build_docker_kernel(image_dir=tmp_path, arch="amd64")
 
@@ -344,6 +436,9 @@ def test_kernel_check_failure_preserves_existing_kernel(
         assert check in {True, False}
 
     monkeypatch.setattr(build_debian.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        build_debian, "_docker_bind_mount_owner", lambda: f"{os.getuid()}:{os.getgid()}"
+    )
 
     with pytest.raises(subprocess.CalledProcessError):
         build_debian._build_docker_kernel(image_dir=tmp_path, arch="amd64")
@@ -359,21 +454,46 @@ def test_build_containerfile_base_image_runs_expected_docker_commands(
     commands: list[list[str]] = []
     wrapper_text: list[str] = []
 
-    def fake_run(command: list[str], *, check: bool) -> None:
+    def fake_run(
+        command: list[str], *, check: bool, **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
         assert check is True
         commands.append(command)
         if command[:3] == ["docker", "build", "-t"]:
             wrapper_text.append((Path(command[-1]) / "Dockerfile").read_text(encoding="utf-8"))
+        stdout = "sha256:user-image\n" if command[:3] == ["docker", "image", "inspect"] else ""
+        return subprocess.CompletedProcess(command, 0, stdout, "")
 
     monkeypatch.setattr(build_debian.subprocess, "run", fake_run)
 
     root_tag = build_debian._build_containerfile_base_image("debian:stable-slim", containerfile)
 
-    assert root_tag.startswith("sbx-debian-base:")
+    expected_digest = hashlib.sha256(b"sha256:user-image").hexdigest()[:12]
+    assert root_tag == f"sbx-debian-base:{expected_digest}"
     assert commands[0][:4] == ["docker", "build", "--build-arg", "BASE_IMAGE=debian:stable-slim"]
-    assert commands[1][:4] == ["docker", "build", "-t", root_tag]
-    user_tag = root_tag.replace("sbx-debian-base:", "sbx-debian-base-user:")
+    user_tag = commands[0][commands[0].index("-t") + 1]
+    assert commands[1] == ["docker", "image", "inspect", "--format", "{{.Id}}", user_tag]
+    assert commands[2][:4] == ["docker", "build", "-t", root_tag]
     assert wrapper_text == [f"FROM {user_tag}\nUSER root\n"]
+
+
+def test_build_containerfile_base_image_tag_tracks_built_image_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    containerfile = tmp_path / "Containerfile"
+    containerfile.write_text("FROM debian:stable-slim\nCOPY payload /payload\n", encoding="utf-8")
+    image_ids = iter(["sha256:first", "sha256:second"])
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        stdout = next(image_ids) if command[:3] == ["docker", "image", "inspect"] else ""
+        return subprocess.CompletedProcess(command, 0, stdout, "")
+
+    monkeypatch.setattr(build_debian.subprocess, "run", fake_run)
+
+    first = build_debian._build_containerfile_base_image("debian:stable-slim", containerfile)
+    second = build_debian._build_containerfile_base_image("debian:stable-slim", containerfile)
+
+    assert first != second
 
 
 def test_build_containerfile_base_image_missing_file(tmp_path: Path) -> None:

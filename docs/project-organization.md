@@ -1,6 +1,6 @@
-# Project organization for sbx, Pi, and spec-kit
+# Project organization for sbx and Pi
 
-This workflow uses a host-side working directory as the orchestration root. `sbx` is started from that working directory, then Pi/spec-kit create feature worktrees under it.
+This workflow uses a host-side working directory as the orchestration root. `sbx` is started from that working directory, then Pi or optional project tooling can create feature worktrees under it.
 
 ## Directory model
 
@@ -12,22 +12,20 @@ working-dir/
 ├── main/                        # main/master clone of the project repo
 ├── specs/                       # optional specification worktree/area
 └── nueces/
-    └── 0000-feature-name/       # feature worktree created later by spec-kit
+    └── 0000-feature-name/       # feature worktree created later by project tooling
 ```
 
-Important: the feature worktree usually does **not** exist when `sbx run` starts. Pi starts in `working-dir`, loads project-local resources from `working-dir/.pi`, and then spec-kit creates the feature directory/worktree as part of the workflow.
+Important: the feature worktree usually does **not** exist when `sbx run` starts. Pi starts in `working-dir`, loads project-local resources from `working-dir/.pi`, and optional tooling such as spec-kit can create the feature directory/worktree later.
 
 ## What belongs in the VM image
 
 The base image should contain global runtime/tooling requirements that are useful before any specific feature worktree exists:
 
 - Node.js/npm
-- Pi CLI
 - uv
-- spec-kit CLI (`specify-cli`)
 - git/curl/ripgrep/sudo and similar base tools
 
-These are installed in the image because they should survive VM destruction and be available immediately on VM startup.
+These shared tools are installed in the image. Pi and Specify are optional runtime installations owned by the selected user; neither is baked into the reusable image.
 
 ## What belongs in `working-dir/.pi`
 
@@ -69,7 +67,8 @@ Run `sbx` from the working directory and mount that directory:
 ```toml
 [sbx]
 project_path = "."
-run_user = "agent"
+runtime_install = ["pi", "specify"]
+# run_user defaults to the current host username.
 ```
 
 Then:
@@ -79,4 +78,4 @@ cd working-dir
 sbx run
 ```
 
-Pi starts in `working-dir`, discovers `working-dir/.pi`, and spec-kit can create feature worktrees below that directory.
+Pi starts in `working-dir`, discovers `working-dir/.pi`, and the optionally installed Specify CLI can create feature worktrees below that directory.

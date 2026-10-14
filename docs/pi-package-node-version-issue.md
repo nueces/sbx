@@ -1,5 +1,7 @@
 # Pi package / Node version issue
 
+> Historical investigation. The curated sbx image now provides Node 22, remains agent-neutral, and installs the current Pi package only when `runtime_install = ["pi"]` is explicitly requested. The SmolVM preset behavior below describes the original failure.
+
 ## Context
 
 While testing `sbx` with a VM named `pi-sbx`, the Pi agent launched inside the VM reported paths and update metadata from the old package namespace:

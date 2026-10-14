@@ -1,10 +1,14 @@
 [sbx]
 agent = "pi"
+runtime_install = ["pi"]
+# Add "specify" to install the Specify CLI with uv during provisioning.
+# runtime_install = ["pi", "specify"]
 name = "pi"
 image = "~/.smolvm/images/debian-sbx"
 memory = 2048
 cpus = 2
-run_user = "agent"
+# Defaults to the current host username when omitted.
+# run_user = "developer"
 
 # Mount this repo into the guest for testing.
 project_path = "."
@@ -13,7 +17,8 @@ writable_mounts = true
 # Keep the VM around after the first test run so you can inspect it.
 stop_on_exit = false
 
-# The image already contains Pi; do not copy host credentials by default.
+# Pi is installed directly as the runtime user during initial provisioning.
+# Host agent state is not copied by default.
 copy_host_credentials = false
 env = []
 git_config = true

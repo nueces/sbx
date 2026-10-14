@@ -1,6 +1,6 @@
-# Build and run a local Debian Pi image
+# Build and run the local Debian image
 
-`sbx image build` builds the curated ready-to-run SmolVM image under `~/.smolvm/images/sbx`. It contains Pi and rootless Docker. `sbx` boots that image directly; it does not run SmolVM's preset installer.
+`sbx image build` builds the curated agent-neutral SmolVM image under `~/.smolvm/images/sbx`. It contains shared development tooling and rootless Docker, but no agent package. `sbx` boots that image directly and installs only explicitly requested runtime tools.
 
 ## 1. Image build command
 
@@ -10,33 +10,24 @@ The builder is an `sbx` subcommand:
 sbx image build
 ```
 
-The image recipe is packaged with `sbx` and split into Debian, Docker, and Pi Containerfile fragments:
+The image recipe is packaged with `sbx` and split into Debian and Docker Containerfile fragments:
 
 ```text
-src/sbx/image/resources/Containers/
-├── Debian/
-│   ├── Base.Containerfile
-│   └── fragments/Docker.Containerfile
-└── Agents/
-    └── Pi.Containerfile
+src/sbx/image/resources/Containers/Debian/
+├── Base.Containerfile
+└── fragments/Docker.Containerfile
 ```
 
 `src/sbx/image/resources/Containers/Debian/Base.Containerfile` defines the reusable Debian base OS layer. It currently:
 
 - starts from `debian:stable-slim`
 - configures the NodeSource Node.js 22.x apt repository directly
-- installs Node.js and basic tools
-- creates an `agent` user with passwordless sudo
+- installs Node.js, npm, uv, and basic tools on the system PATH
+- remains user-neutral so `sbx` can create the selected runtime user after boot
 
-`src/sbx/image/resources/Containers/Agents/Pi.Containerfile` defines the agent/tooling layer. It currently:
+The build command reads these packaged resources with `importlib.resources` and combines them into a temporary Containerfile. An optional `--agent-containerfile` can add custom build-time tooling, but the packaged image has no Pi-specific layer or installer helper.
 
-- installs `@earendil-works/pi-coding-agent` globally under the `agent` user's npm prefix
-- installs `uv`
-- installs spec-kit CLI with `uv tool install specify-cli --from git+https://github.com/github/spec-kit.git`
-
-The build command reads these packaged resources with `importlib.resources` and combines them into a temporary Containerfile. Docker layer caching still makes the base OS layer reusable across tooling changes.
-
-Because Pi and uv tools are installed for `agent`, the generated manifest defaults `run_user` to `agent`; the first project config records that effective user automatically.
+At first startup, `sbx` creates the configured user or a user matching the current host username. Explicit runtime requests install Pi with npm or Specify with uv directly under that user's `$HOME/.local`.
 
 ## 2. Install the tools
 
@@ -64,14 +55,14 @@ sbx image build --rootfs-size-mb 40960
 sbx image build --name custom-image
 ```
 
-The subcommand combines the Debian, Docker, and Pi fragments, builds that image, adds SSH and the SmolVM-compatible init, exports `rootfs.ext4`, and builds the Docker-capable QEMU kernel. SmolVM's published kernel and guest agent are not downloaded; local images communicate through SSH.
+The subcommand combines the Debian and Docker fragments, builds that image, adds SSH and the SmolVM-compatible init, exports `rootfs.ext4`, and builds the Docker-capable QEMU kernel. SmolVM's published kernel and guest agent are not downloaded; local images communicate through SSH.
 
 For local experiments, you can override the packaged fragments with your own files:
 
 ```bash
 sbx image build \
   --base-containerfile path/to/Base.Containerfile \
-  --agent-containerfile path/to/Pi.Containerfile
+  --agent-containerfile path/to/OptionalTooling.Containerfile
 ```
 
 Or pass a fully composed Containerfile directly:
@@ -117,10 +108,7 @@ Example manifest:
   "rootfs": "rootfs.ext4",
   "boot_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init",
   "sbx": {
-    "agent": "pi",
-    "features": ["docker"],
-    "launch_command": "pi",
-    "run_user": "agent"
+    "features": ["docker"]
   }
 }
 ```
@@ -134,10 +122,11 @@ sbx run the-quest \
   --image '~/.smolvm/images/sbx' \
   --project-path . \
   --writable-mounts \
+  --runtime-install pi \
   --write-config
 ```
 
-The curated image manifest selects `run_user = "agent"` when CLI and project configuration do not select a user. `--project-path .` remains explicit because it creates a writable host mount.
+When CLI and project configuration do not select a user, `sbx` uses the current host username. `--project-path .` remains explicit because it creates a writable host mount.
 
 The suggested `.sbx.toml` is:
 
@@ -145,15 +134,15 @@ The suggested `.sbx.toml` is:
 [sbx]
 name = "the-quest"
 agent = "pi"
+runtime_install = ["pi"]
 image = "~/.smolvm/images/sbx"
 project_path = "."
-run_user = "agent"
 writable_mounts = true
 copy_host_credentials = false
 git_config = true
 ```
 
-Important: `copy_host_credentials = false` prevents host credential/config copying. The `run_user` preparation may copy files already inside the guest from `/root` to `/home/agent`, but it does not copy host credentials into the VM.
+Important: `copy_host_credentials = false` prevents host credential/config copying. Runtime-user provisioning does not recursively change ownership beneath the user's home, so same-path mounts are not traversed.
 
 `git_config = true` is the default and only copies a safe subset of host Git identity/workflow settings, such as `user.name` and `user.email`, so commits inside the VM have the expected author. It does not copy Git credentials, SSH keys, GPG/signing keys, credential helpers, includes, or URL rewrite rules.
 
@@ -182,12 +171,11 @@ sbx image build --rootfs-size-mb 81920
 ```toml
 [sbx]
 image = "~/.smolvm/images/sbx"
-run_user = "agent"
 ```
 
 Create or recreate the VM after changing the image. If the rootfs was built with `--rootfs-size-mb 81920`, omit `disk_size` unless you intentionally want SmolVM to grow the per-VM disk.
 
-Rootless Docker starts at VM boot. Inside the guest, use Docker normally:
+Rootless Docker starts after `sbx` provisions the selected user. Inside the guest, use Docker normally:
 
 ```bash
 docker run --rm hello-world
@@ -196,23 +184,23 @@ docker run --rm hello-world
 Rootless Docker data lives on the VM disk under Docker's default rootless data directory:
 
 ```text
-/home/agent/.local/share/docker
+/home/<run-user>/.local/share/docker
 ```
 
 The runtime socket/state is separate and recreated at boot:
 
 ```text
-/run/user/1000/docker.sock
-/run/user/1000/dockerd-rootless
+/run/user/<uid>/docker.sock
+/run/user/<uid>/dockerd-rootless
 ```
 
-SmolVM does not run systemd/logind, so the image creates `/run/user/1000` and exports `XDG_RUNTIME_DIR`/`DOCKER_HOST`; this matches the normal rootless Docker path for uid 1000.
+SmolVM does not run systemd/logind, so the provisioning helper creates `/run/user/<uid>` and exports `XDG_RUNTIME_DIR`/`DOCKER_HOST` for the selected user's actual UID.
 
 To persist pulled images/build cache across VM recreation, mount a host directory at the rootless Docker data path:
 
 ```toml
 [sbx]
-mount = ["/host/path/docker-data:/home/agent/.local/share/docker"]
+mount = ["/host/path/docker-data:/home/me/.local/share/docker"]
 writable_mounts = true
 ```
 
@@ -225,14 +213,13 @@ Use an ext4-backed host path if possible. 9p/workspace mounts may be slow or uns
 Check the boot logs:
 
 ```bash
-sudo cat /var/log/sbx-rootless-docker.log
 sudo cat /var/log/dockerd-rootless.log
 ```
 
 Restart manually if needed:
 
 ```bash
-sudo /usr/local/bin/sbx-start-rootless-docker
+sudo SBX_DOCKER_USER="$(id -un)" /usr/local/bin/sbx-start-rootless-docker
 ```
 
 The helper applies the temporary SmolVM/QEMU DNS workaround: `10.0.2.3` is QEMU slirp DNS; `10.0.2.2` is the gateway and can add ~5s resolver delays.
@@ -275,13 +262,25 @@ or set it in `.sbx.toml`:
 boot_timeout = 90
 ```
 
-### `bash: exec: pi: not found`
+### `agent 'pi' was not found`
 
-Pi is installed under `/home/agent/.nodejs/bin/pi` by the packaged `Containers/Agents/Pi.Containerfile`. Ensure `.sbx.toml` includes:
+The image intentionally contains no Pi package. Add `runtime_install = ["pi"]` and run:
 
-```toml
-run_user = "agent"
+```bash
+sbx run --reprovision --no-attach
 ```
+
+Alternatively use `--runtime-install pi`, which implies reprovisioning for an existing VM. Installation requires npm registry access and writes directly to `/home/<run-user>/.local` without creating or changing `.npmrc`.
+
+### `specify` was not found
+
+The image intentionally contains no Specify package. Add `runtime_install = ["specify"]` or combine it with Pi as `runtime_install = ["pi", "specify"]`, then run:
+
+```bash
+sbx run --reprovision --no-attach
+```
+
+Specify installation uses the image's system `uv`, requires GitHub access, and lets uv manage `$HOME/.local/bin/specify` and its tool tree.
 
 ### `e2fsck and resize2fs are needed to grow the disk`
 
@@ -317,4 +316,4 @@ sbx network close-auth-port the-quest
 
 ## Notes
 
-Local image mode is intentionally minimal: one `image` key points at a ready-to-run image directory. Kernel, rootfs, boot args, agent, and launch command live in `smolvm-image.json` instead of being exposed as many `sbx` config keys.
+Local image mode is intentionally minimal: one `image` key points at a ready-to-run image directory. Kernel, rootfs, boot args, and image features live in `smolvm-image.json`; agent selection and runtime installation stay in box configuration.

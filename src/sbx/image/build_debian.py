@@ -25,7 +25,6 @@ from sbx.image import kernel_inputs
 
 RESOURCE_PACKAGE = "sbx.image.resources"
 DEFAULT_BASE_CONTAINERFILE = Path("Containers") / "Debian" / "Base.Containerfile"
-DEFAULT_AGENT_CONTAINERFILE = Path("Containers") / "Agents" / "Pi.Containerfile"
 DEFAULT_DOCKER_CONTAINERFILE = Path("Containers") / "Debian" / "fragments" / "Docker.Containerfile"
 DEFAULT_DOCKER_KERNEL_FRAGMENT = Path("kernel") / "docker.config.fragment"
 DEFAULT_KERNEL_BUILDER_DOCKERFILE = Path("Containers") / "Build" / "Kernel.Containerfile"
@@ -42,15 +41,12 @@ def _packaged_resources() -> Iterator[Path]:
 def _compose_containerfiles(
     base_containerfile: Path,
     docker_containerfile: Path,
-    agent_containerfile: Path,
+    agent_containerfile: Path | None,
     output: Path,
 ) -> None:
     base_containerfile = base_containerfile.expanduser().resolve()
-    agent_containerfile = agent_containerfile.expanduser().resolve()
     if not base_containerfile.is_file():
         raise FileNotFoundError(f"Base Containerfile not found: {base_containerfile}")
-    if not agent_containerfile.is_file():
-        raise FileNotFoundError(f"Agent Containerfile not found: {agent_containerfile}")
 
     docker_containerfile = docker_containerfile.expanduser().resolve()
     if not docker_containerfile.is_file():
@@ -59,22 +55,13 @@ def _compose_containerfiles(
     content = base_containerfile.read_text(encoding="utf-8").rstrip()
     content += "\n\n# ---- Docker layer ----\n"
     content += docker_containerfile.read_text(encoding="utf-8").lstrip().rstrip()
-    content += "\n\n# ---- Agent/tooling layer ----\n"
-    content += agent_containerfile.read_text(encoding="utf-8").lstrip()
+    if agent_containerfile is not None:
+        agent_containerfile = agent_containerfile.expanduser().resolve()
+        if not agent_containerfile.is_file():
+            raise FileNotFoundError(f"Agent Containerfile not found: {agent_containerfile}")
+        content += "\n\n# ---- Optional tooling layer ----\n"
+        content += agent_containerfile.read_text(encoding="utf-8").lstrip()
     output.write_text(content, encoding="utf-8")
-
-
-class SbxImageBuilder(ImageBuilder):
-    def _default_init_script(self) -> str:
-        # ponytail: protected SmolVM hook; replace with public boot hooks when upstream exists.
-        return self._base_init_script(
-            custom_commands="""
-# sbx: start rootless Docker at boot when the image provides it.
-if [ -x /usr/local/bin/sbx-start-rootless-docker ]; then
-    /usr/local/bin/sbx-start-rootless-docker >/var/log/sbx-rootless-docker.log 2>&1 &
-fi
-"""
-        )
 
 
 def _ssh_rootfs_dockerfile(base_image: str) -> str:
@@ -104,7 +91,7 @@ RUN chmod +x /init
 
 
 def _build_rootfs(
-    *, builder: SbxImageBuilder, name: str, rootfs_size_mb: int, base_image: str, arch: str
+    *, builder: ImageBuilder, name: str, rootfs_size_mb: int, base_image: str, arch: str
 ) -> Path:
     image_dir = builder.cache_dir / name
     rootfs_path = image_dir / "rootfs.ext4"
@@ -197,6 +184,18 @@ def _docker_run_kernel_builder(
     )
 
 
+def _docker_bind_mount_owner() -> str:
+    completed = subprocess.run(
+        ["docker", "info", "--format", "{{json .SecurityOptions}}"],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    if "rootless" in completed.stdout:
+        return "0:0"
+    return f"{os.getuid()}:{os.getgid()}"
+
+
 def _raise_if_linux_digest_mismatch(work_dir: Path) -> None:
     version = (work_dir / "linux.version").read_text(encoding="utf-8").strip()
     checksum = (work_dir / "linux.sha256").read_text(encoding="utf-8").split()[0]
@@ -237,6 +236,7 @@ def _build_docker_kernel(*, image_dir: Path, arch: str, resources_dir: Path | No
             encoding="utf-8",
         )
         builder_tag = _build_kernel_builder_image(builder_dockerfile, resources_dir)
+        bind_mount_owner = _docker_bind_mount_owner()
         out_dir = work_dir / "out"
         try:
             try:
@@ -265,7 +265,7 @@ def _build_docker_kernel(*, image_dir: Path, arch: str, resources_dir: Path | No
             _docker_run_kernel_builder(
                 builder_tag,
                 work_dir,
-                ["chown", "-R", f"{os.getuid()}:{os.getgid()}", "/work"],
+                ["chown", "-R", bind_mount_owner, "/work"],
                 check=False,
             )
         kernel_path = image_dir / KERNEL_NAME
@@ -290,7 +290,6 @@ def _build_containerfile_base_image(
     digest_input = base_image.encode() + b"\0" + containerfile.read_bytes()
     digest = hashlib.sha256(digest_input).hexdigest()[:12]
     user_tag = f"sbx-debian-base-user:{digest}"
-    root_tag = f"sbx-debian-base:{digest}"
     subprocess.run(
         [
             "docker",
@@ -305,11 +304,21 @@ def _build_containerfile_base_image(
         ],
         check=True,
     )
+    inspected = subprocess.run(
+        ["docker", "image", "inspect", "--format", "{{.Id}}", user_tag],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    image_id = inspected.stdout.strip()
+    if not image_id:
+        raise RuntimeError(f"Docker returned no image ID for {user_tag}")
+    root_digest = hashlib.sha256(image_id.encode()).hexdigest()[:12]
+    root_tag = f"sbx-debian-base:{root_digest}"
 
     # SmolVM's Debian builder derives another image from this base and runs
-    # apt/ssh setup commands. A user-provided Containerfile may end with
-    # `USER agent`; reset the default user to root in a tiny wrapper image so
-    # those builder steps still run with the expected privileges.
+    # apt/ssh setup commands. A user-provided Containerfile may end with a
+    # non-root USER; reset it in a tiny wrapper image for those builder steps.
     with tempfile.TemporaryDirectory(prefix="sbx-debian-root-base-") as tmp:
         context = Path(tmp)
         (context / "Dockerfile").write_text(f"FROM {user_tag}\nUSER root\n", encoding="utf-8")
@@ -351,7 +360,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         "--agent-containerfile",
         type=Path,
         default=None,
-        help="Agent/tooling Containerfile (default: packaged Pi agent).",
+        help="Optional custom build-time tooling Containerfile.",
     )
     parser.add_argument(
         "--rootfs-size-mb",
@@ -373,7 +382,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def main_from_args(args: argparse.Namespace) -> int:
-    builder = SbxImageBuilder(cache_dir=args.cache_dir.expanduser() if args.cache_dir else None)
+    builder = ImageBuilder(cache_dir=args.cache_dir.expanduser() if args.cache_dir else None)
     base_image = args.base_image
     arch = "amd64" if builder._host_arch_key() == "x86_64" else "arm64"
 
@@ -391,9 +400,7 @@ def main_from_args(args: argparse.Namespace) -> int:
                     selected_base_containerfile = args.base_containerfile or (
                         resources_dir / DEFAULT_BASE_CONTAINERFILE
                     )
-                    selected_agent_containerfile = args.agent_containerfile or (
-                        resources_dir / DEFAULT_AGENT_CONTAINERFILE
-                    )
+                    selected_agent_containerfile = args.agent_containerfile
                     selected_docker_containerfile = resources_dir / DEFAULT_DOCKER_CONTAINERFILE
                     _compose_containerfiles(
                         selected_base_containerfile,
@@ -426,10 +433,7 @@ def main_from_args(args: argparse.Namespace) -> int:
         "rootfs": rootfs_path.name,
         "boot_args": BOOT_ARGS,
         "sbx": {
-            "agent": "pi",
             "features": [] if args.containerfile is not None else ["docker"],
-            "launch_command": "pi",
-            "run_user": "agent",
         },
     }
     manifest_path.write_text(
@@ -467,7 +471,6 @@ def main_from_args(args: argparse.Namespace) -> int:
     print("sbx config:")
     print("  [sbx]")
     print(f"  image = {str(manifest_path.parent)!r}")
-    print("  run_user = 'agent'")
     image_path = str(manifest_path.parent)
     if manifest_path.parent.is_relative_to(Path.home()):
         image_path = f"~/{manifest_path.parent.relative_to(Path.home())}"
@@ -477,6 +480,7 @@ def main_from_args(args: argparse.Namespace) -> int:
     print(f"    --image {shlex.quote(image_path)} \\")
     print("    --project-path . \\")
     print("    --writable-mounts \\")
+    print("    --runtime-install pi \\")
     print("    --write-config")
     return 0
 

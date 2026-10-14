@@ -34,6 +34,7 @@ from sbx.image import build_debian
 from sbx.runtime import ConfigError
 
 AGENTS = ("pi", "claude", "codex")
+RUNTIME_INSTALLERS = ("pi", "specify")
 MIB = 1024 * 1024
 LAUNCH_COMMANDS = {"pi": "pi", "claude": "claude", "codex": "codex"}
 DEFAULT_CONFIG_PATHS = (Path.home() / ".config" / "sbx" / "config.toml",)
@@ -120,6 +121,32 @@ def _list_value(value: Any, *, key: str) -> list[str]:
     if isinstance(value, list) and all(isinstance(item, str) for item in value):
         return value
     raise ConfigError(f"{key} must be a string or an array of strings")
+
+
+def _runtime_install(args: argparse.Namespace, config: Mapping[str, Any]) -> list[str]:
+    cli_value = getattr(args, "runtime_install", None)
+    value = cli_value if cli_value is not None else _sbx_config(config).get("runtime_install", [])
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ConfigError("[sbx].runtime_install must be an array of strings")
+    if len(value) != len(set(value)):
+        raise ConfigError("runtime_install must not contain duplicates")
+    unknown = [item for item in value if item not in RUNTIME_INSTALLERS]
+    if unknown:
+        raise ConfigError(
+            f"unsupported runtime installer(s): {', '.join(unknown)}; "
+            f"supported: {', '.join(RUNTIME_INSTALLERS)}"
+        )
+    return list(value)
+
+
+def _install_timeout(value: Any) -> int:
+    try:
+        timeout = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("[sbx].install_timeout must be a positive integer") from exc
+    if timeout <= 0:
+        raise ConfigError("[sbx].install_timeout must be a positive integer")
+    return timeout
 
 
 def _resolve_project_path(path_value: str) -> Path:
@@ -421,6 +448,24 @@ def _stop_vm_if_last_session(vm_id: str, *, stop_on_exit: bool) -> None:
     runtime.run_smolvm(["sandbox", "stop", vm_id])
 
 
+def _warn_initial_state_copy(vm_name: str) -> None:
+    print(
+        f"sbx: warning: [sbx].copy_host_credentials=true; host agent directories "
+        f"for VM {vm_name!r}, including tokens, settings, and sessions, may be copied.",
+        file=sys.stderr,
+    )
+
+
+def _print_provisioning_failure(vm_name: str, error: Exception, *, was_provisioned: bool) -> None:
+    print(f"sbx: provisioning VM {vm_name!r} failed: {error}", file=sys.stderr)
+    print(f"sbx: VM {vm_name!r} is still running.", file=sys.stderr)
+    if was_provisioned:
+        print("sbx: Its previous successful provisioning state remains recorded.", file=sys.stderr)
+    print(f"sbx: Inspect: sbx shell {vm_name} --root", file=sys.stderr)
+    print(f"sbx: Retry:   sbx run {vm_name} --reprovision --no-attach", file=sys.stderr)
+    print(f"sbx: Stop:    sbx stop {vm_name}", file=sys.stderr)
+
+
 def _post_start_actions(
     *,
     vm_name: str,
@@ -434,22 +479,96 @@ def _post_start_actions(
     cwd: str | None = None,
     git_config_text: str | None = None,
     session_kind: str = "run",
+    forward_env: list[str] | None = None,
+    provision: bool = False,
+    was_provisioned: bool = False,
+    runtime_install: list[str] | None = None,
+    install_timeout: int = 600,
+    copy_initial_state: bool = False,
+    validate_agent: bool = True,
+    agent_name: str | None = None,
 ) -> int:
     guest_setup.sync_guest_clock(vm_name, run_capture=runtime.run_capture)
+    if not _sync_forwarded_env_or_error(vm_name, forward_env or []):
+        return 1
     if auth_port:
         port_rc = network.expose_auth_port(vm_name, auth_host_port, auth_guest_port)
         if port_rc != 0:
             return port_rc
+    if validate_agent and not provision:
+        metadata = vm_metadata.load_vm(vm_name)
+        if metadata is None or not metadata.get("provisioned"):
+            print(
+                f"sbx: VM {vm_name!r} has not completed provisioning; "
+                f"run `sbx run {vm_name} --reprovision --no-attach`",
+                file=sys.stderr,
+            )
+            return 1
+
+    if provision:
+        try:
+            if run_user is not None:
+                guest_setup.prepare_run_user(
+                    vm_name,
+                    run_user,
+                    copy_initial_state=copy_initial_state and not was_provisioned,
+                    run_capture=runtime.run_capture,
+                )
+                guest_setup.install_runtime_tools(
+                    vm_name,
+                    run_user,
+                    runtime_install or [],
+                    install_timeout,
+                    run_capture=runtime.run_capture,
+                )
+                if not was_provisioned:
+                    guest_setup.install_git_config(
+                        vm_name, run_user, git_config_text, run_capture=runtime.run_capture
+                    )
+                guest_setup.ensure_rootless_docker(
+                    vm_name, run_user, run_capture=runtime.run_capture
+                )
+            vm_metadata.mark_provisioned(vm_name)
+        except Exception as exc:  # noqa: BLE001 - preserve a running VM for diagnosis.
+            _print_provisioning_failure(vm_name, exc, was_provisioned=was_provisioned)
+            return 1
+    elif run_user is not None:
+        try:
+            guest_setup.ensure_rootless_docker(vm_name, run_user, run_capture=runtime.run_capture)
+        except ConfigError as exc:
+            print(f"sbx: runtime startup check failed for VM {vm_name!r}: {exc}", file=sys.stderr)
+            return 1
+
+    resolved_command = command
+    if validate_agent:
+        try:
+            resolved = guest_setup.command_path(
+                vm_name, run_user or "root", command, run_capture=runtime.run_capture
+            )
+        except ConfigError as exc:
+            print(f"sbx: failed to check agent {agent_name or command!r}: {exc}", file=sys.stderr)
+            return 1
+        if resolved is None:
+            print(
+                f"sbx: agent {agent_name or command!r} was not found for user "
+                f"{run_user or 'root'!r}; request its runtime installer or install it manually",
+                file=sys.stderr,
+            )
+            return 1
+        resolved_command = resolved
+
     if not attach:
         return 0
     session_state.register_session(vm_name, session_kind)
     try:
-        if run_user is not None:
-            guest_setup.prepare_run_user(vm_name, run_user, run_capture=runtime.run_capture)
-        guest_setup.install_git_config(
-            vm_name, run_user, git_config_text, run_capture=runtime.run_capture
-        )
-        return guest_setup.attach(vm_name, command, user=run_user, cwd=cwd, run=runtime.run)
+        rc = guest_setup.attach(vm_name, resolved_command, user=run_user, cwd=cwd, run=runtime.run)
+        if rc != 0 and validate_agent:
+            print(
+                f"sbx: agent {agent_name or command!r} at {resolved_command!r} "
+                f"exited with status {rc}",
+                file=sys.stderr,
+            )
+        return rc
     finally:
         remaining = session_state.unregister_session(vm_name)
         runtime.debug(f"unregistered session for {vm_name}; remaining={remaining}")
@@ -474,6 +593,10 @@ def _manifest_sbx(manifest: Mapping[str, Any]) -> Mapping[str, Any]:
     sbx = manifest.get("sbx", {})
     if not isinstance(sbx, Mapping):
         raise ConfigError("image manifest field 'sbx' must be an object")
+    obsolete = [key for key in ("agent", "launch_command") if key in sbx]
+    if obsolete:
+        fields = ", ".join(f"sbx.{key}" for key in obsolete)
+        raise ConfigError(f"image manifest contains obsolete field(s) {fields}; rebuild the image")
     return sbx
 
 
@@ -513,6 +636,8 @@ def _project_config_values(
         values["writable_mounts"] = bool(args.writable_mounts)
     if getattr(args, "env", None) is not None:
         values["env"] = list(args.env)
+    if getattr(args, "runtime_install", None) is not None:
+        values["runtime_install"] = list(args.runtime_install)
     return values
 
 
@@ -642,21 +767,16 @@ def _start_local_image(
     stop_on_exit: bool,
     cwd: str | None,
     git_config_text: str | None,
+    runtime_install: list[str] | None = None,
+    install_timeout: int = 600,
+    copy_initial_state: bool = False,
     forward_env: list[str] | None = None,
     port_forwards: Sequence[str] = (),
 ) -> int:
     from smolvm import SmolVM, VMConfig
     from smolvm.utils import ensure_ssh_key
 
-    sbx_manifest = _manifest_sbx(manifest)
-    manifest_agent = sbx_manifest.get("agent")
-    if manifest_agent is not None and manifest_agent != agent:
-        raise ConfigError(
-            f"image agent {manifest_agent!r} does not match configured agent {agent!r}"
-        )
-    launch_command = sbx_manifest.get("launch_command")
-    if launch_command is not None and not isinstance(launch_command, str):
-        raise ConfigError("image manifest field 'sbx.launch_command' must be a string")
+    _manifest_sbx(manifest)
 
     kernel_path = lifecycle_warnings.manifest_path(image_dir, manifest, "kernel")
     rootfs_path = lifecycle_warnings.manifest_path(image_dir, manifest, "rootfs")
@@ -724,6 +844,9 @@ def _start_local_image(
         vm.start(boot_timeout=boot_timeout)
         vm.wait_for_ssh(timeout=boot_timeout)
         vm_name = vm.vm_id
+        vm_metadata.claim_vm(
+            str(vm_name), _project_identity(args, config), run_user or "root", created=True
+        )
         guest_setup.set_hostname(str(vm_name), run_capture=runtime.run_capture)
     except Exception:
         vm.close()
@@ -733,8 +856,6 @@ def _start_local_image(
     config_created = _maybe_write_project_config(
         args, config, vm_name=str(vm_name), agent=agent, created=True
     )
-    vm_metadata.record_vm_project(str(vm_name), _project_identity(args, config))
-
     json_output = bool(getattr(args, "json", False))
     if not json_output:
         _print_created(
@@ -744,11 +865,9 @@ def _start_local_image(
             attach=attach,
             run_user=run_user,
         )
-    if attach and not _sync_forwarded_env_or_error(str(vm_name), forward_env or []):
-        return 1
     rc = _post_start_actions(
-        vm_name=vm_name,
-        command=launch_command or LAUNCH_COMMANDS[agent],
+        vm_name=str(vm_name),
+        command=LAUNCH_COMMANDS[agent],
         attach=attach,
         run_user=run_user,
         auth_port=auth_port,
@@ -757,6 +876,12 @@ def _start_local_image(
         stop_on_exit=stop_on_exit,
         cwd=cwd,
         git_config_text=git_config_text,
+        forward_env=forward_env,
+        provision=True,
+        runtime_install=runtime_install,
+        install_timeout=install_timeout,
+        copy_initial_state=copy_initial_state,
+        agent_name=agent,
     )
     if rc == 0 and json_output:
         print(json.dumps({"vm": {"name": str(vm_name), "status": "running"}}))
@@ -810,9 +935,14 @@ def cmd_start(args: argparse.Namespace) -> int:
     try:
         memory_mib = int(memory_value) if memory_value is not None else None
         disk_size_mib = int(disk_size_value) if disk_size_value is not None else None
-        install_timeout = int(install_timeout_value)
     except (TypeError, ValueError) as exc:
-        raise ConfigError("memory, disk_size, and install_timeout must be integers") from exc
+        raise ConfigError("memory and disk_size must be integers") from exc
+    install_timeout = _install_timeout(install_timeout_value)
+    runtime_install = _runtime_install(args, config)
+    reprovision = (
+        bool(getattr(args, "reprovision", False))
+        or getattr(args, "runtime_install", None) is not None
+    )
     requested_os = str(_arg_or_config(args, "os", config, "sbx", default="ubuntu"))
     boot_timeout = _validate_boot_timeout(
         _arg_or_config(args, "boot_timeout", config, "sbx", default=DEFAULT_BOOT_TIMEOUT)
@@ -858,7 +988,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     auth_guest_port = int(_arg_or_config(args, "auth_guest_port", config, "sbx", default=1455))
     stop_on_exit = bool(_arg_or_config(args, "stop_on_exit", config, "sbx", default=True))
     git_config = bool(_arg_or_config(args, "git_config", config, "sbx", default=True))
-    git_config_text = guest_setup.host_git_config(project_root) if git_config else None
+    git_config_text = None
     cpus_value = _arg_or_config(args, "cpus", config, "sbx")
     cpus = _validate_cpus(cpus_value) if cpus_value is not None else None
     try:
@@ -875,11 +1005,18 @@ def cmd_start(args: argparse.Namespace) -> int:
         existing_status = _get_existing_vm_status(str(requested_name))
         runtime.debug(f"existing VM lookup: name={requested_name!r}, status={existing_status!r}")
         if existing_status is not None:
-            if run_user is None and image is not None:
-                with suppress(ConfigError):
-                    run_user = _manifest_run_user(lifecycle_warnings.local_image_manifest(image))
-                    if run_user is not None:
-                        args.run_user = run_user
+            if image is not None:
+                existing_manifest = lifecycle_warnings.local_image_manifest(image)
+                _manifest_sbx(existing_manifest)
+                if run_user is None:
+                    run_user = _manifest_run_user(existing_manifest)
+            if run_user is None:
+                run_user = guest_setup.host_username()
+            args.run_user = run_user
+            metadata = vm_metadata.claim_vm(
+                str(requested_name), project_identity, str(run_user or "root"), created=False
+            )
+            was_provisioned = bool(metadata.get("provisioned"))
             if existing_status != "running":
                 try:
                     _sync_existing_vm_start_config(
@@ -904,12 +1041,14 @@ def cmd_start(args: argparse.Namespace) -> int:
             )
             if start_rc != 0:
                 return start_rc
-            if attach and not _sync_forwarded_env_or_error(str(requested_name), forward_env):
-                return 1
             _maybe_write_project_config(
                 args, config, vm_name=str(requested_name), agent=str(agent), created=False
             )
-            vm_metadata.record_vm_project(str(requested_name), project_identity)
+            if reprovision and not was_provisioned:
+                if copy_host_credentials:
+                    _warn_initial_state_copy(str(requested_name))
+                if git_config:
+                    git_config_text = guest_setup.host_git_config(project_root)
             rc = _post_start_actions(
                 vm_name=str(requested_name),
                 command=LAUNCH_COMMANDS[str(agent)],
@@ -921,6 +1060,13 @@ def cmd_start(args: argparse.Namespace) -> int:
                 stop_on_exit=stop_on_exit,
                 cwd=project_guest_cwd,
                 git_config_text=git_config_text,
+                forward_env=forward_env,
+                provision=reprovision,
+                was_provisioned=was_provisioned,
+                runtime_install=runtime_install,
+                install_timeout=install_timeout,
+                copy_initial_state=copy_host_credentials,
+                agent_name=str(agent),
             )
             if rc == 0 and args.json:
                 print(json.dumps({"vm": {"name": str(requested_name), "status": "running"}}))
@@ -931,8 +1077,13 @@ def cmd_start(args: argparse.Namespace) -> int:
             manifest = lifecycle_warnings.local_image_manifest(image)
             if run_user is None:
                 run_user = _manifest_run_user(manifest)
-                if run_user is not None:
-                    args.run_user = run_user
+            if run_user is None:
+                run_user = guest_setup.host_username()
+            args.run_user = run_user
+            if copy_host_credentials:
+                _warn_initial_state_copy(str(requested_name or "new VM"))
+            if git_config:
+                git_config_text = guest_setup.host_git_config(project_root)
             return _start_local_image(
                 args=args,
                 config=config,
@@ -949,6 +1100,9 @@ def cmd_start(args: argparse.Namespace) -> int:
                 stop_on_exit=stop_on_exit,
                 cwd=project_guest_cwd,
                 git_config_text=git_config_text,
+                runtime_install=runtime_install,
+                install_timeout=install_timeout,
+                copy_initial_state=copy_host_credentials,
                 forward_env=forward_env,
                 port_forwards=port_forwards,
             )
@@ -963,15 +1117,14 @@ def cmd_start(args: argparse.Namespace) -> int:
             print(f"sbx: failed to start image: {exc}", file=sys.stderr)
             return 1
 
+    if run_user is None:
+        run_user = guest_setup.host_username()
+    args.run_user = run_user
+
     temp_home_ctx = None
     host_env = guest_setup.sanitize_forwarded_env(dict(os.environ), forward_env)
     if copy_host_credentials:
-        target = f" VM '{requested_name}'" if requested_name else " the new VM"
-        print(
-            f"sbx: warning: [sbx].copy_host_credentials=true; "
-            f"host agent credentials may be copied into{target}.",
-            file=sys.stderr,
-        )
+        _warn_initial_state_copy(str(requested_name or "new VM"))
     else:
         temp_home_ctx = tempfile.TemporaryDirectory(prefix="sbx-no-credentials-")
         host_env = guest_setup.credential_free_env(
@@ -994,6 +1147,9 @@ def cmd_start(args: argparse.Namespace) -> int:
             boot_timeout=boot_timeout,
             install_timeout=install_timeout,
             host_env=host_env,
+            before_provision=lambda new_vm_name: vm_metadata.claim_vm(
+                new_vm_name, project_identity, str(run_user or "root"), created=True
+            ),
         )
         vm_name = str(vm.vm_id)
         guest_setup.set_hostname(vm_name, run_capture=runtime.run_capture)
@@ -1014,8 +1170,6 @@ def cmd_start(args: argparse.Namespace) -> int:
     config_created = _maybe_write_project_config(
         args, config, vm_name=vm_name, agent=str(agent), created=True
     )
-    vm_metadata.record_vm_project(vm_name, project_identity)
-
     if not args.json:
         _print_created(
             vm_name,
@@ -1025,6 +1179,8 @@ def cmd_start(args: argparse.Namespace) -> int:
             run_user=str(run_user) if run_user is not None else None,
         )
 
+    if git_config:
+        git_config_text = guest_setup.host_git_config(project_root)
     rc = _post_start_actions(
         vm_name=vm_name,
         command=LAUNCH_COMMANDS[str(agent)],
@@ -1036,6 +1192,12 @@ def cmd_start(args: argparse.Namespace) -> int:
         stop_on_exit=stop_on_exit,
         cwd=project_guest_cwd,
         git_config_text=git_config_text,
+        forward_env=forward_env,
+        provision=True,
+        runtime_install=runtime_install,
+        install_timeout=install_timeout,
+        copy_initial_state=copy_host_credentials,
+        agent_name=str(agent),
     )
     if rc == 0 and args.json:
         print(json.dumps({"vm": {"name": vm_name, "status": "running"}}))
@@ -1066,17 +1228,20 @@ def cmd_shell(args: argparse.Namespace) -> int:
         print(f"sbx: {exc}", file=sys.stderr)
         return 2
     run_user = None if args.root else args.run_user or _cfg(config, "sbx", "run_user")
+    image = lifecycle_warnings.path_from_config(_cfg(config, "sbx", "image"))
+    if image is not None:
+        shell_manifest = lifecycle_warnings.local_image_manifest(image)
+        _manifest_sbx(shell_manifest)
+        if run_user is None and not args.root:
+            run_user = _manifest_run_user(shell_manifest)
     if run_user is not None:
         run_user = guest_setup.validate_run_user(str(run_user))
+    elif not args.root:
+        run_user = guest_setup.host_username()
     project_path = args.project_path or _cfg(config, "sbx", "project_path")
     project_guest_cwd = _project_guest_cwd(project_path)
-    smolvm_command = ["sandbox", "ssh", name]
     keep_running = bool(getattr(args, "keep_running", False))
     stop_on_exit = bool(_cfg(config, "sbx", "stop_on_exit", True)) and not keep_running
-    git_config = bool(_cfg(config, "sbx", "git_config", True))
-    git_config_text = (
-        guest_setup.host_git_config(Path(project_identity["project_root"])) if git_config else None
-    )
     try:
         port_forwards = _list_value(
             _sbx_config(config).get("port_forwards"), key="[sbx].port_forwards"
@@ -1086,65 +1251,52 @@ def cmd_shell(args: argparse.Namespace) -> int:
         print(f"sbx: {exc}", file=sys.stderr)
         return 2
     existing_status = _get_existing_vm_status(name)
-    if (
-        run_user is not None or project_guest_cwd is not None or git_config_text is not None
-    ) and existing_status is None:
+    if existing_status is None:
         print(f"sbx: {runtime.missing_vm_message(name)}", file=sys.stderr)
         return 1
-    if existing_status is not None:
-        if existing_status != "running":
-            try:
-                _sync_existing_vm_start_config(
-                    name,
-                    None,
-                    writable_mounts=False,
-                    port_forwards=port_forwards,
-                    project=project_identity,
-                )
-            except ConfigError as exc:
-                print(f"sbx: {exc}", file=sys.stderr)
-                return 2
-        else:
-            sbx_cfg = _sbx_config(config)
-            mounts = _list_value(sbx_cfg.get("mount"), key="[sbx].mount")
-            effective_mounts = []
-            if project_path is not None:
-                effective_mounts.append(_same_path_mount(str(project_path)))
-            effective_mounts.extend(
-                mount if ":" in mount else _same_path_mount(mount) for mount in mounts
+    vm_metadata.claim_vm(
+        name, project_identity, str(run_user) if run_user is not None else None, created=False
+    )
+    if existing_status != "running":
+        try:
+            _sync_existing_vm_start_config(
+                name,
+                None,
+                writable_mounts=False,
+                port_forwards=port_forwards,
+                project=project_identity,
             )
-            if effective_mounts:
-                _warn_running_mount_drift(
-                    name, effective_mounts, writable_mounts=project_path is not None
-                )
-        start_rc = _start_existing_vm_if_needed(
-            name,
-            existing_status,
-            DEFAULT_BOOT_TIMEOUT,
+        except ConfigError as exc:
+            print(f"sbx: {exc}", file=sys.stderr)
+            return 2
+    else:
+        sbx_cfg = _sbx_config(config)
+        mounts = _list_value(sbx_cfg.get("mount"), key="[sbx].mount")
+        effective_mounts = []
+        if project_path is not None:
+            effective_mounts.append(_same_path_mount(str(project_path)))
+        effective_mounts.extend(
+            mount if ":" in mount else _same_path_mount(mount) for mount in mounts
         )
-        if start_rc != 0:
-            return start_rc
-    if not _sync_forwarded_env_or_error(name, forward_env):
-        return 1
-    if run_user is not None or project_guest_cwd is not None or git_config_text is not None:
-        return _post_start_actions(
-            vm_name=name,
-            command="bash",
-            attach=True,
-            run_user=run_user,
-            auth_port=False,
-            stop_on_exit=stop_on_exit,
-            cwd=project_guest_cwd,
-            git_config_text=git_config_text,
-            session_kind="shell",
-        )
-    session_state.register_session(name, "shell")
-    try:
-        return runtime.run_smolvm(smolvm_command)
-    finally:
-        remaining = session_state.unregister_session(name)
-        runtime.debug(f"unregistered session for {name}; remaining={remaining}")
-        _stop_vm_if_last_session(name, stop_on_exit=stop_on_exit)
+        if effective_mounts:
+            _warn_running_mount_drift(
+                name, effective_mounts, writable_mounts=project_path is not None
+            )
+    start_rc = _start_existing_vm_if_needed(name, existing_status, DEFAULT_BOOT_TIMEOUT)
+    if start_rc != 0:
+        return start_rc
+    return _post_start_actions(
+        vm_name=name,
+        command="bash",
+        attach=True,
+        run_user=run_user,
+        auth_port=False,
+        stop_on_exit=stop_on_exit,
+        cwd=project_guest_cwd,
+        session_kind="shell",
+        forward_env=forward_env,
+        validate_agent=False,
+    )
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
@@ -1181,15 +1333,14 @@ def _delete_vm(vm_id: str, extra_args: Sequence[str] | None = None, *, quiet: bo
 
     if completed.returncode == 0:
         with suppress(ConfigError):
-            metadata = vm_metadata.load_vm_metadata()
-            if vm_id in metadata:
-                metadata.pop(vm_id, None)
-                vm_metadata.save_vm_metadata(metadata)
+            vm_metadata.remove_vm(vm_id)
         if not quiet:
             print(f"Destroyed VM '{vm_id}'.")
         return 0
 
     if any(item.get("error") == f"VM '{vm_id}' not found" for item in failed):
+        with suppress(ConfigError):
+            vm_metadata.remove_vm(vm_id)
         if not quiet:
             print(f"VM '{vm_id}' not found; nothing to destroy.")
         return 0
@@ -1282,7 +1433,16 @@ def _add_start_options(parser: argparse.ArgumentParser) -> None:
         type=float,
         help="Seconds to wait for VM boot/SSH readiness (default: [sbx].boot_timeout or 60).",
     )
-    resources.add_argument("--install-timeout", type=float)
+    resources.add_argument("--install-timeout", type=int)
+
+    provisioning = parser.add_argument_group("Provisioning")
+    provisioning.add_argument(
+        "--runtime-install",
+        action="append",
+        default=None,
+        metavar="TOOL",
+        help="Install this supported runtime tool. Can be repeated and replaces config values.",
+    )
 
     output = parser.add_argument_group("Configuration and output")
     output.add_argument(
@@ -1310,11 +1470,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="Run an agent session in a sandbox.")
     _add_start_options(run)
+    run.add_argument(
+        "--reprovision",
+        action="store_true",
+        help="Rerun idempotent user and runtime-tool provisioning for an existing VM.",
+    )
     run.set_defaults(func=cmd_start)
 
-    create = sub.add_parser(
-        "create", help="Create an agent-preinstalled sandbox without attaching."
-    )
+    create = sub.add_parser("create", help="Create and provision a sandbox without attaching.")
     _add_start_options(create)
     create.set_defaults(func=cmd_create)
 
@@ -1469,7 +1632,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"sbx: {exc}", file=sys.stderr)
             return 2
     try:
-        return args.func(args)
+        with runtime.without_stale_sudo_env():
+            return args.func(args)
     except KeyboardInterrupt:
         # Shell convention: signal exits are 128 + signal number.
         return 128 + signal.SIGINT

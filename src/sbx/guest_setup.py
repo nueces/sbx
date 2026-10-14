@@ -1,5 +1,6 @@
 import base64
 import os
+import pwd
 import re
 import shlex
 import subprocess
@@ -39,6 +40,17 @@ def validate_run_user(user: str) -> str:
     if not USERNAME_RE.match(user):
         raise ConfigError("[sbx].run_user must be a valid Linux user name")
     return user
+
+
+def host_username() -> str:
+    sudo_user = os.environ.get("SUDO_USER") if os.geteuid() == 0 else None
+    if sudo_user and sudo_user != "root":
+        with suppress(KeyError):
+            return validate_run_user(pwd.getpwnam(sudo_user).pw_name)
+    try:
+        return validate_run_user(pwd.getpwuid(os.getuid()).pw_name)
+    except KeyError as exc:
+        raise ConfigError("could not resolve the current host user; set [sbx].run_user") from exc
 
 
 def validate_env_names(names: list[str]) -> list[str]:
@@ -287,21 +299,19 @@ def install_git_config(
     ssh = ssh or ssh_command
     if not git_config_text:
         return
-    if user is None:
-        home = "/root"
-        owner = "root:root"
-    else:
-        quoted_user = shlex.quote(user)
-        home = f"/home/{quoted_user}"
-        owner = f"{quoted_user}:{quoted_user}"
-
+    quoted_user = shlex.quote(user or "root")
     encoded = base64.b64encode(git_config_text.encode("utf-8")).decode("ascii")
     script = f"""
 set -eu
-install -d {shlex.quote(home)}
-printf %s {shlex.quote(encoded)} | base64 -d > {shlex.quote(home)}/.gitconfig
-chown {owner} {shlex.quote(home)}/.gitconfig
-chmod 600 {shlex.quote(home)}/.gitconfig
+home="$(getent passwd {quoted_user} | cut -d: -f6)"
+[ -n "$home" ] || {{ echo "user {quoted_user} has no home" >&2; exit 1; }}
+group="$(id -gn {quoted_user})"
+install -d -o {quoted_user} -g "$group" "$home"
+if [ ! -e "$home/.gitconfig" ]; then
+  printf %s {shlex.quote(encoded)} | base64 -d > "$home/.gitconfig"
+  chown {quoted_user}:"$group" "$home/.gitconfig"
+  chmod 600 "$home/.gitconfig"
+fi
 """
     cmd = ssh(vm_id)
     cmd.append("bash -lc " + shlex.quote(script))
@@ -317,13 +327,16 @@ def prepare_run_user(
     vm_id: str,
     user: str,
     *,
+    copy_initial_state: bool = False,
     run_capture: Callable[[list[str]], subprocess.CompletedProcess[str] | None] | None = None,
     ssh: Callable[[str], list[str]] | None = None,
 ) -> None:
+    if user == "root":
+        return
     run_capture = run_capture or runtime.run_capture
     ssh = ssh or ssh_command
     quoted_user = shlex.quote(user)
-    home = f"/home/{quoted_user}"
+    copy_state = "1" if copy_initial_state else "0"
     script = f"""
 set -eu
 host="$(hostname)"
@@ -331,16 +344,23 @@ if [ -n "$host" ] && ! getent hosts "$host" >/dev/null 2>&1; then
   printf '127.0.1.1 %s\n' "$host" >> /etc/hosts
 fi
 if ! id -u {quoted_user} >/dev/null 2>&1; then
-  useradd -m -s /bin/bash {quoted_user}
+  useradd -m -U -s /bin/bash {quoted_user}
 fi
-install -d -o {quoted_user} -g {quoted_user} {home}
-for p in .ssh .pi .codex .claude .claude.json; do
-  if [ -e /root/$p ]; then
-    rm -rf {home}/$p
-    cp -a /root/$p {home}/$p
-  fi
-done
-chown -R {quoted_user}:{quoted_user} {home}
+home="$(getent passwd {quoted_user} | cut -d: -f6)"
+[ -n "$home" ] || {{ echo "user {quoted_user} has no home" >&2; exit 1; }}
+group="$(id -gn {quoted_user})"
+install -d -o {quoted_user} -g "$group" "$home"
+printf '%s ALL=(ALL) NOPASSWD:ALL\n' {quoted_user} > /etc/sudoers.d/{quoted_user}
+chmod 0440 /etc/sudoers.d/{quoted_user}
+visudo -cf /etc/sudoers.d/{quoted_user} >/dev/null
+if [ {copy_state} = 1 ]; then
+  for p in .ssh .pi .codex .claude .claude.json; do
+    if [ -e "/root/$p" ] && [ ! -e "$home/$p" ]; then
+      cp -a "/root/$p" "$home/$p"
+      chown -hR {quoted_user}:"$group" "$home/$p"
+    fi
+  done
+fi
 """
     cmd = ssh(vm_id)
     cmd.append("bash -lc " + shlex.quote(script))
@@ -348,8 +368,117 @@ chown -R {quoted_user}:{quoted_user} {home}
     if completed is None:
         raise ConfigError(f"failed to prepare run user {user!r}: ssh command not found")
     if completed.returncode != 0:
-        stderr = completed.stderr.strip() or completed.stdout.strip()
-        raise ConfigError(f"failed to prepare run user {user!r}: {stderr}")
+        details = completed.stderr.strip() or completed.stdout.strip()
+        raise ConfigError(f"failed to prepare run user {user!r}: {details}")
+
+
+def ensure_rootless_docker(
+    vm_id: str,
+    user: str,
+    *,
+    run_capture: Callable[[list[str]], subprocess.CompletedProcess[str] | None] | None = None,
+    ssh: Callable[[str], list[str]] | None = None,
+) -> None:
+    if user == "root":
+        return
+    run_capture = run_capture or runtime.run_capture
+    ssh = ssh or ssh_command
+    script = (
+        "if [ -x /usr/local/bin/sbx-start-rootless-docker ]; then "
+        f"SBX_DOCKER_USER={shlex.quote(user)} /usr/local/bin/sbx-start-rootless-docker; fi"
+    )
+    completed = run_capture([*ssh(vm_id), "bash -lc " + shlex.quote(script)])
+    if completed is None:
+        raise ConfigError(f"failed to check rootless Docker for {user!r}: ssh command not found")
+    if completed.returncode != 0:
+        details = completed.stderr.strip() or completed.stdout.strip()
+        raise ConfigError(f"failed to check rootless Docker for {user!r}: {details}")
+
+
+def command_path(
+    vm_id: str,
+    user: str,
+    command: str,
+    *,
+    run_capture: Callable[[list[str]], subprocess.CompletedProcess[str] | None] | None = None,
+    ssh: Callable[[str], list[str]] | None = None,
+) -> str | None:
+    run_capture = run_capture or runtime.run_capture
+    ssh = ssh or ssh_command
+    quoted_user = shlex.quote(user)
+    check = (
+        'export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"; '
+        f"command -v {shlex.quote(command)}"
+    )
+    script = f"""
+set -eu
+home="$(getent passwd {quoted_user} | cut -d: -f6)"
+[ -n "$home" ] || {{ echo "user {quoted_user} has no home" >&2; exit 1; }}
+sudo -iu {quoted_user} env HOME="$home" sh -lc {shlex.quote(check)}
+"""
+    completed = run_capture([*ssh(vm_id), "bash -lc " + shlex.quote(script)])
+    if completed is None:
+        raise ConfigError(f"failed to resolve {command!r}: ssh command not found")
+    if completed.returncode == 0:
+        return completed.stdout.strip().splitlines()[-1]
+    details = completed.stderr.strip() or completed.stdout.strip()
+    if not details:
+        return None
+    raise ConfigError(f"failed to resolve {command!r} for {user!r}: {details}")
+
+
+def install_runtime_tools(
+    vm_id: str,
+    user: str,
+    tools: list[str],
+    install_timeout: int,
+    *,
+    run_capture: Callable[[list[str]], subprocess.CompletedProcess[str] | None] | None = None,
+    ssh: Callable[[str], list[str]] | None = None,
+) -> None:
+    if not tools:
+        return
+    run_capture = run_capture or runtime.run_capture
+    ssh = ssh or ssh_command
+    for tool in tools:
+        if command_path(vm_id, user, tool, run_capture=run_capture, ssh=ssh):
+            continue
+        quoted_user = shlex.quote(user)
+        if tool == "pi":
+            install_env = "NPM_CONFIG_USERCONFIG=/dev/stdin NPM_CONFIG_GLOBALCONFIG=/dev/null"
+            install_command = (
+                "if [ -r /etc/profile.d/smolvm_env.sh ]; then "
+                ". /etc/profile.d/smolvm_env.sh; fi; "
+                f"exec timeout --signal=TERM --kill-after=10s {install_timeout}s "
+                'npm install --global --prefix "$HOME/.local" --ignore-scripts '
+                "@earendil-works/pi-coding-agent </dev/null"
+            )
+        elif tool == "specify":
+            install_env = ""
+            install_command = (
+                f"exec timeout --signal=TERM --kill-after=10s {install_timeout}s "
+                "uv tool install specify-cli "
+                "--from git+https://github.com/github/spec-kit.git"
+            )
+        else:
+            raise ConfigError(f"no runtime installer is registered for {tool!r}")
+        script = f"""
+set -eu
+home="$(getent passwd {quoted_user} | cut -d: -f6)"
+[ -n "$home" ] || {{ echo "user {quoted_user} has no home" >&2; exit 1; }}
+sudo -iu {quoted_user} env HOME="$home" PATH="$home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+  {install_env} sh -lc {shlex.quote(install_command)}
+"""
+        completed = run_capture([*ssh(vm_id), "bash -lc " + shlex.quote(script)])
+        if completed is None:
+            raise ConfigError(f"failed to install {tool!r}: ssh command not found")
+        if completed.returncode != 0:
+            details = "\n".join(
+                value.strip() for value in (completed.stdout, completed.stderr) if value.strip()
+            )
+            raise ConfigError(
+                f"failed to install {tool!r} as {user!r}: {details or 'installer failed'}"
+            )
 
 
 def attach(
@@ -370,7 +499,7 @@ def attach(
     remote = (
         f"{cd_prefix}[ -r {ENV_FILE} ] && . {ENV_FILE}; "
         'export PATH="$HOME/.local/bin:$PATH"; '
-        f"exec {launch_command}"
+        f"exec {shlex.quote(launch_command)}"
     )
     if user is not None:
         remote = f"sudo -iu {shlex.quote(user)} bash -lc " + shlex.quote(remote)

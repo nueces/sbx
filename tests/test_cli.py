@@ -17,19 +17,36 @@ def isolated_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(cli.runtime, "DEBUG", False)
     monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATHS", (tmp_path / "home-config.toml",))
     monkeypatch.setattr(cli, "LOCAL_CONFIG_PATHS", (tmp_path / ".sbx.toml",))
-    monkeypatch.setattr(vm_metadata, "SBX_STATE_DIR", tmp_path / "state")
-    monkeypatch.setattr(vm_metadata, "SBX_VMS_FILE", tmp_path / "state" / "vms.json")
+    monkeypatch.setattr(vm_metadata, "SBX_VMS_DIR", tmp_path / "state" / "vms")
     monkeypatch.setattr(guest_setup, "host_git_config", lambda project_root=None: None)
     monkeypatch.setattr(guest_setup, "set_hostname", lambda *args, **kwargs: None)
     monkeypatch.setattr(guest_setup, "sync_guest_clock", lambda *args, **kwargs: None)
+    monkeypatch.setattr(guest_setup, "host_username", lambda: "hostuser")
+    monkeypatch.setattr(guest_setup, "prepare_run_user", lambda *args, **kwargs: None)
+    monkeypatch.setattr(guest_setup, "install_runtime_tools", lambda *args, **kwargs: None)
+    monkeypatch.setattr(guest_setup, "ensure_rootless_docker", lambda *args, **kwargs: None)
+    monkeypatch.setattr(guest_setup, "install_git_config", lambda *args, **kwargs: None)
+    monkeypatch.setattr(guest_setup, "sync_forwarded_env", lambda *args, **kwargs: None)
+    monkeypatch.setattr(guest_setup, "command_path", lambda *args, **kwargs: "/usr/bin/pi")
     monkeypatch.setattr(guest_setup, "attach", lambda *args, **kwargs: 0)
-    monkeypatch.setattr(
-        cli.smolvm_preset,
-        "create_preset",
-        lambda preset_name, **kwargs: SimpleNamespace(
-            vm_id=kwargs.get("vm_name") or f"{preset_name}-sbx", close=lambda: None
-        ),
-    )
+    real_claim_vm = vm_metadata.claim_vm
+
+    def claim_vm(vm_name: str, project: object, run_user: str | None, *, created: bool):
+        if not created and vm_metadata.load_vm(vm_name) is None:
+            real_claim_vm(vm_name, project, run_user or "root", created=True)
+            vm_metadata.mark_provisioned(vm_name)
+        return real_claim_vm(vm_name, project, run_user, created=created)
+
+    monkeypatch.setattr(vm_metadata, "claim_vm", claim_vm)
+
+    def create_preset(preset_name: str, **kwargs: object) -> SimpleNamespace:
+        vm_id = str(kwargs.get("vm_name") or f"{preset_name}-sbx")
+        callback = kwargs.get("before_provision")
+        if callable(callback):
+            callback(vm_id)
+        return SimpleNamespace(vm_id=vm_id, close=lambda: None)
+
+    monkeypatch.setattr(cli.smolvm_preset, "create_preset", create_preset)
 
 
 def install_fake_smolvm(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
@@ -57,6 +74,9 @@ def capture_preset(
 ) -> None:
     def fake_create(preset_name: str, **kwargs: object) -> SimpleNamespace:
         captured["preset"] = (preset_name, kwargs)
+        callback = kwargs.get("before_provision")
+        if callable(callback):
+            callback(vm_id)
         return SimpleNamespace(
             vm_id=vm_id,
             close=lambda: captured.setdefault("preset_closed", True),
@@ -251,8 +271,11 @@ def test_list_does_not_require_name(
         network=SimpleNamespace(ssh_host_port=2204),
     )
     monkeypatch.setattr(vm_state, "smolvm_vms", lambda all_vms=False: [vm])
-    vm_metadata.record_vm_project(
-        "vm1", {"project_root": "/project", "config_path": "/project/.sbx.toml"}
+    vm_metadata.claim_vm(
+        "vm1",
+        {"project_root": "/project", "config_path": "/project/.sbx.toml"},
+        "agent",
+        created=True,
     )
 
     rc = cli.main(["list"])
@@ -302,9 +325,17 @@ def test_run_help_groups_supported_options(
 
     assert exc.value.code == 0
     out = capsys.readouterr().out
-    for heading in ("Session:", "Workspace:", "VM resources:", "Configuration and output:"):
+    for heading in (
+        "Session:",
+        "Workspace:",
+        "VM resources:",
+        "Provisioning:",
+        "Configuration and output:",
+    ):
         assert heading in out
     assert "--no-attach" in out
+    assert "--runtime-install" in out
+    assert "--reprovision" in out
     assert "--write-config" in out
 
 
@@ -313,14 +344,23 @@ def test_shell_uses_configured_default_name(
     tmp_path: Path,
     capfd: pytest.CaptureFixture[str],
 ) -> None:
-    print_smolvm_args(monkeypatch)
     config = tmp_path / "config.toml"
     config.write_text('[sbx]\nname = "vm1"\n', encoding="utf-8")
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(cli, "_get_existing_vm_status", lambda vm_id: "running")
+    monkeypatch.setattr(
+        guest_setup,
+        "attach",
+        lambda vm_id, command, **kwargs: (
+            captured.update({"attach": (vm_id, command, kwargs.get("user"))}) or 0
+        ),
+    )
 
     rc = cli.main(["--config", str(config), "shell", "--keep-running"])
 
     assert rc == 0
-    assert capfd.readouterr().out == "sandbox ssh vm1\n"
+    assert captured["attach"] == ("vm1", "bash", "hostuser")
+    assert capfd.readouterr().out == ""
 
 
 def test_shell_uses_configured_run_user(
@@ -345,7 +385,7 @@ def test_shell_uses_configured_run_user(
     rc = cli.main(["--config", str(config), "shell", "--keep-running"])
 
     assert rc == 0
-    assert captured["prepare"] == ("vm1", "agent")
+    assert "prepare" not in captured
     assert captured["attach"] == ("vm1", "agent", "bash", None)
 
 
@@ -408,14 +448,23 @@ def test_shell_root_ignores_configured_run_user(
     tmp_path: Path,
     capfd: pytest.CaptureFixture[str],
 ) -> None:
-    print_smolvm_args(monkeypatch)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(cli, "_get_existing_vm_status", lambda vm_id: "running")
+    monkeypatch.setattr(
+        guest_setup,
+        "attach",
+        lambda vm_id, command, **kwargs: (
+            captured.update({"attach": (vm_id, command, kwargs.get("user"))}) or 0
+        ),
+    )
     config = tmp_path / "config.toml"
     config.write_text('[sbx]\nname = "vm1"\nrun_user = "agent"\n', encoding="utf-8")
 
     rc = cli.main(["--config", str(config), "shell", "--root", "--keep-running"])
 
     assert rc == 0
-    assert capfd.readouterr().out == "sandbox ssh vm1\n"
+    assert captured["attach"] == ("vm1", "bash", None)
+    assert capfd.readouterr().out == ""
 
 
 def test_shell_without_name_or_config_fails(
@@ -438,9 +487,8 @@ def test_shell_syncs_env_from_config_before_attach(
     monkeypatch.setattr(
         guest_setup, "sync_forwarded_env", lambda *args, **kwargs: calls.append("sync")
     )
-    monkeypatch.setattr(
-        cli.runtime, "run_smolvm", lambda *args, **kwargs: calls.append("attach") or 0
-    )
+    monkeypatch.setattr(cli, "_get_existing_vm_status", lambda name: "running")
+    monkeypatch.setattr(guest_setup, "attach", lambda *args, **kwargs: calls.append("attach") or 0)
 
     assert cli.main(["--config", str(config), "shell", "--keep-running"]) == 0
     assert calls == ["sync", "attach"]
@@ -461,9 +509,7 @@ def test_shell_starts_stopped_vm_before_env_sync(
     monkeypatch.setattr(
         guest_setup, "sync_forwarded_env", lambda *args, **kwargs: calls.append("sync")
     )
-    monkeypatch.setattr(
-        cli.runtime, "run_smolvm", lambda *args, **kwargs: calls.append("attach") or 0
-    )
+    monkeypatch.setattr(guest_setup, "attach", lambda *args, **kwargs: calls.append("attach") or 0)
 
     assert cli.main(["--config", str(config), "shell", "--keep-running"]) == 0
     assert calls == ["start", "sync", "attach"]
@@ -511,7 +557,7 @@ mount = [".:/workspace"]
     assert preset_name == "codex"
     assert preset_kwargs["vm_name"] == "demo"
     assert preset_kwargs["mounts"] == [".:/workspace"]
-    assert capfd.readouterr().out == "Started 'demo'. Launching codex...\n"
+    assert capfd.readouterr().out == "Started 'demo'. Launching codex as user hostuser...\n"
 
 
 def test_run_supports_all_exposed_options_from_config(
@@ -578,7 +624,7 @@ port_forwards = ["8080:80"]
     [
         ("agent", "", "agent"),
         ("agent", 'run_user = "developer"', "developer"),
-        (None, "", None),
+        (None, "", "hostuser"),
     ],
 )
 def test_run_uses_local_image_directory(
@@ -594,7 +640,7 @@ def test_run_uses_local_image_directory(
     image_dir.mkdir()
     (image_dir / "vmlinux.bin").write_text("kernel", encoding="utf-8")
     (image_dir / "rootfs.ext4").write_text("rootfs", encoding="utf-8")
-    manifest_sbx = {"agent": "pi", "launch_command": "pi"}
+    manifest_sbx: dict[str, str] = {}
     if manifest_run_user is not None:
         manifest_sbx["run_user"] = manifest_run_user
     (image_dir / "smolvm-image.json").write_text(
@@ -643,9 +689,10 @@ mount = [".:/workspace"]
     assert captured["mounts"] == [".:/workspace"]
     assert captured["attach"] is True
     assert captured["run_user"] == expected_run_user
-    if manifest_run_user is not None and not configured_run_user:
-        assert captured["args"].run_user == "agent"
-    assert "copy_host_credentials=true" not in capsys.readouterr().err
+    assert captured["args"].run_user == expected_run_user
+    warning = capsys.readouterr().err
+    assert "copy_host_credentials=true" in warning
+    assert "tokens, settings, and sessions" in warning
 
 
 def test_run_user_from_config_starts_then_attaches_as_user(
@@ -675,7 +722,7 @@ def test_run_user_from_config_starts_then_attaches_as_user(
     assert rc == 0
     assert captured["preset_closed"] is True
     assert captured["prepare"] == ("vm1", "agent")
-    assert captured["attach"] == ("vm1", "agent", "pi", None)
+    assert captured["attach"] == ("vm1", "agent", "/usr/bin/pi", None)
     out = capfd.readouterr().out
     assert "Created sandbox 'vm1'." in out
     assert "sandbox stop vm1" in out
@@ -732,7 +779,7 @@ def test_git_config_defaults_on_for_managed_run(
     capture_preset(monkeypatch, captured)
 
     assert cli.main(["run"]) == 0
-    assert captured["git"] == ("vm1", None, "[user]\n\tname = Test\n")
+    assert captured["git"] == ("vm1", "hostuser", "[user]\n\tname = Test\n")
 
 
 def test_config_disables_git_forwarding(
@@ -756,7 +803,7 @@ def test_config_disables_git_forwarding(
     capture_preset(monkeypatch, captured)
 
     assert cli.main(["run"]) == 0
-    assert captured["git"] == ("vm1", None, None)
+    assert captured["git"] == ("vm1", "hostuser", None)
 
 
 def test_shell_uses_configured_git_forwarding_policy(
@@ -781,7 +828,7 @@ def test_shell_uses_configured_git_forwarding_policy(
     monkeypatch.setattr(cli, "_get_existing_vm_status", lambda vm_id: "running")
 
     assert cli.main(["--config", str(config), "shell", "--keep-running"]) == 0
-    assert captured["git"] is None
+    assert "git" not in captured
 
 
 def test_credential_free_env_preserves_real_smolvm_state(
@@ -1074,7 +1121,7 @@ def test_run_with_project_path_attaches_from_mounted_project_cwd(
     _, preset_kwargs = captured["preset"]
     assert preset_kwargs["mounts"] == [f"{project}:{project}"]
     assert preset_kwargs["writable_mounts"] is True
-    assert captured["attach"] == ("vm1", "pi", str(project))
+    assert captured["attach"] == ("vm1", "/usr/bin/pi", str(project))
 
 
 def test_run_uses_configured_auth_ports_before_attach(
@@ -1103,7 +1150,7 @@ def test_run_uses_configured_auth_ports_before_attach(
     assert cli.main(["run"]) == 0
     assert captured["preset_closed"] is True
     assert captured["expose"] == ("vm1", 1555, 1666)
-    assert captured["attach"] == ("vm1", "pi", None)
+    assert captured["attach"] == ("vm1", "/usr/bin/pi", None)
 
 
 def test_run_existing_vm_starts_without_creating(
@@ -1302,6 +1349,7 @@ def test_run_missing_vm_creates_it(
     assert cli.main(["run", "vm1", "--no-attach"]) == 0
     _, preset_kwargs = captured["preset"]
     assert preset_kwargs["vm_name"] == "vm1"
+    assert 'run_user = "hostuser"' in (tmp_path / ".sbx.toml").read_text(encoding="utf-8")
 
 
 def test_create_is_run_no_attach_alias(

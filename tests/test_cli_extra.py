@@ -1,4 +1,5 @@
 import json
+import shlex
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -18,8 +19,7 @@ def isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(cli.runtime, "DEBUG", False)
     monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATHS", (tmp_path / "home-config.toml",))
     monkeypatch.setattr(cli, "LOCAL_CONFIG_PATHS", (tmp_path / ".sbx.toml",))
-    monkeypatch.setattr(vm_metadata, "SBX_STATE_DIR", tmp_path / "state")
-    monkeypatch.setattr(vm_metadata, "SBX_VMS_FILE", tmp_path / "state" / "vms.json")
+    monkeypatch.setattr(vm_metadata, "SBX_VMS_DIR", tmp_path / "state" / "vms")
     monkeypatch.setattr(session_state, "SBX_STATE_DIR", tmp_path / "state")
     monkeypatch.setattr(session_state, "SESSIONS_FILE", tmp_path / "state" / "sessions.json")
     monkeypatch.setattr(cli.network, "SBX_STATE_DIR", tmp_path / "state")
@@ -27,13 +27,15 @@ def isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(cli, "SMOLVM_DB_PATH", tmp_path / "smolvm.db")
     monkeypatch.setattr(vm_state, "SMOLVM_DB_PATH", tmp_path / "smolvm.db")
     monkeypatch.setattr(guest_setup, "set_hostname", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        cli.smolvm_preset,
-        "create_preset",
-        lambda preset_name, **kwargs: SimpleNamespace(
-            vm_id=kwargs.get("vm_name") or f"{preset_name}-sbx", close=lambda: None
-        ),
-    )
+
+    def create_preset(preset_name: str, **kwargs: object) -> SimpleNamespace:
+        vm_id = str(kwargs.get("vm_name") or f"{preset_name}-sbx")
+        callback = kwargs.get("before_provision")
+        if callable(callback):
+            callback(vm_id)
+        return SimpleNamespace(vm_id=vm_id, close=lambda: None)
+
+    monkeypatch.setattr(cli.smolvm_preset, "create_preset", create_preset)
 
 
 @pytest.fixture
@@ -51,7 +53,7 @@ def local_image_dir(tmp_path: Path) -> Path:
                 "rootfs": "rootfs.ext4",
                 "initrd": "initrd.img",
                 "boot_args": "boot args",
-                "sbx": {"agent": "pi", "launch_command": "custom-pi"},
+                "sbx": {},
             }
         ),
         encoding="utf-8",
@@ -124,16 +126,19 @@ def test_vm_metadata_load_save_and_project_identity(
 
     args = SimpleNamespace(config=None)
     identity = cli._project_identity(args, {"sbx": {"project_path": "."}})
-    vm_metadata.record_vm_project("vm1", identity)
+    vm_metadata.claim_vm("vm1", identity, "agent", created=True)
 
-    assert vm_metadata.load_vm_metadata() == {"vm1": identity}
+    assert vm_metadata.load_vm_metadata() == {
+        "vm1": {**identity, "run_user": "agent", "provisioned": False}
+    }
     assert identity["project_root"] == str(project.resolve())
     assert identity["config_path"] == str(config.resolve())
 
 
 def test_vm_metadata_corrupt_json_raises() -> None:
-    vm_metadata.SBX_VMS_FILE.parent.mkdir(parents=True)
-    vm_metadata.SBX_VMS_FILE.write_text("not json", encoding="utf-8")
+    path = vm_metadata.metadata_path("vm1")
+    path.parent.mkdir(parents=True)
+    path.write_text("not json", encoding="utf-8")
 
     with pytest.raises(cli.ConfigError, match="invalid sbx VM metadata"):
         vm_metadata.load_vm_metadata()
@@ -145,8 +150,11 @@ def test_sync_existing_vm_mounts_rejects_wrong_project(tmp_path: Path) -> None:
     old.mkdir()
     new.mkdir()
     _write_vm_row(cli.SMOLVM_DB_PATH, "vm1", status="stopped", config={"workspace_mounts": []})
-    vm_metadata.record_vm_project(
-        "vm1", {"project_root": str(old), "config_path": str(old / ".sbx.toml")}
+    vm_metadata.claim_vm(
+        "vm1",
+        {"project_root": str(old), "config_path": str(old / ".sbx.toml")},
+        "agent",
+        created=True,
     )
 
     with pytest.raises(cli.ConfigError, match="belongs to"):
@@ -196,8 +204,11 @@ def test_doctor_fix_repairs_local_bookkeeping(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     missing = tmp_path / "missing"
-    vm_metadata.record_vm_project(
-        "vm1", {"project_root": str(missing), "config_path": str(missing / ".sbx.toml")}
+    vm_metadata.claim_vm(
+        "vm1",
+        {"project_root": str(missing), "config_path": str(missing / ".sbx.toml")},
+        "agent",
+        created=True,
     )
     session_state.save_sessions({"vm1": {"sessions": [{"pid": -1, "kind": "run"}]}})
     cli.network._save_tunnels({"vm1": {"auth_port": {"pid": -1, "host_port": 1}}})
@@ -265,6 +276,13 @@ def test_cmd_start_syncs_env_before_existing_vm_attach(
     config = tmp_path / "config.toml"
     config.write_text('[sbx]\nname = "vm1"\nenv = ["SBX_TOKEN"]\n', encoding="utf-8")
     calls: list[str] = []
+    vm_metadata.claim_vm(
+        "vm1",
+        {"project_root": str(tmp_path), "config_path": str(config)},
+        guest_setup.host_username(),
+        created=True,
+    )
+    vm_metadata.mark_provisioned("vm1")
 
     monkeypatch.setattr(cli, "_get_existing_vm_status", lambda vm_id: "running")
     monkeypatch.setattr(
@@ -277,7 +295,7 @@ def test_cmd_start_syncs_env_before_existing_vm_attach(
     monkeypatch.setattr(cli, "_post_start_actions", lambda **kwargs: calls.append("attach") or 0)
 
     assert cli.main(["--config", str(config), "run"]) == 0
-    assert calls == ["start", "sync", "attach"]
+    assert calls == ["start", "attach"]
 
 
 def test_sync_existing_vm_start_config_updates_port_forwards(
@@ -301,6 +319,13 @@ def test_cmd_start_does_not_sync_running_vm_mounts(
     config = tmp_path / "config.toml"
     config.write_text('[sbx]\nname = "vm1"\n', encoding="utf-8")
     calls: list[str] = []
+    vm_metadata.claim_vm(
+        "vm1",
+        {"project_root": str(tmp_path), "config_path": str(config)},
+        guest_setup.host_username(),
+        created=True,
+    )
+    vm_metadata.mark_provisioned("vm1")
 
     monkeypatch.setattr(cli, "_get_existing_vm_status", lambda vm_id: "running")
     monkeypatch.setattr(guest_setup, "host_git_config", lambda project_root=None: None)
@@ -408,7 +433,7 @@ def test_start_local_image_happy_path(
     )
 
     assert rc == 0
-    assert calls == ["sync", "attach"]
+    assert calls == ["attach"]
     assert fake_smolvm_sdk["started"] is True
     assert fake_smolvm_sdk["waited"] is True
     assert fake_smolvm_sdk["start_kwargs"] == {"boot_timeout": 60.0}
@@ -422,7 +447,7 @@ def test_start_local_image_happy_path(
     assert vm_config["port_forwards"] == [
         {"host_address": "127.0.0.1", "host_port": 8080, "guest_port": 3000}
     ]
-    assert captured["command"] == "custom-pi"
+    assert captured["command"] == "pi"
     assert captured["git_config_text"] == "[user]\n"
 
 
@@ -453,6 +478,87 @@ def test_simple_helper_error_branches(tmp_path: Path) -> None:
         guest_setup.validate_run_user("bad user")
     with pytest.raises(cli.ConfigError, match="invalid env var"):
         guest_setup.validate_env_names(["1BAD"])
+
+
+def test_host_username_uses_account_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(guest_setup.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(guest_setup.os, "getuid", lambda: 1000)
+    monkeypatch.setattr(
+        guest_setup.pwd, "getpwuid", lambda uid: SimpleNamespace(pw_name="developer")
+    )
+    assert guest_setup.host_username() == "developer"
+
+    monkeypatch.setattr(guest_setup.os, "geteuid", lambda: 0)
+    monkeypatch.setenv("SUDO_USER", "nueces")
+    monkeypatch.setattr(guest_setup.pwd, "getpwnam", lambda user: SimpleNamespace(pw_name=user))
+    assert guest_setup.host_username() == "nueces"
+
+    monkeypatch.setattr(
+        guest_setup.pwd, "getpwnam", lambda user: (_ for _ in ()).throw(KeyError(user))
+    )
+    monkeypatch.setattr(guest_setup.pwd, "getpwuid", lambda uid: SimpleNamespace(pw_name="root"))
+    assert guest_setup.host_username() == "root"
+
+
+@pytest.mark.parametrize("sudo_user", ["root", "missing", "bad user"])
+def test_main_hides_stale_sudo_env_from_non_root_commands(
+    monkeypatch: pytest.MonkeyPatch, sudo_user: str
+) -> None:
+    observed: dict[str, str] = {}
+    sudo_env = {
+        "SUDO_COMMAND": "/bin/bash",
+        "SUDO_GID": "0",
+        "SUDO_HOME": "/root",
+        "SUDO_UID": "0",
+        "SUDO_USER": sudo_user,
+    }
+    for key, value in sudo_env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(runtime.os, "geteuid", lambda: 1000)
+
+    class Parser:
+        def parse_args(self, argv: list[str]) -> SimpleNamespace:
+            return SimpleNamespace(
+                action="completion",
+                config=None,
+                debug=False,
+                func=lambda args: (
+                    observed.update(
+                        {
+                            key: runtime.os.environ[key]
+                            for key in runtime.SUDO_ENV_KEYS
+                            if key in runtime.os.environ
+                        }
+                    )
+                    or 0
+                ),
+            )
+
+    monkeypatch.setattr(cli, "build_parser", Parser)
+
+    assert cli.main([]) == 0
+    assert observed == {}
+    assert {key: runtime.os.environ[key] for key in runtime.SUDO_ENV_KEYS} == sudo_env
+
+
+def test_main_preserves_sudo_env_when_effectively_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SUDO_USER", "developer")
+    monkeypatch.setattr(runtime.os, "geteuid", lambda: 0)
+    observed: list[str | None] = []
+
+    class Parser:
+        def parse_args(self, argv: list[str]) -> SimpleNamespace:
+            return SimpleNamespace(
+                action="completion",
+                config=None,
+                debug=False,
+                func=lambda args: observed.append(runtime.os.getenv("SUDO_USER")) or 0,
+            )
+
+    monkeypatch.setattr(cli, "build_parser", Parser)
+
+    assert cli.main([]) == 0
+    assert observed == ["developer"]
 
 
 def test_ssh_command_and_pid_alive(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -526,6 +632,13 @@ def test_shell_reports_missing_vm_from_smolvm_without_traceback(
 
     config = tmp_path / "config.toml"
     config.write_text('[sbx]\nname = "the-quest"\nrun_user = "agent"\n', encoding="utf-8")
+    vm_metadata.claim_vm(
+        "the-quest",
+        {"project_root": str(tmp_path), "config_path": str(config)},
+        "agent",
+        created=True,
+    )
+    vm_metadata.mark_provisioned("the-quest")
     monkeypatch.setattr(cli, "_get_existing_vm_status", lambda vm_id: "running")
     monkeypatch.setattr(guest_setup, "host_git_config", lambda project_root=None: None)
     monkeypatch.setattr(cli, "_stop_vm_if_last_session", lambda vm_id, *, stop_on_exit: None)
@@ -618,7 +731,7 @@ def test_manifest_run_user() -> None:
                 "rootfs": "rootfs.ext4",
                 "sbx": {"agent": "codex"},
             },
-            "does not match configured agent",
+            "obsolete field.*sbx.agent",
         ),
         (
             {
@@ -715,8 +828,9 @@ def test_install_git_config_for_root_and_user(
     guest_setup.install_git_config("vm1", "agent", "[user]\n", run_capture=fake_run_capture)
     guest_setup.install_git_config("vm1", "agent", None, run_capture=fake_run_capture)
 
-    assert "/root/.gitconfig" in commands[0][-1]
-    assert "/home/agent/.gitconfig" in commands[1][-1]
+    assert "getent passwd root" in commands[0][-1]
+    assert "getent passwd agent" in commands[1][-1]
+    assert '"$home/.gitconfig"' in commands[0][-1]
     assert len(commands) == 2
 
 
@@ -732,9 +846,26 @@ def test_prepare_run_user_success_and_failure(
 
     monkeypatch.setattr(cli.runtime, "run_capture", fake_ok)
     guest_setup.prepare_run_user("vm1", "agent", run_capture=fake_ok)
-    assert "getent hosts" in captured["argv"][-1]
-    assert "127.0.1.1" in captured["argv"][-1]
-    assert ".ssh .pi .codex .claude .claude.json" in captured["argv"][-1]
+    script = captured["argv"][-1]
+    assert "getent hosts" in script
+    assert "127.0.1.1" in script
+    assert ".ssh .pi .codex .claude .claude.json" in script
+    assert "/var/lib/sbx/run-user" not in script
+    assert "useradd -m -U" in script
+    assert "visudo -cf" in script
+    assert 'chown -R agent:"$group" "$home"' not in script
+    assert ".npmrc" not in script
+    assert ".nodejs" not in script
+    assert (
+        subprocess.run(
+            ["bash", "-n"], input=shlex.split(script)[2], text=True, check=False
+        ).returncode
+        == 0
+    )
+
+    captured.clear()
+    guest_setup.prepare_run_user("vm1", "root", run_capture=fake_ok)
+    assert captured == {}
 
     monkeypatch.setattr(cli.runtime, "run_capture", lambda argv, **kwargs: None)
     with pytest.raises(cli.ConfigError, match="ssh command not found"):
@@ -764,6 +895,7 @@ def test_attach_commands(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "-t" in commands[0]
     assert "cd /workspace" in commands[0][-1]
     assert "exec pi" in commands[0][-1]
+    assert "$HOME/.nodejs/bin" not in commands[0][-1]
     assert "sudo -iu agent" in commands[1][-1]
 
 
@@ -787,6 +919,8 @@ def test_sync_guest_clock_sets_host_time_and_timezone(monkeypatch: pytest.Monkey
 
 def test_post_start_actions_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[str, object]] = []
+    project = {"project_root": "/project", "config_path": "/project/.sbx.toml"}
+    vm_metadata.claim_vm("vm1", project, "agent", created=True)
     monkeypatch.setattr(
         cli.network, "expose_auth_port", lambda *args: calls.append(("port", args)) or 0
     )
@@ -809,54 +943,62 @@ def test_post_start_actions_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.setattr(
         guest_setup,
+        "install_runtime_tools",
+        lambda *args, **kwargs: calls.append(("install", args)),
+    )
+    monkeypatch.setattr(
+        guest_setup,
         "install_git_config",
         lambda *args, **kwargs: calls.append(("git", args)),
     )
     monkeypatch.setattr(
         guest_setup,
+        "ensure_rootless_docker",
+        lambda *args, **kwargs: calls.append(("docker", args)),
+    )
+    monkeypatch.setattr(
+        guest_setup,
+        "command_path",
+        lambda *args, **kwargs: calls.append(("command", args)) or "/home/agent/.local/bin/pi",
+    )
+    monkeypatch.setattr(
+        guest_setup,
         "attach",
-        lambda *args, **kwargs: calls.append(("user" if kwargs.get("user") else "root", args)) or 0,
+        lambda *args, **kwargs: calls.append(("user", args)) or 0,
     )
 
-    assert (
-        cli._post_start_actions(
-            vm_name="vm1",
-            command="pi",
-            attach=False,
-            run_user=None,
-            auth_port=True,
-            auth_host_port=1,
-            auth_guest_port=2,
-            stop_on_exit=True,
-        )
-        == 0
-    )
-    assert calls == [("clock", ("vm1",)), ("port", ("vm1", 1, 2))]
-
-    calls.clear()
     assert (
         cli._post_start_actions(
             vm_name="vm1",
             command="pi",
             attach=True,
             run_user="agent",
-            auth_port=False,
+            auth_port=True,
             auth_host_port=1,
             auth_guest_port=2,
             stop_on_exit=True,
             git_config_text="git",
+            provision=True,
+            runtime_install=["pi"],
+            copy_initial_state=True,
+            agent_name="pi",
         )
         == 0
     )
     assert [name for name, _ in calls] == [
         "clock",
-        "register",
+        "port",
         "prepare",
+        "install",
         "git",
+        "docker",
+        "command",
+        "register",
         "user",
         "unregister",
         "stop",
     ]
+    assert vm_metadata.load_vm("vm1")["provisioned"] is True
 
 
 def test_tunnel_and_session_state(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1380,7 +1522,7 @@ def test_local_image_without_launch_command_uses_agent_fallback(
     fake_smolvm_sdk: dict[str, object],
 ) -> None:
     captured: dict[str, object] = {}
-    manifest = {"kernel": "vmlinux.bin", "rootfs": "rootfs.ext4", "sbx": {"agent": "pi"}}
+    manifest = {"kernel": "vmlinux.bin", "rootfs": "rootfs.ext4", "sbx": {}}
     monkeypatch.setattr(cli, "_post_start_actions", lambda **kwargs: captured.update(kwargs) or 0)
     args = type("Args", (), {"name": None, "memory": 1024, "cpus": None})()
 
@@ -1416,7 +1558,7 @@ def test_local_image_configures_cpus(
     local_image_dir: Path,
     fake_smolvm_sdk: dict[str, object],
 ) -> None:
-    manifest = {"kernel": "vmlinux.bin", "rootfs": "rootfs.ext4", "sbx": {"agent": "pi"}}
+    manifest = {"kernel": "vmlinux.bin", "rootfs": "rootfs.ext4", "sbx": {}}
     monkeypatch.setattr(cli, "_post_start_actions", lambda **kwargs: 0)
     args = type("Args", (), {"name": None, "memory": 1024, "cpus": 3})()
 
@@ -1450,7 +1592,7 @@ def test_local_image_configures_disk_size_and_growth(
     local_image_dir: Path,
     fake_smolvm_sdk: dict[str, object],
 ) -> None:
-    manifest = {"kernel": "vmlinux.bin", "rootfs": "rootfs.ext4", "sbx": {"agent": "pi"}}
+    manifest = {"kernel": "vmlinux.bin", "rootfs": "rootfs.ext4", "sbx": {}}
     monkeypatch.setattr(cli, "_post_start_actions", lambda **kwargs: 0)
     args = type("Args", (), {"name": None, "memory": 1024, "cpus": None, "disk_size": None})()
 
@@ -1488,7 +1630,7 @@ def test_local_image_rejects_disk_size_smaller_than_rootfs(
     rootfs = local_image_dir / "rootfs.ext4"
     with rootfs.open("wb") as fh:
         fh.truncate(80 * 1024 * 1024)
-    manifest = {"kernel": "vmlinux.bin", "rootfs": "rootfs.ext4", "sbx": {"agent": "pi"}}
+    manifest = {"kernel": "vmlinux.bin", "rootfs": "rootfs.ext4", "sbx": {}}
     args = type("Args", (), {"name": None, "memory": 1024, "cpus": None, "disk_size": 10})()
 
     with pytest.raises(cli.ConfigError) as excinfo:
@@ -1524,7 +1666,7 @@ def test_local_image_qcow2_disk_size_does_not_request_filesystem_growth(
     fake_smolvm_sdk: dict[str, object],
 ) -> None:
     (local_image_dir / "rootfs.qcow2").write_text("rootfs", encoding="utf-8")
-    manifest = {"kernel": "vmlinux.bin", "rootfs": "rootfs.qcow2", "sbx": {"agent": "pi"}}
+    manifest = {"kernel": "vmlinux.bin", "rootfs": "rootfs.qcow2", "sbx": {}}
     monkeypatch.setattr(cli, "_post_start_actions", lambda **kwargs: 0)
     args = type("Args", (), {"name": None, "memory": 1024, "cpus": None, "disk_size": 40960})()
 
@@ -1713,3 +1855,246 @@ def test_network_auth_port_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     args = type("Args", (), {"name": "vm1", "host_port": 1, "guest_port": 2, "replace": True})()
     assert cli.network.cmd_auth_port(args) == ("vm1", 1, 2, True)
+
+
+def test_vm_metadata_claim_is_per_vm_atomic_and_immutable(tmp_path: Path) -> None:
+    project = {"project_root": str(tmp_path), "config_path": str(tmp_path / ".sbx.toml")}
+
+    with pytest.raises(cli.ConfigError, match="no trusted sbx runtime identity"):
+        vm_metadata.claim_vm("vm1", project, "agent", created=False)
+
+    claimed = vm_metadata.claim_vm("vm1", project, "agent", created=True)
+
+    assert claimed["run_user"] == "agent"
+    assert claimed["provisioned"] is False
+    assert vm_metadata.metadata_path("vm1").stat().st_mode & 0o777 == 0o600
+    assert vm_metadata.SBX_VMS_DIR.stat().st_mode & 0o777 == 0o700
+    with pytest.raises(cli.ConfigError, match="recreate"):
+        vm_metadata.claim_vm("vm1", project, "other", created=False)
+
+    vm_metadata.mark_provisioned("vm1")
+    vm_metadata.claim_vm("vm1", project, "agent", created=False)
+    assert vm_metadata.load_vm("vm1")["provisioned"] is True
+
+
+def test_root_shell_requires_host_identity(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "_get_existing_vm_status", lambda name: "running")
+
+    assert cli.main(["shell", "vm1", "--root"]) == 2
+    assert "no trusted sbx runtime identity" in capsys.readouterr().err
+
+
+def test_runtime_install_is_strict_and_cli_replaces_config() -> None:
+    configured = {"sbx": {"runtime_install": ["pi", "specify"]}}
+    assert cli._runtime_install(SimpleNamespace(runtime_install=None), configured) == [
+        "pi",
+        "specify",
+    ]
+    assert cli._runtime_install(SimpleNamespace(runtime_install=[]), configured) == []
+    assert cli._runtime_install(SimpleNamespace(runtime_install=["specify"]), configured) == [
+        "specify"
+    ]
+    assert cli._cfg_agent({"sbx": {"agent": "codex", "runtime_install": ["specify"]}}) == "codex"
+
+    for value in ("pi", ["pi", "pi"], ["specify", "specify"], ["unknown"]):
+        with pytest.raises(cli.ConfigError):
+            cli._runtime_install(
+                SimpleNamespace(runtime_install=None), {"sbx": {"runtime_install": value}}
+            )
+    with pytest.raises(cli.ConfigError, match="positive integer"):
+        cli._install_timeout(0)
+
+
+def test_empty_runtime_install_does_nothing() -> None:
+    calls: list[list[str]] = []
+
+    guest_setup.install_runtime_tools(
+        "vm1",
+        "agent",
+        [],
+        600,
+        run_capture=lambda argv: calls.append(argv),
+        ssh=lambda vm_id: ["ssh", vm_id],
+    )
+
+    assert calls == []
+
+
+@pytest.mark.parametrize("user", ["agent", "root"])
+def test_runtime_pi_install_uses_explicit_user_prefix_without_npm_config(user: str) -> None:
+    calls: list[list[str]] = []
+    results = iter(
+        [
+            subprocess.CompletedProcess([], 127, "", ""),
+            subprocess.CompletedProcess([], 0, "installed\n", ""),
+        ]
+    )
+
+    def run_capture(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return next(results)
+
+    guest_setup.install_runtime_tools(
+        "vm1",
+        user,
+        ["pi"],
+        321,
+        run_capture=run_capture,
+        ssh=lambda vm_id: ["ssh", vm_id],
+    )
+
+    assert len(calls) == 2
+    assert 'export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"' in calls[0][-1]
+    install_script = calls[1][-1]
+    assert f"sudo -iu {user}" in install_script
+    assert "321s npm install --global" in install_script
+    assert '--prefix "$HOME/.local"' in install_script
+    assert "@earendil-works/pi-coding-agent" in install_script
+    assert "NPM_CONFIG_USERCONFIG=/dev/stdin" in install_script
+    assert "NPM_CONFIG_GLOBALCONFIG=/dev/null" in install_script
+    assert "@earendil-works/pi-coding-agent </dev/null" in install_script
+    assert "if [ -r /etc/profile.d/smolvm_env.sh ]" in install_script
+    assert ".npmrc" not in install_script
+    assert "npm config" not in install_script
+
+
+def test_runtime_specify_install_uses_uv_as_selected_user() -> None:
+    calls: list[list[str]] = []
+    results = iter(
+        [
+            subprocess.CompletedProcess([], 127, "", ""),
+            subprocess.CompletedProcess([], 0, "installed\n", ""),
+        ]
+    )
+
+    def run_capture(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return next(results)
+
+    guest_setup.install_runtime_tools(
+        "vm1",
+        "developer",
+        ["specify"],
+        123,
+        run_capture=run_capture,
+        ssh=lambda vm_id: ["ssh", vm_id],
+    )
+
+    assert len(calls) == 2
+    install_script = calls[1][-1]
+    assert "sudo -iu developer" in install_script
+    assert "123s uv tool install specify-cli" in install_script
+    assert "--from git+https://github.com/github/spec-kit.git" in install_script
+    assert "NPM_CONFIG" not in install_script
+    assert "chown" not in install_script
+
+
+@pytest.mark.parametrize("tool", ["pi", "specify"])
+def test_runtime_install_preserves_existing_command(tool: str) -> None:
+    calls: list[list[str]] = []
+
+    def run_capture(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, f"/custom/bin/{tool}\n", "")
+
+    guest_setup.install_runtime_tools(
+        "vm1",
+        "agent",
+        [tool],
+        600,
+        run_capture=run_capture,
+        ssh=lambda vm_id: ["ssh", vm_id],
+    )
+
+    assert len(calls) == 1
+    assert "npm install" not in calls[0][-1]
+    assert "uv tool install" not in calls[0][-1]
+
+
+def test_runtime_specify_install_failure_is_actionable() -> None:
+    results = iter(
+        [
+            subprocess.CompletedProcess([], 127, "", ""),
+            subprocess.CompletedProcess([], 127, "", "timeout: failed to run command 'uv'"),
+        ]
+    )
+
+    with pytest.raises(cli.ConfigError, match="failed to install 'specify'.*failed to run"):
+        guest_setup.install_runtime_tools(
+            "vm1",
+            "agent",
+            ["specify"],
+            600,
+            run_capture=lambda argv: next(results),
+            ssh=lambda vm_id: ["ssh", vm_id],
+        )
+
+
+@pytest.mark.parametrize("tool", ["pi", "specify"])
+def test_cli_runtime_install_implies_existing_vm_reprovision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tool: str
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('[sbx]\nname = "vm1"\n', encoding="utf-8")
+    project = {"project_root": str(tmp_path), "config_path": str(config)}
+    user = guest_setup.host_username()
+    vm_metadata.claim_vm("vm1", project, user, created=True)
+    vm_metadata.mark_provisioned("vm1")
+    monkeypatch.setattr(cli, "_get_existing_vm_status", lambda vm_id: "running")
+    monkeypatch.setattr(guest_setup, "host_git_config", lambda project_root=None: None)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(cli, "_post_start_actions", lambda **kwargs: captured.update(kwargs) or 0)
+
+    assert (
+        cli.main(
+            [
+                "--config",
+                str(config),
+                "run",
+                "--no-attach",
+                "--runtime-install",
+                tool,
+            ]
+        )
+        == 0
+    )
+    assert captured["provision"] is True
+    assert captured["was_provisioned"] is True
+    assert captured["runtime_install"] == [tool]
+
+
+def test_failed_reprovision_preserves_success_and_prints_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project = {"project_root": str(tmp_path), "config_path": str(tmp_path / ".sbx.toml")}
+    vm_metadata.claim_vm("vm1", project, "agent", created=True)
+    vm_metadata.mark_provisioned("vm1")
+    monkeypatch.setattr(guest_setup, "sync_guest_clock", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        guest_setup,
+        "prepare_run_user",
+        lambda *args, **kwargs: (_ for _ in ()).throw(cli.ConfigError("boom")),
+    )
+
+    rc = cli._post_start_actions(
+        vm_name="vm1",
+        command="pi",
+        attach=False,
+        run_user="agent",
+        auth_port=False,
+        stop_on_exit=True,
+        provision=True,
+        was_provisioned=True,
+    )
+
+    assert rc == 1
+    assert vm_metadata.load_vm("vm1")["provisioned"] is True
+    error = capsys.readouterr().err
+    assert "previous successful provisioning state remains recorded" in error
+    assert "sbx shell vm1 --root" in error
+    assert "sbx run vm1 --reprovision --no-attach" in error
+    assert "sbx stop vm1" in error

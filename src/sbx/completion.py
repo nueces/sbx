@@ -36,6 +36,7 @@ START_OPTIONS = (
     "--keep-running",
     "--boot-timeout",
     "--install-timeout",
+    "--runtime-install",
     "--write-config",
     "--json",
     "--help",
@@ -45,7 +46,7 @@ LS_OPTIONS = ("--running", "--json", "--help")
 RM_OPTIONS = ("--force", "--help")
 DOCTOR_OPTIONS = ("--fix", "--help")
 STOP_OPTIONS = ("--help",)
-RUN_OPTIONS = START_OPTIONS
+RUN_OPTIONS = (*START_OPTIONS, "--reprovision")
 FORWARD_OPTIONS = ("--name", "--help")
 AUTH_PORT_OPTIONS = ("--guest-port", "--host-port", "--replace", "--help")
 NETWORK_STATUS_OPTIONS = ("--host-port", "--json", "--help")
@@ -121,6 +122,10 @@ _sbx_complete() {{
     case "$prev" in
         --agent)
             COMPREPLY=( $(compgen -W "{agents}" -- "$cur") )
+            return 0
+            ;;
+        --runtime-install)
+            COMPREPLY=( $(compgen -W "pi specify" -- "$cur") )
             return 0
             ;;
         --config|--image|--mount|--project-path)

@@ -7,16 +7,13 @@ Track deliberate use of internal APIs, generated-file assumptions, or other inte
 Used by `src/sbx/image/build_debian.py`:
 
 ```python
-class SbxImageBuilder(ImageBuilder):
-    def _default_init_script(self) -> str:
-        return self._base_init_script(custom_commands="...")
-
+ImageBuilder(...)._default_init_script()
 DockerRootfsBuilder(...)._build_rootfs(...)
 ```
 
-Why: SmolVM 0.0.28 has no public rootfs-only operation. `build_debian_ssh_key()` injects the guest agent and downloads a kernel; `DockerRootfsBuilder.build_boot_image()` also downloads a kernel. sbx needs only the generated init plus Docker export/ext4 conversion because it builds its own kernel and uses SSH.
+Why: SmolVM 0.0.28 has no public rootfs-only operation. `build_debian_ssh_key()` injects the guest agent and downloads a kernel; `DockerRootfsBuilder.build_boot_image()` also downloads a kernel. sbx needs only Docker export/ext4 conversion because it builds its own kernel and uses SSH.
 
-Fragility: `_base_init_script()` and `_build_rootfs()` are private SmolVM internals and may change. The dependency remains pinned to `smolvm==0.0.28`, and focused tests cover the call boundary.
+Fragility: `_default_init_script()` and `_build_rootfs()` are private SmolVM internals and may change. The dependency remains pinned to `smolvm==0.0.28`, and focused tests cover the call boundary.
 
 Exit: use a public SmolVM rootfs-only API that accepts caller-owned Dockerfile/context and init commands without resolving a kernel or injecting a guest agent.
 
