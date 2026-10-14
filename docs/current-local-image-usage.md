@@ -23,7 +23,7 @@ The local agent-neutral Debian image is built with:
 sbx image build
 ```
 
-The build recipe combines packaged Debian and Docker fragments, plus an optional custom tooling fragment.
+The build recipe combines packaged Debian and Docker fragments, plus an optional custom tooling fragment. On Linux x86_64, `--nested-kvm` inserts the packaged nested-KVM userspace fragment and appends its amd64 kernel fragment; the default composition remains unchanged.
 
 The build command:
 
@@ -33,7 +33,7 @@ The build command:
 4. downloads the kernel recipe and checker from immutable commits, verifies each SHA-256, and builds a Docker-capable QEMU kernel from SHA-256-verified Linux source;
 5. writes `smolvm-image.json` next to the generated kernel and rootfs.
 
-The resulting rootfs contains Node.js, npm, uv, and Docker, but no Pi or Specify package. Local-image runtime tools are installed only when explicitly requested during VM provisioning.
+The resulting rootfs contains Node.js, npm, uv, and Docker, but no Pi or Specify package. Local-image runtime tools are installed only when explicitly requested during VM provisioning. Nested builds additionally contain inner-QEMU tools and `/usr/local/bin/sbx-prepare-kvm`, and advertise `features: ["docker", "nested-kvm"]`.
 
 ## Manifest
 

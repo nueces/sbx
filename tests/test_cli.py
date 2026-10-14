@@ -23,6 +23,7 @@ def isolated_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(guest_setup, "sync_guest_clock", lambda *args, **kwargs: None)
     monkeypatch.setattr(guest_setup, "host_username", lambda: "hostuser")
     monkeypatch.setattr(guest_setup, "prepare_run_user", lambda *args, **kwargs: None)
+    monkeypatch.setattr(guest_setup, "ensure_kvm_access", lambda *args, **kwargs: None)
     monkeypatch.setattr(guest_setup, "install_runtime_tools", lambda *args, **kwargs: None)
     monkeypatch.setattr(guest_setup, "ensure_rootless_docker", lambda *args, **kwargs: None)
     monkeypatch.setattr(guest_setup, "install_git_config", lambda *args, **kwargs: None)
@@ -1843,7 +1844,7 @@ def test_image_list_lists_local_images(
     plain_image.mkdir()
     invalid_image.mkdir()
     (docker_image / "smolvm-image.json").write_text(
-        '{"name":"legacy-docker","kernel":"vmlinux-docker.bin","rootfs":"rootfs.ext4","sbx":{"agent":"pi","features":["docker"]}}',
+        '{"name":"legacy-docker","kernel":"vmlinux-docker.bin","rootfs":"rootfs.ext4","sbx":{"agent":"pi","features":["docker","nested-kvm"]}}',
         encoding="utf-8",
     )
     (plain_image / "smolvm-image.json").write_text(
@@ -1858,7 +1859,7 @@ def test_image_list_lists_local_images(
     assert "NAME" in out
     assert "FEATURES" in out
     assert "legacy-docker" in out
-    assert "docker" in out
+    assert "docker,nested-kvm" in out
     assert "legacy-plain" in out
     assert "invalid" not in out
 
@@ -1870,7 +1871,7 @@ def test_image_ls_json(
     image = tmp_path / ".smolvm" / "images" / "legacy-docker"
     image.mkdir(parents=True)
     (image / "smolvm-image.json").write_text(
-        '{"kernel":"vmlinux-docker.bin","rootfs":"rootfs.ext4","sbx":{"agent":"pi","features":["docker"]}}',
+        '{"kernel":"vmlinux-docker.bin","rootfs":"rootfs.ext4","sbx":{"agent":"pi","features":["docker","nested-kvm"]}}',
         encoding="utf-8",
     )
 
@@ -1880,7 +1881,7 @@ def test_image_ls_json(
     assert payload == [
         {
             "agent": "pi",
-            "features": ["docker"],
+            "features": ["docker", "nested-kvm"],
             "kernel": "vmlinux-docker.bin",
             "name": "legacy-docker",
             "path": str(image),

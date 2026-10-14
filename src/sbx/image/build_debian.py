@@ -9,6 +9,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import shlex
 import shutil
 import subprocess
@@ -26,8 +27,18 @@ from sbx.image import kernel_inputs
 RESOURCE_PACKAGE = "sbx.image.resources"
 DEFAULT_BASE_CONTAINERFILE = Path("Containers") / "Debian" / "Base.Containerfile"
 DEFAULT_DOCKER_CONTAINERFILE = Path("Containers") / "Debian" / "fragments" / "Docker.Containerfile"
+DEFAULT_NESTED_KVM_CONTAINERFILE = (
+    Path("Containers") / "Debian" / "fragments" / "NestedKvm.Containerfile"
+)
 DEFAULT_DOCKER_KERNEL_FRAGMENT = Path("kernel") / "docker.config.fragment"
+DEFAULT_NESTED_KVM_KERNEL_FRAGMENT = Path("kernel") / "nested-kvm.amd64.config.fragment"
 DEFAULT_KERNEL_BUILDER_DOCKERFILE = Path("Containers") / "Build" / "Kernel.Containerfile"
+NESTED_KVM_CONFIG = (
+    "CONFIG_VIRTUALIZATION",
+    "CONFIG_KVM",
+    "CONFIG_KVM_INTEL",
+    "CONFIG_KVM_AMD",
+)
 KERNEL_NAME = "vmlinux.bin"
 BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init"
 
@@ -43,6 +54,8 @@ def _compose_containerfiles(
     docker_containerfile: Path,
     agent_containerfile: Path | None,
     output: Path,
+    *,
+    nested_kvm_containerfile: Path | None = None,
 ) -> None:
     base_containerfile = base_containerfile.expanduser().resolve()
     if not base_containerfile.is_file():
@@ -55,6 +68,14 @@ def _compose_containerfiles(
     content = base_containerfile.read_text(encoding="utf-8").rstrip()
     content += "\n\n# ---- Docker layer ----\n"
     content += docker_containerfile.read_text(encoding="utf-8").lstrip().rstrip()
+    if nested_kvm_containerfile is not None:
+        nested_kvm_containerfile = nested_kvm_containerfile.expanduser().resolve()
+        if not nested_kvm_containerfile.is_file():
+            raise FileNotFoundError(
+                f"Nested KVM Containerfile not found: {nested_kvm_containerfile}"
+            )
+        content += "\n\n# ---- Nested KVM layer ----\n"
+        content += nested_kvm_containerfile.read_text(encoding="utf-8").lstrip().rstrip()
     if agent_containerfile is not None:
         agent_containerfile = agent_containerfile.expanduser().resolve()
         if not agent_containerfile.is_file():
@@ -213,14 +234,44 @@ def _raise_if_linux_digest_mismatch(work_dir: Path) -> None:
         )
 
 
-def _build_docker_kernel(*, image_dir: Path, arch: str, resources_dir: Path | None = None) -> Path:
+def _verify_nested_kvm_config(config: Path) -> None:
+    values = {}
+    for line in config.read_text(encoding="utf-8").splitlines():
+        if line.startswith("CONFIG_") and "=" in line:
+            name, value = line.split("=", 1)
+            values[name] = value
+    invalid = [
+        f"{name}=y (got {values.get(name, 'unset')})"
+        for name in NESTED_KVM_CONFIG
+        if values.get(name) != "y"
+    ]
+    if invalid:
+        raise RuntimeError("nested KVM kernel config validation failed: " + ", ".join(invalid))
+
+
+def _build_docker_kernel(
+    *,
+    image_dir: Path,
+    arch: str,
+    nested_kvm: bool = False,
+    resources_dir: Path | None = None,
+) -> Path:
     if resources_dir is None:
         with _packaged_resources() as packaged:
-            return _build_docker_kernel(image_dir=image_dir, arch=arch, resources_dir=packaged)
+            return _build_docker_kernel(
+                image_dir=image_dir,
+                arch=arch,
+                nested_kvm=nested_kvm,
+                resources_dir=packaged,
+            )
 
     docker_fragment = resources_dir / DEFAULT_DOCKER_KERNEL_FRAGMENT
     builder_dockerfile = resources_dir / DEFAULT_KERNEL_BUILDER_DOCKERFILE
-    for path in (docker_fragment, builder_dockerfile):
+    required_resources = [docker_fragment, builder_dockerfile]
+    nested_kvm_fragment = resources_dir / DEFAULT_NESTED_KVM_KERNEL_FRAGMENT
+    if nested_kvm:
+        required_resources.append(nested_kvm_fragment)
+    for path in required_resources:
         if not path.is_file():
             raise FileNotFoundError(f"Kernel build resource not found: {path}")
 
@@ -229,12 +280,17 @@ def _build_docker_kernel(*, image_dir: Path, arch: str, resources_dir: Path | No
         for name, source in kernel_inputs.KERNEL_INPUTS.items():
             kernel_inputs.download_verified(source, work_dir / name)
         config = work_dir / "config.fragment"
-        config.write_text(
+        additions = (
             config.read_text(encoding="utf-8").rstrip()
             + "\n\n# ---- sbx Docker additions ----\n"
-            + docker_fragment.read_text(encoding="utf-8").lstrip(),
-            encoding="utf-8",
+            + docker_fragment.read_text(encoding="utf-8").lstrip().rstrip()
         )
+        if nested_kvm:
+            additions += (
+                "\n\n# ---- sbx nested KVM additions ----\n"
+                + nested_kvm_fragment.read_text(encoding="utf-8").lstrip().rstrip()
+            )
+        config.write_text(additions + "\n", encoding="utf-8")
         builder_tag = _build_kernel_builder_image(builder_dockerfile, resources_dir)
         bind_mount_owner = _docker_bind_mount_owner()
         out_dir = work_dir / "out"
@@ -261,6 +317,8 @@ def _build_docker_kernel(*, image_dir: Path, arch: str, resources_dir: Path | No
                 ],
                 check=True,
             )
+            if nested_kvm:
+                _verify_nested_kvm_config(out_dir / f"vmlinux-{arch}.config")
         finally:
             _docker_run_kernel_builder(
                 builder_tag,
@@ -363,6 +421,14 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         help="Optional custom build-time tooling Containerfile.",
     )
     parser.add_argument(
+        "--nested-kvm",
+        action="store_true",
+        help=(
+            "Build an amd64 image for nested KVM (Linux x86_64 only; "
+            "cannot be combined with --containerfile)."
+        ),
+    )
+    parser.add_argument(
         "--rootfs-size-mb",
         type=int,
         default=20480,
@@ -384,11 +450,27 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 def main_from_args(args: argparse.Namespace) -> int:
     builder = ImageBuilder(cache_dir=args.cache_dir.expanduser() if args.cache_dir else None)
     base_image = args.base_image
-    arch = "amd64" if builder._host_arch_key() == "x86_64" else "arm64"
+    host_arch = builder._host_arch_key()
+    arch = "amd64" if host_arch == "x86_64" else "arm64"
+    if args.nested_kvm and (platform.system() != "Linux" or host_arch != "x86_64"):
+        print(
+            "sbx image build: --nested-kvm requires a Linux x86_64 host "
+            f"(detected {platform.system()} {host_arch})",
+            file=sys.stderr,
+        )
+        return 2
+    if args.nested_kvm and args.containerfile is not None:
+        print(
+            "sbx image build: --nested-kvm cannot be combined with --containerfile; "
+            "use the packaged composition or fragment overrides",
+            file=sys.stderr,
+        )
+        return 2
 
     selected_base_containerfile: Path | None = None
     selected_agent_containerfile: Path | None = None
     selected_docker_containerfile: Path | None = None
+    selected_nested_kvm_containerfile: Path | None = None
 
     try:
         with _packaged_resources() as resources_dir:
@@ -402,11 +484,16 @@ def main_from_args(args: argparse.Namespace) -> int:
                     )
                     selected_agent_containerfile = args.agent_containerfile
                     selected_docker_containerfile = resources_dir / DEFAULT_DOCKER_CONTAINERFILE
+                    if args.nested_kvm:
+                        selected_nested_kvm_containerfile = (
+                            resources_dir / DEFAULT_NESTED_KVM_CONTAINERFILE
+                        )
                     _compose_containerfiles(
                         selected_base_containerfile,
                         selected_docker_containerfile,
                         selected_agent_containerfile,
                         combined_containerfile,
+                        nested_kvm_containerfile=selected_nested_kvm_containerfile,
                     )
                     base_image = _build_containerfile_base_image(
                         args.base_image, combined_containerfile, context_dir=resources_dir
@@ -420,21 +507,25 @@ def main_from_args(args: argparse.Namespace) -> int:
                 arch=arch,
             )
             kernel_path = _build_docker_kernel(
-                image_dir=rootfs_path.parent, arch=arch, resources_dir=resources_dir
+                image_dir=rootfs_path.parent,
+                arch=arch,
+                nested_kvm=args.nested_kvm,
+                resources_dir=resources_dir,
             )
     except Exception as exc:  # noqa: BLE001 - keep the CLI error friendly.
         print(f"sbx image build: failed to build image: {exc}", file=sys.stderr)
         return 1
 
     manifest_path = rootfs_path.parent / "smolvm-image.json"
+    features = [] if args.containerfile is not None else ["docker"]
+    if args.nested_kvm:
+        features.append("nested-kvm")
     manifest = {
         "name": args.name,
         "kernel": kernel_path.name,
         "rootfs": rootfs_path.name,
         "boot_args": BOOT_ARGS,
-        "sbx": {
-            "features": [] if args.containerfile is not None else ["docker"],
-        },
+        "sbx": {"features": features},
     }
     manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -449,6 +540,10 @@ def main_from_args(args: argparse.Namespace) -> int:
         "base_containerfile": None if uses_custom else str(selected_base_containerfile),
         "agent_containerfile": None if uses_custom else str(selected_agent_containerfile),
         "docker_containerfile": None if uses_custom else str(selected_docker_containerfile),
+        "nested_kvm_containerfile": (
+            str(selected_nested_kvm_containerfile) if selected_nested_kvm_containerfile else None
+        ),
+        "nested_kvm": args.nested_kvm,
         "kernel_path": str(kernel_path),
         "rootfs_path": str(rootfs_path),
         "manifest_path": str(manifest_path),
@@ -467,6 +562,8 @@ def main_from_args(args: argparse.Namespace) -> int:
     print(f"  rootfs:      {payload['rootfs_path']}")
     print(f"  manifest:    {payload['manifest_path']}")
     print(f"  boot args:   {payload['boot_args']}")
+    if args.nested_kvm:
+        print("  nested KVM:  enabled")
     print()
     print("sbx config:")
     print("  [sbx]")

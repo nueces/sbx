@@ -152,6 +152,64 @@ Important: `copy_host_credentials = false` prevents host credential/config copyi
 sbx run
 ```
 
+## Nested KVM images
+
+Nested KVM is an optional Linux x86_64 image capability. It is not present in the default curated image. The physical host must have virtualization enabled in firmware, a working `/dev/kvm`, and nested virtualization enabled in the active vendor module.
+
+Check the physical host before creating the outer VM:
+
+```bash
+# AMD; expected value: 1 or Y
+cat /sys/module/kvm_amd/parameters/nested
+
+# Intel; expected value: 1 or Y
+cat /sys/module/kvm_intel/parameters/nested
+
+test -c /dev/kvm
+```
+
+Only one vendor parameter exists on a given host. `sbx` does not change firmware settings, reload KVM modules, or alter host module parameters.
+
+Build a clearly named image:
+
+```bash
+sbx image build --name sbx-nested-kvm --nested-kvm
+```
+
+The flag is supported only on Linux x86_64 and cannot be combined with the fully composed `--containerfile` override. The packaged base/agent fragment overrides remain available. A nested image adds `qemu-system-x86`, `qemu-utils`, `e2fsprogs`, the guest KVM drivers for Intel and AMD, and an `sbx-prepare-kvm` helper. Its manifest advertises:
+
+```json
+"features": ["docker", "nested-kvm"]
+```
+
+Select the new image in `.sbx.toml`, then recreate the VM so it receives the new kernel and rootfs:
+
+```toml
+[sbx]
+image = "~/.smolvm/images/sbx-nested-kvm"
+```
+
+```bash
+sbx recreate --force
+```
+
+Inside the outer VM, verify CPU exposure, the device, and runtime-user access:
+
+```bash
+grep -E -m1 -o 'vmx|svm' /proc/cpuinfo
+test -c /dev/kvm
+test -r /dev/kvm -a -w /dev/kvm
+id -nG | grep -w kvm
+stat -c '%U:%G %a' /dev/kvm  # root:kvm 660
+qemu-system-x86_64 --version
+```
+
+A successful device check is necessary but not a complete test: boot an inner VM with `-accel kvm -cpu host` and verify that it executes a command. The inner `/dev/kvm` is created by the outer guest kernel; it is not the physical host device bind-mounted into the VM.
+
+If startup reports that `/dev/kvm` is unavailable, fix physical-host nesting and `vmx`/`svm` exposure, then recreate or restart the outer VM. Do not use `mknod`; a device node without an initialized KVM driver cannot run guests.
+
+Access to `/dev/kvm` exposes the KVM ioctl interface to the configured runtime user and exercises virtualization code in both guest and physical-host kernels. Keep the host kernel, guest image, QEMU, and CPU microcode patched. Bound inner VM CPU, memory, and disk; avoid mounting credentials, Docker sockets, broad home directories, or sensitive outer-guest paths; and delete disposable inner/outer VMs and test state after use.
+
 ## Docker guest usage
 
 ### Host

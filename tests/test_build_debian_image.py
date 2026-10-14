@@ -194,20 +194,44 @@ def test_rootless_docker_helper_detaches_and_waits_for_readiness(tmp_path: Path)
     assert (state_dir / "docker-calls").read_text(encoding="utf-8").count("call") == 2
 
 
-def test_compose_containerfiles_includes_docker_between_base_and_agent(tmp_path: Path) -> None:
+def test_compose_containerfiles_includes_optional_nested_kvm_layer(tmp_path: Path) -> None:
     base = tmp_path / "Base.Containerfile"
     docker = tmp_path / "Docker.Containerfile"
+    nested = tmp_path / "NestedKvm.Containerfile"
     agent = tmp_path / "Pi.Containerfile"
     output = tmp_path / "Combined.Containerfile"
     base.write_text("FROM debian AS sbx-base\nRUN echo base\n", encoding="utf-8")
     docker.write_text("RUN echo docker\n", encoding="utf-8")
+    nested.write_text("RUN echo nested\n", encoding="utf-8")
     agent.write_text("FROM sbx-base AS sbx-final\nRUN echo pi\n", encoding="utf-8")
 
     build_debian._compose_containerfiles(base, docker, agent, output)
+    assert "nested" not in output.read_text(encoding="utf-8")
 
+    build_debian._compose_containerfiles(
+        base, docker, agent, output, nested_kvm_containerfile=nested
+    )
     combined = output.read_text(encoding="utf-8")
     assert combined.index("RUN echo base") < combined.index("RUN echo docker")
-    assert combined.index("RUN echo docker") < combined.index("RUN echo pi")
+    assert combined.index("RUN echo docker") < combined.index("RUN echo nested")
+    assert combined.index("RUN echo nested") < combined.index("RUN echo pi")
+
+
+def test_packaged_nested_kvm_resources_are_minimal_and_safe() -> None:
+    with build_debian._packaged_resources() as resources:
+        containerfile = (resources / build_debian.DEFAULT_NESTED_KVM_CONTAINERFILE).read_text()
+        fragment = (resources / build_debian.DEFAULT_NESTED_KVM_KERNEL_FRAGMENT).read_text()
+        helper = (resources / "scripts" / "sbx-prepare-kvm").read_text()
+
+    for package in ("qemu-system-x86", "qemu-utils", "e2fsprogs"):
+        assert package in containerfile
+    assert "sbx-prepare-kvm" in containerfile
+    assert set(fragment.splitlines()) == {f"{name}=y" for name in build_debian.NESTED_KVM_CONFIG}
+    assert "root:kvm" in helper
+    assert "chmod 0660 /dev/kvm" in helper
+    assert "usermod -aG kvm" in helper
+    assert "0666" not in helper
+    assert "mknod" not in helper
 
 
 def test_default_build_always_uses_docker_kernel_and_feature(
@@ -222,6 +246,7 @@ def test_default_build_always_uses_docker_kernel_and_feature(
     assert rc == 0
     assert "# ---- Docker layer ----" in combined[0]
     assert "# ---- Optional tooling layer ----" not in combined[0]
+    assert "Nested KVM layer" not in combined[0]
     rootfs_call = calls["rootfs"]
     assert isinstance(rootfs_call, dict)
     assert rootfs_call["name"] == "sbx"
@@ -231,12 +256,71 @@ def test_default_build_always_uses_docker_kernel_and_feature(
     manifest = json.loads((tmp_path / "sbx" / "smolvm-image.json").read_text())
     assert manifest["kernel"] == "vmlinux.bin"
     assert manifest["sbx"] == {"features": ["docker"]}
+    kernel_call = calls["kernel"]
+    assert isinstance(kernel_call, dict)
+    assert kernel_call["nested_kvm"] is False
     output = capsys.readouterr().out
     assert "kernel:" in output
     assert "sbx run the-quest" in output
     assert f"--image {tmp_path / 'sbx'}" in output
     assert "--runtime-install pi" in output
     assert "--write-config" in output
+    assert "nested KVM:" not in output
+
+
+def test_nested_kvm_build_composes_resources_manifest_and_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    combined, calls = _fake_build(monkeypatch, tmp_path)
+
+    rc = build_debian.main(["--name", "nested", "--nested-kvm", "--json"])
+
+    assert rc == 0
+    assert "# ---- Nested KVM layer ----" in combined[0]
+    assert "qemu-system-x86" in combined[0]
+    kernel_call = calls["kernel"]
+    assert isinstance(kernel_call, dict)
+    assert kernel_call["nested_kvm"] is True
+    manifest = json.loads((tmp_path / "nested" / "smolvm-image.json").read_text())
+    assert manifest["sbx"]["features"] == ["docker", "nested-kvm"]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["nested_kvm"] is True
+    assert payload["nested_kvm_containerfile"].endswith("NestedKvm.Containerfile")
+
+
+def test_nested_kvm_rejects_unsupported_host_before_build(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class ArmBuilder(FakeImageBuilder):
+        def _host_arch_key(self) -> str:
+            return "aarch64"
+
+    monkeypatch.setattr(build_debian, "ImageBuilder", ArmBuilder)
+    monkeypatch.setattr(build_debian.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(
+        build_debian,
+        "_build_containerfile_base_image",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("build must not start")),
+    )
+
+    assert build_debian.main(["--nested-kvm", "--cache-dir", str(tmp_path)]) == 2
+    assert "requires a Linux x86_64 host" in capsys.readouterr().err
+
+
+def test_nested_kvm_rejects_non_linux_and_custom_containerfile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(build_debian.platform, "system", lambda: "Darwin")
+    assert build_debian.main(["--nested-kvm", "--cache-dir", str(tmp_path)]) == 2
+    assert "detected Darwin x86_64" in capsys.readouterr().err
+
+    monkeypatch.setattr(build_debian.platform, "system", lambda: "Linux")
+    custom = tmp_path / "Containerfile"
+    custom.write_text("FROM debian:stable-slim\n", encoding="utf-8")
+    assert build_debian.main(["--nested-kvm", "--containerfile", str(custom)]) == 2
+    assert "cannot be combined with --containerfile" in capsys.readouterr().err
 
 
 def test_custom_containerfile_is_conservative_about_docker_feature(
@@ -387,12 +471,61 @@ def test_build_docker_kernel_uses_only_verified_inputs(
     assert set(downloads) == set(kernel_inputs.KERNEL_INPUTS)
     assert any("/work/build.sh" in command for command in runs)
     assert any("/work/check-config.sh" in command for command in runs)
-    assert runs[-1][-4:] == [
-        "chown",
-        "-R",
-        f"{build_debian.os.getuid()}:{build_debian.os.getgid()}",
-        "/work",
-    ]
+    assert runs[-1][-4:] == ["chown", "-R", f"{os.getuid()}:{os.getgid()}", "/work"]
+
+
+def test_nested_kvm_final_config_validation(tmp_path: Path) -> None:
+    config = tmp_path / "config"
+    config.write_text(
+        "CONFIG_VIRTUALIZATION=y\nCONFIG_KVM=y\nCONFIG_KVM_INTEL=y\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="CONFIG_KVM_AMD=y.*got unset"):
+        build_debian._verify_nested_kvm_config(config)
+
+    config.write_text(
+        "\n".join(f"{name}=y" for name in build_debian.NESTED_KVM_CONFIG),
+        encoding="utf-8",
+    )
+    build_debian._verify_nested_kvm_config(config)
+
+
+def test_nested_kvm_kernel_fragment_failure_preserves_existing_kernel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        kernel_inputs,
+        "download_verified",
+        lambda source, destination: destination.write_text("# verified input\n", encoding="utf-8"),
+    )
+    kernel = tmp_path / "vmlinux.bin"
+    kernel.write_text("old kernel", encoding="utf-8")
+
+    def fake_run(command: list[str], *, check: bool) -> None:
+        if command[:3] == ["docker", "run", "--rm"] and "bash" in command:
+            work_dir = Path(command[command.index("-v") + 1].split(":", 1)[0])
+            fragment = (work_dir / "config.fragment").read_text(encoding="utf-8")
+            assert "CONFIG_KVM_INTEL=y" in fragment
+            assert "CONFIG_KVM_AMD=y" in fragment
+            out = work_dir / "out"
+            out.mkdir()
+            (out / "vmlinux-amd64.image").write_text("new kernel", encoding="utf-8")
+            (out / "vmlinux-amd64.config").write_text(
+                "CONFIG_VIRTUALIZATION=y\nCONFIG_KVM=y\nCONFIG_KVM_INTEL=y\n",
+                encoding="utf-8",
+            )
+        assert check in {True, False}
+
+    monkeypatch.setattr(build_debian.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        build_debian, "_docker_bind_mount_owner", lambda: f"{os.getuid()}:{os.getgid()}"
+    )
+
+    with pytest.raises(RuntimeError, match="CONFIG_KVM_AMD"):
+        build_debian._build_docker_kernel(image_dir=tmp_path, arch="amd64", nested_kvm=True)
+
+    assert kernel.read_text(encoding="utf-8") == "old kernel"
 
 
 def test_kernel_input_mismatch_stops_before_docker(
