@@ -2,7 +2,6 @@ from pathlib import Path
 
 import sbx.network as network
 from sbx import session_state, vm_metadata, vm_state
-from sbx.constants import SBX_VMS_FILE
 from sbx.runtime import ConfigError
 
 
@@ -11,32 +10,25 @@ def doctor_metadata(*, fix: bool) -> int:
         metadata = vm_metadata.load_vm_metadata()
     except ConfigError as exc:
         print(f"sbx metadata: {exc}")
-        if fix and SBX_VMS_FILE.exists():
-            backup = SBX_VMS_FILE.with_suffix(SBX_VMS_FILE.suffix + ".bak")
-            SBX_VMS_FILE.replace(backup)
-            print(f"  fixed: moved corrupt metadata to {backup}")
-            return 0
         return 1
 
     if not metadata:
         return 0
     existing = {str(getattr(vm, "vm_id", "")) for vm in vm_state.smolvm_vms(all_vms=True)}
-    changed = False
     for name, item in list(metadata.items()):
         reason = None
         if name not in existing:
             reason = "VM missing from SmolVM"
+        elif not isinstance(item.get("project_root"), str):
+            reason = "project association missing"
         elif not Path(item["project_root"]).exists():
             reason = f"project path missing: {item['project_root']}"
         if reason is None:
             continue
         print(f"sbx metadata: {name}: {reason}")
         if fix:
-            metadata.pop(name, None)
-            changed = True
+            vm_metadata.remove_vm(name)
             print(f"  fixed: removed metadata for {name}")
-    if changed:
-        vm_metadata.save_vm_metadata(metadata)
     return 0
 
 

@@ -29,7 +29,7 @@ sbx doctor
 
 ### 1. Build the curated image
 
-The curated image contains Pi, common development tools, and rootless Docker. Building it requires a working host Docker installation:
+The curated image contains common development tools and rootless Docker, but no agent. Building it requires a working host Docker installation:
 
 ```bash
 sbx image build
@@ -54,15 +54,17 @@ cd ~/code/my-project
 sbx run the-quest \
   --image '~/.smolvm/images/sbx' \
   --project-path . \
-  --writable-mounts
+  --writable-mounts \
+  --runtime-install pi
 ```
 
 On first creation, `sbx`:
 
 1. creates and starts the VM;
 2. mounts the project at the same absolute path inside the VM;
-3. writes the project settings to `./.sbx.toml`; and
-4. launches Pi as the `agent` user in the mounted project.
+3. writes the project settings to `./.sbx.toml`;
+4. creates a guest user matching your host username; and
+5. installs the explicitly requested Pi runtime as that user, then launches it.
 
 ### 3. Use the sandbox day to day
 
@@ -107,15 +109,15 @@ If you try to run with different mounts while the VM is already running, `sbx` k
 
 ### Install more tools
 
-The curated image includes Pi. For one project, install other tools directly on the sandbox disk instead of rebuilding the image:
+The curated image installs Pi only when `runtime_install = ["pi"]` or `--runtime-install pi` is requested. For other tools, install directly on the sandbox disk instead of rebuilding the image:
 
 ```bash
 sbx shell
 
-# Run these inside the VM as the configured agent user:
-npm install -g opencode-ai
-npm install -g @anthropic-ai/claude-code
-npm install -g @openai/codex
+# Run these inside the VM as the configured runtime user:
+npm install -g --prefix "$HOME/.local" opencode-ai
+npm install -g --prefix "$HOME/.local" @anthropic-ai/claude-code
+npm install -g --prefix "$HOME/.local" @openai/codex
 exit
 ```
 
@@ -153,6 +155,9 @@ These commands use the sandbox named in `.sbx.toml`. Use `--name OTHER_VM` only 
 # Create or start without launching an agent.
 sbx run --no-attach
 
+# Explicitly rerun user/tool provisioning after changing its config.
+sbx run --reprovision --no-attach
+
 # Keep the VM running after the agent exits.
 sbx run --keep-running
 
@@ -170,9 +175,10 @@ The first project creation produces a small `.sbx.toml` resembling:
 [sbx]
 name = "the-quest"
 agent = "pi"
+runtime_install = ["pi"]
 image = "~/.smolvm/images/sbx"
 project_path = "."
-run_user = "agent"
+run_user = "me"
 writable_mounts = true
 copy_host_credentials = false
 git_config = true
@@ -184,7 +190,7 @@ git_config = true
 2. `./.sbx.toml` — project defaults; and
 3. `--config PATH` — an explicit override.
 
-CLI options override configuration. Keep durable choices such as the image, VM resources, user, mounts, and forwarded environment names in `.sbx.toml`; use commands for actions such as running, stopping, or recreating.
+CLI options override configuration. Repeated `--runtime-install` values replace the configured list for that invocation and imply reprovisioning for an existing VM. When `run_user` is omitted, `sbx` uses the current host username and records it in a newly generated `.sbx.toml`. Keep durable choices such as the image, VM resources, user, mounts, runtime installation, and forwarded environment names in `.sbx.toml`; use `sbx run --reprovision` after changing provisioning config. Changing the runtime user of an existing VM requires `sbx recreate`.
 
 Security-sensitive behavior is configuration-only:
 

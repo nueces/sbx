@@ -17,13 +17,13 @@ The image is not a single self-contained bootable disk. It is a direct-kernel Sm
 
 ## Build flow
 
-The local Debian/Pi image is built with:
+The local agent-neutral Debian image is built with:
 
 ```bash
 sbx image build
 ```
 
-The build recipe combines packaged Debian, Docker, and Pi fragments.
+The build recipe combines packaged Debian and Docker fragments, plus an optional custom tooling fragment.
 
 The build command:
 
@@ -33,7 +33,7 @@ The build command:
 4. downloads the kernel recipe and checker from immutable commits, verifies each SHA-256, and builds a Docker-capable QEMU kernel from SHA-256-verified Linux source;
 5. writes `smolvm-image.json` next to the generated kernel and rootfs.
 
-The resulting rootfs already contains Pi and related tooling from the packaged `Containers/Agents/Pi.Containerfile`. Therefore, `sbx` does not run SmolVM preset installation for this mode.
+The resulting rootfs contains Node.js, npm, uv, Specify, and Docker, but no Pi package. Local-image runtime tools are installed only when explicitly requested during VM provisioning.
 
 ## Manifest
 
@@ -46,15 +46,12 @@ The local image manifest is `smolvm-image.json`:
   "rootfs": "rootfs.ext4",
   "boot_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init",
   "sbx": {
-    "agent": "pi",
-    "features": ["docker"],
-    "launch_command": "pi",
-    "run_user": "agent"
+    "features": ["docker"]
   }
 }
 ```
 
-`sbx` reads this manifest to locate the kernel/rootfs, validate the configured agent, default the guest user when CLI/config omit it, and list image features with `sbx image list`. CLI and `[sbx].run_user` override the manifest value.
+`sbx` reads this manifest to locate the kernel/rootfs and list image features with `sbx image list`. Agent selection and runtime installation are box configuration, not image policy. New curated images use the current host username when CLI/config omit `run_user`; older or custom manifests may still provide `run_user` for compatibility. Manifests with obsolete `agent` or `launch_command` fields must be rebuilt.
 
 ## Runtime flow
 
@@ -63,9 +60,10 @@ A typical `.sbx.toml` uses the local image directory:
 ```toml
 [sbx]
 agent = "pi"
+runtime_install = ["pi"]
 name = "the-quest"
 image = "~/.smolvm/images/sbx"
-run_user = "agent"
+run_user = "me"
 memory = 8192
 cpus = 4
 boot_timeout = 60
@@ -82,8 +80,9 @@ When `sbx run` starts a missing VM from this image, `sbx`:
 3. creates a SmolVM `VMConfig` using those paths and `comm_channel="ssh"`;
 4. starts the VM through the SmolVM SDK;
 5. waits for SSH readiness;
-6. prepares the configured or manifest-defaulted `run_user`, safe Git config, auth callback forwarding, and project cwd;
-7. launches the configured agent command, usually `pi`.
+6. creates/prepares the configured, legacy-manifest, or host-named runtime user;
+7. installs explicitly requested runtime tools directly under that user's `$HOME/.local`;
+8. records successful provisioning and launches the independently configured agent command.
 
 In code this path is handled by `src/sbx/cli.py` in `_start_local_image()`.
 
@@ -99,7 +98,7 @@ Even in local image mode, `sbx` still uses SmolVM for:
 - SSH readiness checks and SSH command generation;
 - isolated per-VM disk materialization.
 
-The kernel and Debian/Pi/Docker rootfs are built locally. SmolVM still provides lifecycle, QEMU, disk, mount, and SSH integration, but this build does not download SmolVM's published kernel or guest agent.
+The kernel and Debian/Docker rootfs are built locally. SmolVM still provides lifecycle, QEMU, disk, mount, and SSH integration, but this build does not download SmolVM's published kernel or guest agent.
 
 ## Disk behavior
 
@@ -171,4 +170,4 @@ Current Linux local image mode is not:
 - SmolVM's Windows local image mode;
 - SmolVM preset install-at-boot mode.
 
-For Linux/Pi, the current artifact format is a directory containing kernel, rootfs, and manifest metadata.
+For Linux local images, the current artifact format is a directory containing kernel, rootfs, and manifest metadata.

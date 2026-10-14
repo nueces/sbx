@@ -26,14 +26,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       docker-ce-rootless-extras \
     && rm -rf /var/lib/apt/lists/*
 
-RUN echo 'agent:100000:65536' >> /etc/subuid && \
-    echo 'agent:100000:65536' >> /etc/subgid
-
 COPY scripts/sbx-start-rootless-docker /usr/local/bin/sbx-start-rootless-docker
 RUN chmod +x /usr/local/bin/sbx-start-rootless-docker && \
     printf '%s\n' \
-      'export XDG_RUNTIME_DIR=/run/user/1000' \
-      'export DOCKER_HOST=unix:///run/user/1000/docker.sock' \
+      'if [ "$(id -u)" -ne 0 ]; then' \
+      '  export XDG_RUNTIME_DIR="/run/user/$(id -u)"' \
+      '  export DOCKER_HOST="unix://$XDG_RUNTIME_DIR/docker.sock"' \
+      'fi' \
       > /etc/profile.d/sbx-rootless-docker.sh
 
-USER agent
+USER root

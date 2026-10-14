@@ -60,12 +60,13 @@ Good durable config fields include:
 [sbx]
 name = "the-quest"
 agent = "pi"
+runtime_install = ["pi"]
 image = "~/.smolvm/images/sbx"
 memory = 8192
 cpus = 4
 disk_size = 40960
 project_path = "."
-run_user = "agent"
+run_user = "me"
 writable_mounts = true
 ```
 
@@ -81,7 +82,7 @@ Security and forwarding policy such as `auth_port`, `copy_host_credentials`, and
 
 ## Existing VM reuse
 
-An existing named VM is reused as-is. Changing `.sbx.toml` does not mutate an existing VM's durable state.
+An existing named VM is reused as-is. Changing `.sbx.toml` does not implicitly mutate an existing VM's durable state. Apply user/tool provisioning changes explicitly with `sbx run --reprovision`.
 
 For example, if `.sbx.toml` changes from:
 
@@ -131,7 +132,7 @@ Behavior:
 Example:
 
 ```bash
-sbx run the-quest --image ~/.smolvm/images/sbx --memory 8192 --cpus 4 --disk-size 40960 --project-path .
+sbx run the-quest --image ~/.smolvm/images/sbx --memory 8192 --cpus 4 --disk-size 40960 --project-path . --runtime-install pi
 ```
 
 could create:
@@ -139,12 +140,13 @@ could create:
 ```toml
 [sbx]
 name = "the-quest"
+runtime_install = ["pi"]
 image = "~/.smolvm/images/sbx"
 memory = 8192
 cpus = 4
 disk_size = 40960
 project_path = "."
-run_user = "agent"
+run_user = "me"
 ```
 
 On initial creation, `sbx` prints the generated config and the next `run`, `shell`, `stop`, and `rm` commands. After that, project workflows become:

@@ -4,13 +4,28 @@ import shlex
 import subprocess
 import sys
 from argparse import Namespace
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 DEBUG = False
 SMOLVM_DISABLE_VERSION_CHECK_ENV = "SMOLVM_DISABLE_VERSION_CHECK"
 SBX_SMOLVM_VERSION_NOTICES_ENV = "SBX_SMOLVM_VERSION_NOTICES"
+SUDO_ENV_KEYS = ("SUDO_COMMAND", "SUDO_GID", "SUDO_HOME", "SUDO_UID", "SUDO_USER")
+
+
+@contextmanager
+def without_stale_sudo_env() -> Iterator[None]:
+    if os.geteuid() == 0:
+        yield
+        return
+
+    saved = {key: os.environ.pop(key) for key in SUDO_ENV_KEYS if key in os.environ}
+    try:
+        yield
+    finally:
+        os.environ.update(saved)
 
 
 class ConfigError(ValueError):

@@ -22,12 +22,11 @@ Important: the feature worktree usually does **not** exist when `sbx run` starts
 The base image should contain global runtime/tooling requirements that are useful before any specific feature worktree exists:
 
 - Node.js/npm
-- Pi CLI
 - uv
 - spec-kit CLI (`specify-cli`)
 - git/curl/ripgrep/sudo and similar base tools
 
-These are installed in the image because they should survive VM destruction and be available immediately on VM startup.
+These shared tools are installed in the image. Pi is installed directly as the selected user during provisioning when `runtime_install = ["pi"]`; it is not baked into the reusable image.
 
 ## What belongs in `working-dir/.pi`
 
@@ -69,7 +68,8 @@ Run `sbx` from the working directory and mount that directory:
 ```toml
 [sbx]
 project_path = "."
-run_user = "agent"
+runtime_install = ["pi"]
+# run_user defaults to the current host username.
 ```
 
 Then:

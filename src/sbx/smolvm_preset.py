@@ -1,7 +1,7 @@
 """Temporary in-process SmolVM preset creation compatibility layer."""
 
 import os
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 
 from smolvm import SmolVM
@@ -40,6 +40,7 @@ def create_preset(
     boot_timeout: float,
     install_timeout: int,
     host_env: Mapping[str, str],
+    before_provision: Callable[[str], None] | None = None,
 ) -> SmolVM:
     """Create and provision a running preset VM; the caller must close the facade."""
     preset = get_preset("claude-code" if preset_name == "claude" else preset_name)
@@ -71,6 +72,8 @@ def create_preset(
         try:
             vm.start(boot_timeout=boot_timeout)
             vm.wait_for_ssh(timeout=boot_timeout)
+            if before_provision is not None:
+                before_provision(str(vm.vm_id))
             channel = vm._ensure_ssh_for_env()
             apply_preset(channel, preset, install_timeout=install_timeout)
         except BaseException:

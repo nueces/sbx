@@ -48,23 +48,19 @@ Commit signing is not configured or disabled by this feature. If signing is off 
 
 ## Where it is installed
 
-For root sessions, `sbx` writes:
+During the selected user's first successful provisioning, `sbx` creates `.gitconfig` only when the destination is absent. Ordinary runs and later reprovisioning never overwrite or restore it.
 
-```text
-/root/.gitconfig
-```
-
-For `run_user` sessions, for example:
+For example:
 
 ```toml
 [sbx]
-run_user = "agent"
+run_user = "developer"
 ```
 
 `sbx` writes:
 
 ```text
-/home/agent/.gitconfig
+/home/developer/.gitconfig
 ```
 
-This is guest-internal configuration only and is independent from `copy_host_credentials`.
+This is guest-internal configuration only and is independent from `copy_host_credentials`. `sbx shell --root` does not write `/root/.gitconfig`.
