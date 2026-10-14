@@ -51,7 +51,7 @@ The local image manifest is `smolvm-image.json`:
 }
 ```
 
-`sbx` reads this manifest to locate the kernel/rootfs and list image features with `sbx image list`. Agent selection and runtime installation are box configuration, not image policy. New curated images use the current host username when CLI/config omit `run_user`; older or custom manifests may still provide `run_user` for compatibility. Obsolete `agent` or `launch_command` fields are ignored with a warning; rebuild the image to remove them.
+`sbx` reads this manifest to locate the kernel/rootfs and list image features with `sbx image list`. Agent selection and runtime installation are box configuration, not image policy. New curated images use the current host username when CLI/config omit `run_user`; older or custom manifests may still provide `run_user` for compatibility. Obsolete `agent` or `launch_command` fields are ignored with a warning; remove them from the manifest or rebuild the image.
 
 ## Runtime flow
 
