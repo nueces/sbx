@@ -541,14 +541,6 @@ def _post_start_actions(
 
     resolved_command = command
     if validate_agent:
-        metadata = vm_metadata.load_vm(vm_name)
-        if metadata is None or not metadata.get("provisioned"):
-            print(
-                f"sbx: VM {vm_name!r} has not completed provisioning; "
-                f"run `sbx run {vm_name} --reprovision --no-attach`",
-                file=sys.stderr,
-            )
-            return 1
         try:
             resolved = guest_setup.command_path(
                 vm_name, run_user or "root", command, run_capture=runtime.run_capture
@@ -1248,10 +1240,8 @@ def cmd_shell(args: argparse.Namespace) -> int:
         run_user = guest_setup.host_username()
     project_path = args.project_path or _cfg(config, "sbx", "project_path")
     project_guest_cwd = _project_guest_cwd(project_path)
-    smolvm_command = ["sandbox", "ssh", name]
     keep_running = bool(getattr(args, "keep_running", False))
     stop_on_exit = bool(_cfg(config, "sbx", "stop_on_exit", True)) and not keep_running
-    git_config_text = None
     try:
         port_forwards = _list_value(
             _sbx_config(config).get("port_forwards"), key="[sbx].port_forwards"
@@ -1264,63 +1254,49 @@ def cmd_shell(args: argparse.Namespace) -> int:
     if existing_status is None:
         print(f"sbx: {runtime.missing_vm_message(name)}", file=sys.stderr)
         return 1
-    if existing_status is not None:
-        vm_metadata.claim_vm(
-            name, project_identity, str(run_user) if run_user is not None else None, created=False
-        )
-        if existing_status != "running":
-            try:
-                _sync_existing_vm_start_config(
-                    name,
-                    None,
-                    writable_mounts=False,
-                    port_forwards=port_forwards,
-                    project=project_identity,
-                )
-            except ConfigError as exc:
-                print(f"sbx: {exc}", file=sys.stderr)
-                return 2
-        else:
-            sbx_cfg = _sbx_config(config)
-            mounts = _list_value(sbx_cfg.get("mount"), key="[sbx].mount")
-            effective_mounts = []
-            if project_path is not None:
-                effective_mounts.append(_same_path_mount(str(project_path)))
-            effective_mounts.extend(
-                mount if ":" in mount else _same_path_mount(mount) for mount in mounts
+    vm_metadata.claim_vm(
+        name, project_identity, str(run_user) if run_user is not None else None, created=False
+    )
+    if existing_status != "running":
+        try:
+            _sync_existing_vm_start_config(
+                name,
+                None,
+                writable_mounts=False,
+                port_forwards=port_forwards,
+                project=project_identity,
             )
-            if effective_mounts:
-                _warn_running_mount_drift(
-                    name, effective_mounts, writable_mounts=project_path is not None
-                )
-        start_rc = _start_existing_vm_if_needed(
-            name,
-            existing_status,
-            DEFAULT_BOOT_TIMEOUT,
+        except ConfigError as exc:
+            print(f"sbx: {exc}", file=sys.stderr)
+            return 2
+    else:
+        sbx_cfg = _sbx_config(config)
+        mounts = _list_value(sbx_cfg.get("mount"), key="[sbx].mount")
+        effective_mounts = []
+        if project_path is not None:
+            effective_mounts.append(_same_path_mount(str(project_path)))
+        effective_mounts.extend(
+            mount if ":" in mount else _same_path_mount(mount) for mount in mounts
         )
-        if start_rc != 0:
-            return start_rc
-    if existing_status is not None or run_user is not None or project_guest_cwd is not None:
-        return _post_start_actions(
-            vm_name=name,
-            command="bash",
-            attach=True,
-            run_user=run_user,
-            auth_port=False,
-            stop_on_exit=stop_on_exit,
-            cwd=project_guest_cwd,
-            git_config_text=git_config_text,
-            session_kind="shell",
-            forward_env=forward_env,
-            validate_agent=False,
-        )
-    session_state.register_session(name, "shell")
-    try:
-        return runtime.run_smolvm(smolvm_command)
-    finally:
-        remaining = session_state.unregister_session(name)
-        runtime.debug(f"unregistered session for {name}; remaining={remaining}")
-        _stop_vm_if_last_session(name, stop_on_exit=stop_on_exit)
+        if effective_mounts:
+            _warn_running_mount_drift(
+                name, effective_mounts, writable_mounts=project_path is not None
+            )
+    start_rc = _start_existing_vm_if_needed(name, existing_status, DEFAULT_BOOT_TIMEOUT)
+    if start_rc != 0:
+        return start_rc
+    return _post_start_actions(
+        vm_name=name,
+        command="bash",
+        attach=True,
+        run_user=run_user,
+        auth_port=False,
+        stop_on_exit=stop_on_exit,
+        cwd=project_guest_cwd,
+        session_kind="shell",
+        forward_env=forward_env,
+        validate_agent=False,
+    )
 
 
 def cmd_stop(args: argparse.Namespace) -> int:

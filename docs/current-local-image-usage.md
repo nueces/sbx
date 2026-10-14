@@ -63,7 +63,6 @@ agent = "pi"
 runtime_install = ["pi"]
 name = "the-quest"
 image = "~/.smolvm/images/sbx"
-run_user = "me"
 memory = 8192
 cpus = 4
 boot_timeout = 60

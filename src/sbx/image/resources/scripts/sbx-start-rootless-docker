@@ -30,21 +30,26 @@ daemon_running() {
     || pgrep -u "$DOCKER_UID" -f '/dockerd-rootless\.sh([[:space:]]|$)' >/dev/null 2>&1
 }
 
+wait_for_docker() {
+  message="$1"
+  i=0
+  while ! docker_ready; do
+    i=$((i + 1))
+    if [ "$i" -ge 30 ]; then
+      echo "$message; log: $LOG_PATH" >&2
+      tail -80 "$LOG_PATH" >&2 2>/dev/null || true
+      return 1
+    fi
+    sleep 1
+  done
+}
+
 if docker_ready; then
   exit 0
 fi
 
 if daemon_running; then
-  i=0
-  while ! docker_ready; do
-    i=$((i + 1))
-    if [ "$i" -ge 30 ]; then
-      echo "rootless Docker is running but unresponsive; log: $LOG_PATH" >&2
-      tail -80 "$LOG_PATH" >&2 2>/dev/null || true
-      exit 1
-    fi
-    sleep 1
-  done
+  wait_for_docker "rootless Docker is running but unresponsive"
   exit 0
 fi
 
@@ -69,13 +74,4 @@ as_user start-stop-daemon --start --background \
   --startas /usr/bin/dockerd-rootless.sh \
   --output "$LOG_PATH"
 
-i=0
-while ! docker_ready; do
-  i=$((i + 1))
-  if [ "$i" -ge 30 ]; then
-    echo "rootless Docker did not start; log: $LOG_PATH" >&2
-    tail -80 "$LOG_PATH" >&2 || true
-    exit 1
-  fi
-  sleep 1
-done
+wait_for_docker "rootless Docker did not start"

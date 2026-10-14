@@ -137,7 +137,6 @@ agent = "pi"
 runtime_install = ["pi"]
 image = "~/.smolvm/images/sbx"
 project_path = "."
-run_user = "me"
 writable_mounts = true
 copy_host_credentials = false
 git_config = true
@@ -172,7 +171,6 @@ sbx image build --rootfs-size-mb 81920
 ```toml
 [sbx]
 image = "~/.smolvm/images/sbx"
-run_user = "me"
 ```
 
 Create or recreate the VM after changing the image. If the rootfs was built with `--rootfs-size-mb 81920`, omit `disk_size` unless you intentionally want SmolVM to grow the per-VM disk.

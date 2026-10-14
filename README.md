@@ -178,7 +178,6 @@ agent = "pi"
 runtime_install = ["pi"]
 image = "~/.smolvm/images/sbx"
 project_path = "."
-run_user = "me"
 writable_mounts = true
 copy_host_credentials = false
 git_config = true

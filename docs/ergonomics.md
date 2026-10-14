@@ -66,7 +66,6 @@ memory = 8192
 cpus = 4
 disk_size = 40960
 project_path = "."
-run_user = "me"
 writable_mounts = true
 ```
 
@@ -146,7 +145,6 @@ memory = 8192
 cpus = 4
 disk_size = 40960
 project_path = "."
-run_user = "me"
 ```
 
 On initial creation, `sbx` prints the generated config and the next `run`, `shell`, `stop`, and `rm` commands. After that, project workflows become:

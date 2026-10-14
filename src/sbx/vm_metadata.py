@@ -51,7 +51,7 @@ def _ensure_directory() -> None:
     SBX_VMS_DIR.chmod(0o700)
 
 
-def _write(vm_name: str, data: Mapping[str, Any]) -> None:
+def _write(vm_name: str, data: Mapping[str, Any], *, exclusive: bool = False) -> bool:
     _ensure_directory()
     path = metadata_path(vm_name)
     fd, temporary = tempfile.mkstemp(prefix=f".{vm_name}.", suffix=".tmp", dir=SBX_VMS_DIR)
@@ -60,25 +60,13 @@ def _write(vm_name: str, data: Mapping[str, Any]) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(dict(data), handle, indent=2, sort_keys=True)
             handle.write("\n")
-        os.replace(temporary, path)
-        path.chmod(0o600)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
-
-
-def _create(vm_name: str, data: Mapping[str, Any]) -> bool:
-    _ensure_directory()
-    path = metadata_path(vm_name)
-    fd, temporary = tempfile.mkstemp(prefix=f".{vm_name}.", suffix=".tmp", dir=SBX_VMS_DIR)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(dict(data), handle, indent=2, sort_keys=True)
-            handle.write("\n")
-        try:
-            os.link(temporary, path)
-        except FileExistsError:
-            return False
+        if exclusive:
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                return False
+        else:
+            os.replace(temporary, path)
         path.chmod(0o600)
         return True
     finally:
@@ -117,7 +105,7 @@ def claim_vm(
             "run_user": run_user,
             "provisioned": False,
         }
-        if _create(vm_name, saved):
+        if _write(vm_name, saved, exclusive=True):
             return saved
         saved = load_vm(vm_name)
         if saved is None:
