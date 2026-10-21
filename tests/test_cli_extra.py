@@ -878,6 +878,24 @@ def test_prepare_run_user_success_and_failure(
         guest_setup.prepare_run_user("vm1", "agent", run_capture=fake_fail)
 
 
+def test_ensure_kvm_access_runs_optional_helper_each_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    guest_setup.ensure_kvm_access(
+        "vm1", "agent", run_capture=fake_run, ssh=lambda vm_id: ["ssh", vm_id]
+    )
+
+    assert calls[0][:2] == ["ssh", "vm1"]
+    assert "[ -x /usr/local/bin/sbx-prepare-kvm ]" in calls[0][-1]
+    assert "/usr/local/bin/sbx-prepare-kvm agent" in calls[0][-1]
+
+
 def test_attach_commands(monkeypatch: pytest.MonkeyPatch) -> None:
     commands: list[list[str]] = []
     monkeypatch.setattr(guest_setup, "ssh_command", lambda vm_id: ["ssh", "root@host"])
@@ -942,6 +960,11 @@ def test_post_start_actions_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.setattr(
         guest_setup,
+        "ensure_kvm_access",
+        lambda *args, **kwargs: calls.append(("kvm", args)),
+    )
+    monkeypatch.setattr(
+        guest_setup,
         "install_runtime_tools",
         lambda *args, **kwargs: calls.append(("install", args)),
     )
@@ -988,6 +1011,7 @@ def test_post_start_actions_paths(monkeypatch: pytest.MonkeyPatch) -> None:
         "clock",
         "port",
         "prepare",
+        "kvm",
         "install",
         "git",
         "docker",
@@ -998,6 +1022,21 @@ def test_post_start_actions_paths(monkeypatch: pytest.MonkeyPatch) -> None:
         "stop",
     ]
     assert vm_metadata.load_vm("vm1")["provisioned"] is True
+
+    calls.clear()
+    assert (
+        cli._post_start_actions(
+            vm_name="vm1",
+            command="bash",
+            attach=False,
+            run_user="agent",
+            auth_port=False,
+            stop_on_exit=True,
+            validate_agent=False,
+        )
+        == 0
+    )
+    assert [name for name, _ in calls] == ["clock", "kvm", "docker"]
 
 
 def test_tunnel_and_session_state(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2073,6 +2112,7 @@ def test_failed_reprovision_preserves_success_and_prints_guidance(
     vm_metadata.claim_vm("vm1", project, "agent", created=True)
     vm_metadata.mark_provisioned("vm1")
     monkeypatch.setattr(guest_setup, "sync_guest_clock", lambda *args, **kwargs: None)
+    monkeypatch.setattr(guest_setup, "ensure_kvm_access", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         guest_setup,
         "prepare_run_user",

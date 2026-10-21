@@ -514,6 +514,7 @@ def _post_start_actions(
                     copy_initial_state=copy_initial_state and not was_provisioned,
                     run_capture=runtime.run_capture,
                 )
+                guest_setup.ensure_kvm_access(vm_name, run_user, run_capture=runtime.run_capture)
                 guest_setup.install_runtime_tools(
                     vm_name,
                     run_user,
@@ -534,6 +535,7 @@ def _post_start_actions(
             return 1
     elif run_user is not None:
         try:
+            guest_setup.ensure_kvm_access(vm_name, run_user, run_capture=runtime.run_capture)
             guest_setup.ensure_rootless_docker(vm_name, run_user, run_capture=runtime.run_capture)
         except ConfigError as exc:
             print(f"sbx: runtime startup check failed for VM {vm_name!r}: {exc}", file=sys.stderr)

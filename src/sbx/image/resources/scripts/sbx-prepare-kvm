@@ -1,0 +1,28 @@
+#!/usr/bin/env sh
+set -eu
+
+if [ "$#" -ne 1 ]; then
+  echo "usage: sbx-prepare-kvm USER" >&2
+  exit 2
+fi
+
+user=$1
+if [ ! -c /dev/kvm ]; then
+  echo "nested KVM is enabled in this image, but /dev/kvm is unavailable;" >&2
+  echo "verify host nested virtualization and vmx/svm CPU exposure" >&2
+  exit 1
+fi
+
+if [ "$user" = root ]; then
+  exit 0
+fi
+if ! id -u "$user" >/dev/null 2>&1; then
+  echo "nested KVM runtime user does not exist: $user" >&2
+  exit 1
+fi
+if ! getent group kvm >/dev/null 2>&1; then
+  groupadd --system kvm
+fi
+chown root:kvm /dev/kvm
+chmod 0660 /dev/kvm
+usermod -aG kvm "$user"

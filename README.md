@@ -37,6 +37,14 @@ sbx image build
 
 The image is written to `~/.smolvm/images/sbx`. The first build compiles a QEMU kernel and can take a while. Later builds reuse Docker layers.
 
+On a Linux x86_64 host with nested virtualization enabled, build a separate image for running KVM-accelerated inner VMs:
+
+```bash
+sbx image build --name sbx-nested-kvm --nested-kvm
+```
+
+Nested KVM increases the kernel and QEMU attack surface and is never enabled in the default image. See the [image guide](docs/build-local-debian-pi-image.md#nested-kvm-images) for host checks, verification, and cleanup.
+
 Check the result with:
 
 ```bash

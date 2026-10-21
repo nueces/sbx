@@ -372,6 +372,29 @@ fi
         raise ConfigError(f"failed to prepare run user {user!r}: {details}")
 
 
+def ensure_kvm_access(
+    vm_id: str,
+    user: str,
+    *,
+    run_capture: Callable[[list[str]], subprocess.CompletedProcess[str] | None] | None = None,
+    ssh: Callable[[str], list[str]] | None = None,
+) -> None:
+    if user == "root":
+        return
+    run_capture = run_capture or runtime.run_capture
+    ssh = ssh or ssh_command
+    script = (
+        "if [ -x /usr/local/bin/sbx-prepare-kvm ]; then "
+        f"/usr/local/bin/sbx-prepare-kvm {shlex.quote(user)}; fi"
+    )
+    completed = run_capture([*ssh(vm_id), "bash -lc " + shlex.quote(script)])
+    if completed is None:
+        raise ConfigError(f"failed to check nested KVM access for {user!r}: ssh command not found")
+    if completed.returncode != 0:
+        details = completed.stderr.strip() or completed.stdout.strip()
+        raise ConfigError(f"failed to prepare nested KVM access for {user!r}: {details}")
+
+
 def ensure_rootless_docker(
     vm_id: str,
     user: str,
