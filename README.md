@@ -86,6 +86,8 @@ sbx ls        # list all sandboxes, including stopped ones
 sbx rm        # remove the VM after confirmation
 ```
 
+Boot setup (hostname, clock, KVM access, and rootless Docker) runs when sbx starts the VM or reprovisioning is requested—not on each attachment to a running VM. To repair setup in a running VM, use `sbx run --reprovision --no-attach`. See [guest setup lifecycle](docs/ergonomics.md#guest-setup-lifecycle) for recovery and diagnostic-root behavior.
+
 ## Customize the sandbox
 
 ### Add another folder

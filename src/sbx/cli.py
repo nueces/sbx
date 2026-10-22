@@ -469,6 +469,7 @@ def _print_provisioning_failure(vm_name: str, error: Exception, *, was_provision
 def _post_start_actions(
     *,
     vm_name: str,
+    started_now: bool,
     command: str,
     attach: bool,
     run_user: str | None,
@@ -487,17 +488,33 @@ def _post_start_actions(
     copy_initial_state: bool = False,
     validate_agent: bool = True,
     agent_name: str | None = None,
+    diagnostic_root: bool = False,
 ) -> int:
-    guest_setup.sync_guest_clock(vm_name, run_capture=runtime.run_capture)
-    if not _sync_forwarded_env_or_error(vm_name, forward_env or []):
-        return 1
-    if auth_port:
-        port_rc = network.expose_auth_port(vm_name, auth_host_port, auth_guest_port)
-        if port_rc != 0:
-            return port_rc
-    if validate_agent and not provision:
-        metadata = vm_metadata.load_vm(vm_name)
-        if metadata is None or not metadata.get("provisioned"):
+    metadata = vm_metadata.load_vm(vm_name)
+    runtime_user = metadata.get("run_user") if metadata else None
+    if not isinstance(runtime_user, str):
+        raise ConfigError(f"VM {vm_name!r} has no trusted sbx runtime identity")
+    runtime_user = guest_setup.validate_run_user(runtime_user)
+    if run_user is not None and run_user != runtime_user:
+        raise ConfigError(f"VM {vm_name!r} is provisioned for {runtime_user!r}, not {run_user!r}")
+    needs_boot_setup = started_now or provision
+
+    try:
+        if needs_boot_setup:
+            for action in (guest_setup.set_hostname, guest_setup.sync_guest_clock):
+                try:
+                    action(vm_name, run_capture=runtime.run_capture)
+                except ConfigError as exc:
+                    if not diagnostic_root:
+                        raise
+                    print(f"sbx: warning: {exc}", file=sys.stderr)
+        if not _sync_forwarded_env_or_error(vm_name, forward_env or []):
+            return 1
+        if auth_port:
+            port_rc = network.expose_auth_port(vm_name, auth_host_port, auth_guest_port)
+            if port_rc != 0:
+                return port_rc
+        if validate_agent and not provision and not metadata.get("provisioned"):
             print(
                 f"sbx: VM {vm_name!r} has not completed provisioning; "
                 f"run `sbx run {vm_name} --reprovision --no-attach`",
@@ -505,41 +522,54 @@ def _post_start_actions(
             )
             return 1
 
-    if provision:
-        try:
-            if run_user is not None:
-                guest_setup.prepare_run_user(
-                    vm_name,
-                    run_user,
-                    copy_initial_state=copy_initial_state and not was_provisioned,
-                    run_capture=runtime.run_capture,
+        if provision:
+            guest_setup.prepare_run_user(
+                vm_name,
+                runtime_user,
+                copy_initial_state=copy_initial_state and not was_provisioned,
+                run_capture=runtime.run_capture,
+            )
+            if runtime_user != "root":
+                guest_setup.ensure_kvm_access(
+                    vm_name, runtime_user, run_capture=runtime.run_capture
                 )
-                guest_setup.ensure_kvm_access(vm_name, run_user, run_capture=runtime.run_capture)
-                guest_setup.install_runtime_tools(
-                    vm_name,
-                    run_user,
-                    runtime_install or [],
-                    install_timeout,
-                    run_capture=runtime.run_capture,
+            guest_setup.install_runtime_tools(
+                vm_name,
+                runtime_user,
+                runtime_install or [],
+                install_timeout,
+                run_capture=runtime.run_capture,
+            )
+            if not was_provisioned:
+                guest_setup.install_git_config(
+                    vm_name, runtime_user, git_config_text, run_capture=runtime.run_capture
                 )
-                if not was_provisioned:
-                    guest_setup.install_git_config(
-                        vm_name, run_user, git_config_text, run_capture=runtime.run_capture
-                    )
+            if runtime_user != "root":
                 guest_setup.ensure_rootless_docker(
-                    vm_name, run_user, run_capture=runtime.run_capture
+                    vm_name, runtime_user, run_capture=runtime.run_capture
                 )
             vm_metadata.mark_provisioned(vm_name)
-        except Exception as exc:  # noqa: BLE001 - preserve a running VM for diagnosis.
+        elif needs_boot_setup and runtime_user != "root":
+            for action in (guest_setup.ensure_kvm_access, guest_setup.ensure_rootless_docker):
+                try:
+                    action(vm_name, runtime_user, run_capture=runtime.run_capture)
+                except ConfigError as exc:
+                    if not diagnostic_root:
+                        raise
+                    print(f"sbx: warning: {exc}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 - preserve provisioning diagnostics.
+        if provision:
             _print_provisioning_failure(vm_name, exc, was_provisioned=was_provisioned)
-            return 1
-    elif run_user is not None:
-        try:
-            guest_setup.ensure_kvm_access(vm_name, run_user, run_capture=runtime.run_capture)
-            guest_setup.ensure_rootless_docker(vm_name, run_user, run_capture=runtime.run_capture)
-        except ConfigError as exc:
+        elif isinstance(exc, ConfigError):
             print(f"sbx: runtime startup check failed for VM {vm_name!r}: {exc}", file=sys.stderr)
-            return 1
+            print(f"sbx: VM {vm_name!r} is still running.", file=sys.stderr)
+            print(f"sbx: Inspect: sbx shell {vm_name} --root", file=sys.stderr)
+            print(f"sbx: Retry:   sbx run {vm_name} --reprovision --no-attach", file=sys.stderr)
+            print(f"sbx: Or stop/start: sbx stop {vm_name}; sbx run {vm_name}", file=sys.stderr)
+        else:
+            raise
+        return 1
+    # shortcut: running VMs skip failed boot work; use --reprovision to retry it.
 
     resolved_command = command
     if validate_agent:
@@ -856,7 +886,6 @@ def _start_local_image(
         vm_metadata.claim_vm(
             str(vm_name), _project_identity(args, config), run_user or "root", created=True
         )
-        guest_setup.set_hostname(str(vm_name), run_capture=runtime.run_capture)
     except Exception:
         vm.close()
         raise
@@ -876,6 +905,7 @@ def _start_local_image(
         )
     rc = _post_start_actions(
         vm_name=str(vm_name),
+        started_now=True,
         command=LAUNCH_COMMANDS[agent],
         attach=attach,
         run_user=run_user,
@@ -1060,6 +1090,7 @@ def cmd_start(args: argparse.Namespace) -> int:
                     git_config_text = guest_setup.host_git_config(project_root)
             rc = _post_start_actions(
                 vm_name=str(requested_name),
+                started_now=existing_status != "running",
                 command=LAUNCH_COMMANDS[str(agent)],
                 attach=attach,
                 run_user=str(run_user) if run_user is not None else None,
@@ -1161,7 +1192,6 @@ def cmd_start(args: argparse.Namespace) -> int:
             ),
         )
         vm_name = str(vm.vm_id)
-        guest_setup.set_hostname(vm_name, run_capture=runtime.run_capture)
     except Exception as exc:  # noqa: BLE001 - keep CLI errors user-friendly.
         if _maybe_print_boot_timeout_running_hint(
             str(requested_name) if requested_name else None, boot_timeout
@@ -1192,6 +1222,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         git_config_text = guest_setup.host_git_config(project_root)
     rc = _post_start_actions(
         vm_name=vm_name,
+        started_now=True,
         command=LAUNCH_COMMANDS[str(agent)],
         attach=attach,
         run_user=str(run_user) if run_user is not None else None,
@@ -1296,6 +1327,8 @@ def cmd_shell(args: argparse.Namespace) -> int:
         return start_rc
     return _post_start_actions(
         vm_name=name,
+        started_now=existing_status != "running",
+        diagnostic_root=bool(args.root),
         command="bash",
         attach=True,
         run_user=run_user,

@@ -992,6 +992,7 @@ def test_post_start_actions_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     assert (
         cli._post_start_actions(
             vm_name="vm1",
+            started_now=True,
             command="pi",
             attach=True,
             run_user="agent",
@@ -1027,6 +1028,7 @@ def test_post_start_actions_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     assert (
         cli._post_start_actions(
             vm_name="vm1",
+            started_now=False,
             command="bash",
             attach=False,
             run_user="agent",
@@ -1036,7 +1038,7 @@ def test_post_start_actions_paths(monkeypatch: pytest.MonkeyPatch) -> None:
         )
         == 0
     )
-    assert [name for name, _ in calls] == ["clock", "kvm", "docker"]
+    assert calls == []
 
 
 def test_tunnel_and_session_state(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1490,6 +1492,12 @@ def test_read_toml_oserror_and_create_alias(
 
 def test_post_start_actions_auth_port_failure_skips_attach(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
+    vm_metadata.claim_vm(
+        "vm1",
+        {"project_root": "/project", "config_path": "/project/.sbx.toml"},
+        "agent",
+        created=True,
+    )
     monkeypatch.setattr(
         guest_setup, "sync_guest_clock", lambda vm_id, **kwargs: calls.append("clock")
     )
@@ -1499,6 +1507,7 @@ def test_post_start_actions_auth_port_failure_skips_attach(monkeypatch: pytest.M
     assert (
         cli._post_start_actions(
             vm_name="vm1",
+            started_now=True,
             command="pi",
             attach=True,
             run_user=None,
@@ -2121,6 +2130,7 @@ def test_failed_reprovision_preserves_success_and_prints_guidance(
 
     rc = cli._post_start_actions(
         vm_name="vm1",
+        started_now=False,
         command="pi",
         attach=False,
         run_user="agent",
@@ -2137,3 +2147,390 @@ def test_failed_reprovision_preserves_success_and_prints_guidance(
     assert "sbx shell vm1 --root" in error
     assert "sbx run vm1 --reprovision --no-attach" in error
     assert "sbx stop vm1" in error
+
+
+@pytest.fixture
+def boot_flow(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespace:
+    config = tmp_path / ".sbx.toml"
+    config.write_text(
+        '[sbx]\nname = "vm1"\nrun_user = "agent"\nauth_port = false\n'
+        'stop_on_exit = false\nruntime_install = ["pi"]\n',
+        encoding="utf-8",
+    )
+    project = {"project_root": str(tmp_path), "config_path": str(config)}
+    vm_metadata.claim_vm("vm1", project, "agent", created=True)
+    vm_metadata.mark_provisioned("vm1")
+    flow = SimpleNamespace(
+        config=config,
+        events=[],
+        status="stopped",
+        fail=None,
+        start_rc=0,
+        attach_rc=0,
+        hostname="smolvm",
+        kvm=False,
+        docker=False,
+        account_exists=True,
+    )
+
+    def record(name: str):
+        def action(*args, **kwargs):
+            flow.events.append((name, args, kwargs))
+            if flow.fail == name:
+                raise cli.ConfigError(f"{name} failed")
+            if name in ("kvm", "docker") and not flow.account_exists:
+                raise cli.ConfigError("runtime user does not exist: agent")
+            if name == "prepare":
+                flow.account_exists = True
+            elif name == "hostname":
+                flow.hostname = args[0]
+            elif name == "kvm":
+                flow.kvm = True
+            elif name == "docker":
+                flow.docker = True
+            elif name == "command":
+                return "/usr/bin/pi"
+            elif name == "attach":
+                return flow.attach_rc
+
+        return action
+
+    for name, attribute in (
+        ("hostname", "set_hostname"),
+        ("clock", "sync_guest_clock"),
+        ("prepare", "prepare_run_user"),
+        ("kvm", "ensure_kvm_access"),
+        ("tools", "install_runtime_tools"),
+        ("git", "install_git_config"),
+        ("docker", "ensure_rootless_docker"),
+        ("env", "sync_forwarded_env"),
+        ("command", "command_path"),
+        ("attach", "attach"),
+    ):
+        monkeypatch.setattr(guest_setup, attribute, record(name))
+    monkeypatch.setattr(guest_setup, "host_git_config", lambda *args: "safe config")
+    monkeypatch.setattr(cli, "_get_existing_vm_status", lambda name: flow.status)
+    monkeypatch.setattr(cli, "_sync_existing_vm_start_config", lambda *a, **kw: None)
+    monkeypatch.setattr(cli, "_warn_running_mount_drift", lambda *a, **kw: None)
+
+    def start(argv):
+        flow.events.append(("start", tuple(argv), {}))
+        if flow.start_rc == 0:
+            flow.status = "running"
+        return subprocess.CompletedProcess(argv, flow.start_rc, stdout="", stderr="")
+
+    monkeypatch.setattr(runtime, "run_smolvm_capture", start)
+    monkeypatch.setattr(cli, "_maybe_print_boot_timeout_running_hint", lambda *args: False)
+    real_mark = vm_metadata.mark_provisioned
+
+    def mark(name):
+        flow.events.append(("mark", (name,), {}))
+        real_mark(name)
+
+    monkeypatch.setattr(vm_metadata, "mark_provisioned", mark)
+    flow.run = lambda *args: cli.main(["--config", str(config), *args])
+    flow.names = lambda: [name for name, _, _ in flow.events]
+    return flow
+
+
+@pytest.mark.parametrize("status", ["running", "stopped"])
+@pytest.mark.parametrize("command,no_attach", [("run", False), ("run", True), ("shell", False)])
+def test_boot_setup_follows_start_not_attachment(
+    boot_flow: SimpleNamespace,
+    status: str,
+    command: str,
+    no_attach: bool,
+) -> None:
+    boot_flow.status = status
+    args = [command, *(["--no-attach", "--json"] if no_attach else [])]
+    assert boot_flow.run(*args) == 0
+    names = boot_flow.names()
+    boot = ["hostname", "clock", "kvm", "docker"]
+    assert [name for name in names if name in boot] == (boot if status == "stopped" else [])
+    assert names.count("start") == int(status == "stopped")
+    assert ("attach" in names) is not no_attach
+    assert not {"prepare", "tools", "git", "mark"}.intersection(names)
+    if status == "running":
+        assert boot_flow.hostname == "smolvm"
+    if status == "stopped":
+        assert boot_flow.hostname == "vm1"
+        assert boot_flow.kvm and boot_flow.docker
+
+
+@pytest.mark.parametrize("status", ["running", "stopped"])
+@pytest.mark.parametrize("options", [["--reprovision"], ["--runtime-install", "pi"]])
+def test_boot_reprovision_runs_once_and_marks_last(
+    boot_flow: SimpleNamespace,
+    status: str,
+    options: list[str],
+) -> None:
+    boot_flow.status = status
+    assert boot_flow.run("run", *options, "--no-attach") == 0
+    assert [name for name in boot_flow.names() if name != "start"] == [
+        "hostname",
+        "clock",
+        "env",
+        "prepare",
+        "kvm",
+        "tools",
+        "docker",
+        "mark",
+        "command",
+    ]
+    prepare = next(kwargs for name, _, kwargs in boot_flow.events if name == "prepare")
+    assert prepare["copy_initial_state"] is False
+
+
+@pytest.mark.parametrize("creation", ["preset", "image", "recreate"])
+def test_boot_creation_paths_share_setup(
+    boot_flow: SimpleNamespace,
+    creation: str,
+    local_image_dir: Path,
+    fake_smolvm_sdk: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    boot_flow.status = None
+    vm_metadata.remove_vm("vm1")
+    monkeypatch.setattr(guest_setup, "host_username", lambda: "agent")
+    if creation == "image":
+        # The SDK fixture uses a generated ID, independently of the requested name.
+        expected_name = "local-vm"
+        args = ["run", "--image", str(local_image_dir)]
+    elif creation == "recreate":
+        boot_flow.status = "running"
+        vm_metadata.claim_vm(
+            "vm1",
+            {"project_root": str(boot_flow.config.parent), "config_path": str(boot_flow.config)},
+            "agent",
+            created=True,
+        )
+
+        def delete(name, **kwargs):
+            vm_metadata.remove_vm(name)
+            boot_flow.status = None
+            return 0
+
+        monkeypatch.setattr(cli, "_delete_vm", delete)
+        args = ["recreate", "--force"]
+        expected_name = "vm1"
+    else:
+        args = ["run"]
+        expected_name = "vm1"
+    assert boot_flow.run(*args, "--no-attach", "--json") == 0
+    assert [name for name in boot_flow.names() if name != "start"] == [
+        "hostname",
+        "clock",
+        "env",
+        "prepare",
+        "kvm",
+        "tools",
+        "git",
+        "docker",
+        "mark",
+        "command",
+    ]
+    assert vm_metadata.load_vm(expected_name)["provisioned"] is True
+    assert json.loads(capsys.readouterr().out)["vm"]["name"] == expected_name
+
+
+@pytest.mark.parametrize("failed", ["hostname", "clock", "kvm", "docker"])
+@pytest.mark.parametrize("mode", ["run", "shell", "reprovision", "install"])
+def test_boot_failure_blocks_normal_completion(
+    boot_flow: SimpleNamespace,
+    failed: str,
+    mode: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    boot_flow.fail = failed
+    if mode == "shell":
+        args = ["shell"]
+    else:
+        args = ["run", "--no-attach", "--json"]
+        if mode == "reprovision":
+            args += ["--reprovision"]
+        elif mode == "install":
+            args += ["--runtime-install", "pi"]
+    assert boot_flow.run(*args) == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert f"{failed} failed" in output.err
+    assert ("provisioning VM" in output.err) == (mode in ("reprovision", "install"))
+    assert "sbx shell vm1 --root" in output.err
+    assert "sbx run vm1 --reprovision --no-attach" in output.err
+    assert not {"attach", "mark"}.intersection(boot_flow.names())
+    assert boot_flow.status == "running"
+    assert vm_metadata.load_vm("vm1")["provisioned"] is True
+
+
+@pytest.mark.parametrize("failed", [None, "hostname", "clock", "kvm", "docker"])
+def test_boot_root_shell_prepares_recorded_user_and_allows_diagnosis(
+    boot_flow: SimpleNamespace,
+    failed: str | None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    boot_flow.fail = failed
+    boot_flow.attach_rc = 7
+    assert boot_flow.run("shell", "--root") == 7
+    assert boot_flow.names() == ["start", "hostname", "clock", "env", "kvm", "docker", "attach"]
+    for name, args, kwargs in boot_flow.events:
+        if name in ("kvm", "docker"):
+            assert args == ("vm1", "agent")
+        if name == "attach":
+            assert kwargs["user"] is None
+    if failed:
+        assert f"warning: {failed} failed" in capsys.readouterr().err
+    else:
+        assert boot_flow.kvm and boot_flow.docker
+    boot_flow.events.clear()
+    boot_flow.attach_rc = 0
+    assert boot_flow.run("run") == 0
+    assert boot_flow.names() == ["env", "command", "attach"]
+
+
+@pytest.mark.parametrize("command", ["run", "shell"])
+def test_boot_start_failure_skips_guest_operations(
+    boot_flow: SimpleNamespace,
+    command: str,
+) -> None:
+    boot_flow.start_rc = 9
+    assert boot_flow.run(command, *(["--root"] if command == "shell" else [])) == 9
+    assert boot_flow.names() == ["start"]
+
+
+@pytest.mark.parametrize("user", ["root", None, "bad user"])
+def test_boot_identity_checked_before_guest_mutation(
+    boot_flow: SimpleNamespace,
+    user: str | None,
+) -> None:
+    metadata = vm_metadata.load_vm("vm1")
+    metadata["run_user"] = user
+    vm_metadata.metadata_path("vm1").write_text(json.dumps(metadata), encoding="utf-8")
+    if user == "root":
+        assert boot_flow.run("shell", "--root") == 0
+        assert boot_flow.names() == ["start", "hostname", "clock", "env", "attach"]
+    else:
+        assert boot_flow.run("shell", "--root") == 2
+        assert not {"hostname", "clock", "kvm", "docker", "attach"}.intersection(boot_flow.names())
+
+
+@pytest.mark.parametrize("provisioned", [False, True])
+def test_boot_failed_setup_needs_explicit_retry(
+    boot_flow: SimpleNamespace,
+    provisioned: bool,
+) -> None:
+    metadata = vm_metadata.load_vm("vm1")
+    metadata["provisioned"] = provisioned
+    vm_metadata.metadata_path("vm1").write_text(json.dumps(metadata), encoding="utf-8")
+    boot_flow.fail = "kvm"
+    assert boot_flow.run("run", "--reprovision", "--no-attach") == 1
+    assert vm_metadata.load_vm("vm1")["provisioned"] is provisioned
+    boot_flow.events.clear()
+    assert boot_flow.run("run", "--no-attach") == (0 if provisioned else 1)
+    assert not {"hostname", "clock", "prepare", "kvm", "docker", "mark"}.intersection(
+        boot_flow.names()
+    )
+    boot_flow.fail = None
+    boot_flow.events.clear()
+    assert boot_flow.run("run", "--reprovision", "--no-attach") == 0
+    assert "kvm" in boot_flow.names()
+    assert vm_metadata.load_vm("vm1")["provisioned"] is True
+
+
+@pytest.mark.parametrize("problem", ["missing-metadata", "project", "config"])
+def test_boot_root_diagnostics_do_not_bypass_host_validation(
+    boot_flow: SimpleNamespace,
+    problem: str,
+) -> None:
+    if problem == "missing-metadata":
+        vm_metadata.remove_vm("vm1")
+    elif problem == "project":
+        metadata = vm_metadata.load_vm("vm1")
+        metadata["project_root"] = "/another-project"
+        vm_metadata.metadata_path("vm1").write_text(json.dumps(metadata), encoding="utf-8")
+    else:
+        boot_flow.config.write_text('[sbx]\nport_forwards = ["invalid"]\nname = "vm1"\n')
+    assert boot_flow.run("shell", "--root") == 2
+    assert boot_flow.events == []
+
+
+@pytest.mark.parametrize("root_shell", [False, True])
+def test_boot_does_not_create_missing_runtime_account(
+    boot_flow: SimpleNamespace,
+    root_shell: bool,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    boot_flow.account_exists = False
+    args = ["shell", "--root"] if root_shell else ["run", "--no-attach"]
+    assert boot_flow.run(*args) == (0 if root_shell else 1)
+    assert not boot_flow.account_exists
+    assert "prepare" not in boot_flow.names()
+    assert "runtime user does not exist" in capsys.readouterr().err
+    assert ("attach" in boot_flow.names()) is root_shell
+
+
+@pytest.mark.parametrize("fail_clock", [False, True])
+def test_boot_root_provisioning_is_not_diagnostic(
+    boot_flow: SimpleNamespace,
+    fail_clock: bool,
+) -> None:
+    metadata = vm_metadata.load_vm("vm1")
+    metadata["run_user"] = "root"
+    vm_metadata.metadata_path("vm1").write_text(json.dumps(metadata), encoding="utf-8")
+    boot_flow.config.write_text(
+        '[sbx]\nname = "vm1"\nrun_user = "root"\nauth_port = false\n',
+        encoding="utf-8",
+    )
+    boot_flow.fail = "clock" if fail_clock else None
+    assert boot_flow.run("run", "--reprovision", "--no-attach") == int(fail_clock)
+    assert not {"kvm", "docker", "attach"}.intersection(boot_flow.names())
+    assert ("mark" in boot_flow.names()) is not fail_clock
+
+
+@pytest.mark.parametrize("keep_running", [False, True])
+def test_boot_running_session_keeps_environment_tunnel_and_cleanup(
+    boot_flow: SimpleNamespace,
+    keep_running: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    boot_flow.status = "running"
+    boot_flow.config.write_text(
+        '[sbx]\nname = "vm1"\nrun_user = "agent"\nauth_port = true\n'
+        'stop_on_exit = true\nenv = ["OLLAMA_HOST"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        cli.network,
+        "expose_auth_port",
+        lambda *args: boot_flow.events.append(("port", args, {})) or 0,
+    )
+    stopped = []
+    monkeypatch.setattr(runtime, "run_smolvm", lambda argv: stopped.append(argv) or 0)
+    assert boot_flow.run("run", *(["--keep-running"] if keep_running else [])) == 0
+    assert boot_flow.names() == ["env", "port", "command", "attach"]
+    assert boot_flow.events[0][1] == ("vm1", ["OLLAMA_HOST"])
+    assert session_state.active_sessions("vm1") == []
+    assert stopped == ([] if keep_running else [["sandbox", "stop", "vm1"]])
+
+
+@pytest.mark.parametrize("completed", [None, subprocess.CompletedProcess([], 1, "", "denied")])
+def test_guest_clock_errors_are_not_best_effort(completed) -> None:
+    with pytest.raises(cli.ConfigError, match="failed to sync VM clock"):
+        guest_setup.sync_guest_clock(
+            "vm1",
+            ssh=lambda name: ["ssh", name],
+            run_capture=lambda argv: completed,
+        )
+
+
+def test_boot_root_diagnostics_do_not_hide_programming_errors(
+    boot_flow: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken(*args, **kwargs):
+        raise RuntimeError("unexpected bug")
+
+    monkeypatch.setattr(guest_setup, "set_hostname", broken)
+    with pytest.raises(RuntimeError, match="unexpected bug"):
+        boot_flow.run("shell", "--root")
+    assert "attach" not in boot_flow.names()
