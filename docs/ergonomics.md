@@ -108,6 +108,33 @@ sbx config/state:
 
 When using a local image, `sbx doctor` should also warn if `[sbx].disk_size` is smaller than the local image rootfs. `sbx run` should fail early with the same explanation: set `disk_size` to at least the image rootfs size, remove `disk_size`, or rebuild the configured local image with a smaller rootfs.
 
+## Guest setup lifecycle
+
+Guest setup uses SSH and has three scopes:
+
+| Scope | Operations |
+| --- | --- |
+| Creation or requested reprovisioning | Prepare the runtime account, install requested tools, and apply initial-state/Git configuration safeguards. |
+| An sbx-managed start or requested reprovisioning | Restore hostname, synchronize clock, restore runtime-user KVM access, and start rootless Docker when supported by the image. |
+| Each run/shell invocation | Forward selected environment variables, establish requested authentication tunnels, validate the command when applicable, and manage attachment/session cleanup. |
+
+Reprovisioning is requested by `--reprovision` or CLI `--runtime-install`. A configured `runtime_install` list alone does not reprovision an existing VM. Starting and reprovisioning together performs boot setup once.
+
+Attaching to an already-running VM does not repeat boot setup. This also means upgrading sbx does not immediately repair an old hostname, and Docker is not automatically restarted if it dies during a boot. Apply setup explicitly:
+
+```bash
+sbx run --reprovision --no-attach
+# Or restart through sbx without deleting the VM disk:
+sbx stop
+sbx run
+```
+
+Boot setup targets the runtime user recorded for the VM, independently of the attachment user. If `sbx shell --root` starts a stopped VM, it still attempts KVM/Docker preparation for the recorded non-root user, then attaches as root. Explicitly root-provisioned VMs skip non-root KVM/Docker setup. Ordinary startup never creates a missing user; account creation is provisioning-only.
+
+Hostname, clock, KVM, and Docker setup failures stop normal startup/provisioning before attachment or no-attach success. The VM remains running for inspection. Diagnostic `sbx shell --root` reports guest boot-setup failures as warnings and allows inspection; start, configuration, and trusted identity errors remain fatal.
+
+There is no persistent boot-readiness tracking: a later ordinary attachment to that running VM does not retry failed setup and may proceed if provisioning eligibility checks pass. Use the explicit repair commands above. sbx also does not detect a reboot performed outside sbx when it next finds the VM already running.
+
 ## Shell completion
 
 Completion should be static and project-context oriented.
