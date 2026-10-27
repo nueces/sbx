@@ -3,12 +3,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from sbx import guest_setup, runtime
+from sbx import guest_setup, runtime, session_state
 
 
 @pytest.fixture
-def fake_guest_lifecycle(monkeypatch):
+def fake_guest_lifecycle(monkeypatch, tmp_path):
     """Keep CLI orchestration tests out of real VM/network/guest state."""
+    monkeypatch.setattr(session_state, "SBX_STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(session_state, "SESSIONS_FILE", tmp_path / "state" / "sessions.json")
     config = SimpleNamespace(env_vars={}, comm_channel="ssh", workspace_mounts=[])
     vm = SimpleNamespace(
         info=SimpleNamespace(config=config),
@@ -33,7 +35,13 @@ def fake_guest_lifecycle(monkeypatch):
     monkeypatch.setattr(guest_setup, "bootstrap_session", session)
     monkeypatch.setattr(guest_setup, "wait_for_control", lambda *a, **kw: None)
     monkeypatch.setattr(guest_setup, "start_vm", lambda *a, **kw: None)
-    monkeypatch.setattr(
-        guest_setup, "stop_vm", lambda name: runtime.run_smolvm(["sandbox", "stop", name])
-    )
+
+    def stop(name, *, only_if_idle=False):
+        if only_if_idle:
+            with session_state.session_lock():
+                if session_state.active_sessions(name):
+                    return 0
+        return runtime.run_smolvm(["sandbox", "stop", name])
+
+    monkeypatch.setattr(guest_setup, "stop_vm", stop)
     return guest

@@ -201,10 +201,9 @@ class Runtime:
         self.lock_fd = None
 
     def redact(self, text):
-        for name in self.env_names:
-            value = os.environ.get(name)
-            if value:
-                text = text.replace(value, "[redacted]")
+        values = {os.environ.get(name) for name in self.env_names}
+        for value in sorted(filter(None, values), key=len, reverse=True):
+            text = text.replace(value, "[redacted]")
         return text
 
     def run(self, argv, *, timeout=30, user=False, check=True):

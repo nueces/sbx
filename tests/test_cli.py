@@ -431,7 +431,7 @@ def test_shell_uses_configured_project_path_as_cwd(
     assert captured["attach"] == ("vm1", "agent", "bash", str(project))
 
 
-def test_shell_root_uses_configured_project_path_as_cwd(
+def test_shell_root_ignores_configured_project_path_as_cwd(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -454,7 +454,7 @@ def test_shell_root_uses_configured_project_path_as_cwd(
     rc = cli.main(["--config", str(config), "shell", "--root", "--keep-running"])
 
     assert rc == 0
-    assert captured["attach"] == ("vm1", "bash", str(project))
+    assert captured["attach"] == ("vm1", "bash", None)
 
 
 def test_shell_root_ignores_configured_run_user(

@@ -1,8 +1,6 @@
-import fcntl
 import json
 import os
 import re
-import stat
 import tempfile
 from collections.abc import Iterator, Mapping
 from contextlib import ExitStack, contextmanager
@@ -10,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from sbx.constants import SBX_VMS_DIR
-from sbx.runtime import ConfigError
+from sbx.runtime import ConfigError, exclusive_lock
 
 VM_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
@@ -57,21 +55,10 @@ def _ensure_directory() -> None:
 @contextmanager
 def lifecycle_lock(vm_name: str) -> Iterator[None]:
     path = metadata_path(vm_name).with_suffix(".lock")
-    _ensure_directory()
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-            raise ConfigError(f"untrusted lifecycle lock for VM {vm_name!r}")
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise ConfigError(
-                f"VM {vm_name!r} has a lifecycle operation in progress; retry later"
-            ) from exc
+    with exclusive_lock(
+        path, busy_message=f"VM {vm_name!r} has a lifecycle operation in progress; retry later"
+    ):
         yield
-    finally:
-        os.close(fd)
 
 
 class Lifecycle(ExitStack):

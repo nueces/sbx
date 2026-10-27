@@ -437,6 +437,40 @@ def test_guest_tools_keep_installer_security_context_and_deadline(
         )
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_overlapping_secrets_are_redacted_before_host_sanitization(
+    guest_script, account_home, monkeypatch, reverse
+):
+    values = {
+        "SBX_BASE": "https://registry.example",
+        "SBX_AUTH": "https://registry.example/?token=SYNTHETIC_SECRET",
+        "SBX_EMPTY": "",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    names = list(reversed(values)) if reverse else list(values)
+    result = SimpleNamespace(
+        returncode=1, stdout="install failed " + values["SBX_AUTH"], stderr="nonsecret details"
+    )
+    monkeypatch.setattr(guest_script.module.subprocess, "run", lambda *a, **kw: result)
+    guest = guest_script.module.Runtime(data(env_names=names))
+    host = bootstrap.GuestBootstrap(
+        SimpleNamespace(
+            info=SimpleNamespace(config=SimpleNamespace(workspace_mounts=[], env_vars={}))
+        ),
+        "agent",
+        "vm1",
+        names,
+    )
+    with pytest.raises(ValueError) as error:
+        guest.run(["synthetic-installer"])
+    message = host.sanitized(str(error.value))
+    assert "SYNTHETIC_SECRET" not in message
+    assert "token=" not in message
+    assert "[redacted]" in message and "nonsecret details" in message
+    assert guest.redact("unrelated output") == "unrelated output"
+
+
 def test_guest_installer_failure_is_redacted(guest_script, account_home, monkeypatch):
     monkeypatch.setenv("SBX_SECRET", "SENTINEL_SECRET")
     results = iter(

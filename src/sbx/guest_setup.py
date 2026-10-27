@@ -16,7 +16,7 @@ import smolvm.utils
 from smolvm.env import ENV_FILE, build_env_script
 from smolvm.vm import SmolVMManager
 
-from sbx import bootstrap, runtime, vm_metadata
+from sbx import bootstrap, runtime, session_state, vm_metadata
 from sbx.runtime import ConfigError, ssh_command
 
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -330,9 +330,13 @@ def stop_if_owned(vm_id: str) -> int:
     return _stop_manager(vm_id, manager, key)
 
 
-def stop_vm(vm_id: str) -> int:
+def stop_vm(vm_id: str, *, only_if_idle: bool = False) -> int:
     with vm_metadata.Lifecycle() as operation:
         operation.lock(vm_id)
+        if only_if_idle:
+            with session_state.session_lock():
+                if session_state.active_sessions(vm_id):
+                    return 0
         try:
             with open_guest(vm_id, legacy_ssh=True) as vm:
                 vm.wait_for_ready(timeout=10)
@@ -344,8 +348,12 @@ def stop_vm(vm_id: str) -> int:
                 f"sbx: warning: could not flush guest writes for {vm_id!r}; stopping anyway",
                 file=sys.stderr,
             )
-        manager, key = _manager_for(vm_id)
-        return _stop_manager(vm_id, manager, key)
+        with session_state.session_lock() if only_if_idle else nullcontext():
+            if only_if_idle and session_state.active_sessions(vm_id):
+                runtime.debug(f"not stopping {vm_id}: a session joined during flushing")
+                return 0
+            manager, key = _manager_for(vm_id)
+            return _stop_manager(vm_id, manager, key)
 
 
 def _phase(vm_id, name, arguments=None, *, user="root", guest=None, timeout=30):

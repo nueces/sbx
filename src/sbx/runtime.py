@@ -1,6 +1,8 @@
+import fcntl
 import json
 import os
 import shlex
+import stat
 import subprocess
 import sys
 from argparse import Namespace
@@ -30,6 +32,27 @@ def without_stale_sudo_env() -> Iterator[None]:
 
 class ConfigError(ValueError):
     pass
+
+
+@contextmanager
+def exclusive_lock(path: Path, *, busy_message: str, blocking: bool = False) -> Iterator[None]:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.parent.chmod(0o700)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        raise ConfigError(f"cannot open lock file {path}: {exc.strerror}") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ConfigError(f"untrusted lock file: {path}")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError as exc:
+            raise ConfigError(busy_message) from exc
+        yield
+    finally:
+        os.close(fd)
 
 
 def vm_name_from_arg_or_config(

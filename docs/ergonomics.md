@@ -110,12 +110,12 @@ When using a local image, `sbx doctor` should also warn if `[sbx].disk_size` is 
 
 ## Guest setup lifecycle
 
-Guest setup uses SSH and has three scopes:
+Guest bootstrap uses the configured control transport (SSH for the curated image) and has three normal-operation scopes:
 
 | Scope | Operations |
 | --- | --- |
 | Creation or requested reprovisioning | Prepare the runtime account, install requested tools, and apply initial-state/Git configuration safeguards. |
-| An sbx-managed start or requested reprovisioning | Restore hostname, synchronize clock, restore runtime-user KVM access, and start rootless Docker when supported by the image. |
+| A normal sbx-managed start or requested reprovisioning | Check/create the runtime account and home before workspace targets/mounts; restore hostname/clock and optional runtime-user KVM/Docker helpers. |
 | Each run/shell invocation | Forward selected environment variables, establish requested authentication tunnels, validate the command when applicable, and manage attachment/session cleanup. |
 
 Reprovisioning is requested by `--reprovision` or CLI `--runtime-install`. A configured `runtime_install` list alone does not reprovision an existing VM. Starting and reprovisioning together performs boot setup once.
@@ -129,11 +129,21 @@ sbx stop
 sbx run
 ```
 
-Boot setup targets the runtime user recorded for the VM, independently of the attachment user. If `sbx shell --root` starts a stopped VM, it still attempts KVM/Docker preparation for the recorded non-root user, then attaches as root. Explicitly root-provisioned VMs skip non-root KVM/Docker setup. Ordinary startup never creates a missing user; account creation is provisioning-only.
+Normal boot setup uses the recorded runtime identity. If neither account nor intended home exists, standard account creation initializes the home before workspace target creation. An existing account with a missing home, or an existing home without its intended account, requires explicit repair; sbx does not adopt/chown the home, reset existing UID/GID, or repair dotfiles. Initial installs/copies are not repeated on an ordinary restart.
 
-Hostname, clock, KVM, and Docker setup failures stop normal startup/provisioning before attachment or no-attach success. The VM remains running for inspection. Diagnostic `sbx shell --root` reports guest boot-setup failures as warnings and allows inspection; start, configuration, and trusted identity errors remain fatal.
+Diagnostic `sbx shell --root` bypasses mandatory account setup, environment synchronization, guest workspace mounting, hostname/clock and KVM/Docker helpers. It opens from a safe default directory even if `project_path` is configured but absent in the guest. It never marks provisioning successful; host startup, configuration and trusted identity checks still apply. After a diagnostic boot, explicitly reprovision or stop/start normally before expecting workspace/boot setup to be present.
+
+Hostname, clock, account, mount and helper failures stop normal startup/provisioning before attachment or no-attach success. The VM remains available for root inspection and explicit repair/retry.
+
+Nested KVM is optional. Default images omit its helper, so the KVM phase skips KVM-specific work without requiring guest `/dev/kvm`. Images built with `--nested-kvm` include the kernel support and helper; if that helper cannot access `/dev/kvm`, normal setup fails with host/CPU-exposure guidance. Root runtime users skip the non-root helper.
 
 There is no persistent boot-readiness tracking: a later ordinary attachment to that running VM does not retry failed setup and may proceed if provisioning eligibility checks pass. Use the explicit repair commands above. sbx also does not detect a reboot performed outside sbx when it next finds the VM already running.
+
+### Automatic stop versus explicit stop
+
+Automatic stop-on-exit applies only when the VM is idle. Already-active sessions suppress both flushing and stopping. If a new session is admitted during the bounded readiness/filesystem flush, automatic stop is canceled, even if the flush failed. Session registration and the final idle decision/stop are coordinated without holding the session registry lock through interactive use or provisioning. If stop commits first, a competing attachment waits and checks VM state again before launch; retry the run if the VM stopped.
+
+An explicit `sbx stop` is a direct request, not an idle-only policy. It may stop a VM with active sessions and disconnect a simultaneous new attachment. Flush failure/timeout warns but does not suppress that explicit stop or replace its result. Best-effort flushing is not guest shutdown and does not guarantee crash durability or cover writes made afterward.
 
 ## Shell completion
 

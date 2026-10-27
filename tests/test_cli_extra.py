@@ -12,6 +12,8 @@ import smolvm.utils
 
 from sbx import cli, guest_setup, lifecycle_warnings, runtime, session_state, vm_metadata, vm_state
 
+_ORIGINAL_ATTACH = guest_setup.attach
+
 
 @pytest.fixture(autouse=True)
 def isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_guest_lifecycle) -> None:
@@ -2418,6 +2420,74 @@ def test_boot_failure_blocks_normal_completion(
     assert not {"attach", "mark"}.intersection(boot_flow.names())
     assert boot_flow.status == "running"
     assert vm_metadata.load_vm("vm1")["provisioned"] is True
+
+
+@pytest.mark.parametrize("status", ["running", "stopped"])
+@pytest.mark.parametrize("root_shell", [False, True])
+def test_shell_working_directory_does_not_block_root_recovery(
+    boot_flow, monkeypatch, tmp_path, status, root_shell
+):
+    boot_flow.status = status
+    missing = tmp_path / "absent-guest-project"
+    with boot_flow.config.open("a") as handle:
+        handle.write(f"project_path = {json.dumps(str(missing))}\n")
+    commands = []
+
+    def attach(*args, **kwargs):
+        return _ORIGINAL_ATTACH(
+            *args,
+            **(
+                kwargs
+                | {
+                    "run": lambda argv: commands.append(argv) or 0,
+                    "ssh": lambda name: ["ssh", "synthetic-host"],
+                }
+            ),
+        )
+
+    monkeypatch.setattr(guest_setup, "attach", attach)
+    assert boot_flow.run("shell", *(["--root"] if root_shell else [])) == 0
+    assert (str(missing) in commands[0][-1]) is not root_shell
+    assert not missing.exists()
+    if root_shell:
+        assert not {"prepare", "mounts", "env", "mark"}.intersection(boot_flow.names())
+
+
+def test_failure_before_attachment_unregisters_without_automatic_stop(boot_flow, monkeypatch):
+    boot_flow.status = "running"
+    stopped = []
+    monkeypatch.setattr(
+        cli, "_print_created", lambda *a, **kw: (_ for _ in ()).throw(OSError("closed output"))
+    )
+    monkeypatch.setattr(guest_setup, "stop_vm", lambda *a, **kw: stopped.append(a))
+    with pytest.raises(OSError, match="closed output"):
+        cli._post_start_actions(
+            vm_name="vm1",
+            started_now=False,
+            command="pi",
+            attach=True,
+            run_user="agent",
+            auth_port=False,
+            stop_on_exit=True,
+            created_config=True,
+        )
+    assert session_state.active_sessions("vm1") == []
+    assert "attach" not in boot_flow.names()
+    assert not stopped
+
+
+def test_running_attachment_rechecks_vm_before_registering(boot_flow, monkeypatch, capsys):
+    boot_flow.status = "running"
+
+    def command(*args, **kwargs):
+        boot_flow.status = "stopped"
+        return "/usr/bin/pi"
+
+    monkeypatch.setattr(guest_setup, "command_path", command)
+    assert boot_flow.run("run") == 1
+    assert "attach" not in boot_flow.names()
+    assert session_state.active_sessions("vm1") == []
+    assert "retry" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("failed", [None, "hostname", "clock", "kvm", "docker"])

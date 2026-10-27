@@ -445,12 +445,8 @@ def _stop_vm_if_last_session(vm_id: str, *, stop_on_exit: bool) -> None:
     if not stop_on_exit:
         runtime.debug(f"not stopping {vm_id}: stop_on_exit disabled")
         return
-    if session_state.active_sessions(vm_id):
-        runtime.debug(f"not stopping {vm_id}: other sbx sessions still active")
-        return
-    runtime.debug(f"stopping {vm_id}: no other sbx sessions active")
     try:
-        guest_setup.stop_vm(vm_id)
+        guest_setup.stop_vm(vm_id, only_if_idle=True)
     except ConfigError as exc:
         print(f"sbx: warning: {exc}", file=sys.stderr)
 
@@ -509,107 +505,125 @@ def _post_start_actions(
     if run_user is not None and run_user != runtime_user:
         raise ConfigError(f"VM {vm_name!r} is provisioned for {runtime_user!r}, not {run_user!r}")
     needs_boot_setup = started_now or provision
-
+    registered = False
+    attempted_attach = False
     try:
-        with ExitStack() as scope:
-            operation = operation or vm_metadata.Lifecycle()
-            scope.callback(operation.close)
-            guest = None
-            if diagnostic_root and started_now:
-                guest_setup.wait_for_control(vm_name, timeout=boot_timeout)
-            if needs_boot_setup and not diagnostic_root:
-                operation.lock(vm_name)
-                guest = scope.enter_context(
-                    guest_setup.bootstrap_session(
-                        vm_name, runtime_user, env_names=forward_env or [], timeout=boot_timeout
+        try:
+            with ExitStack() as scope:
+                operation = operation or vm_metadata.Lifecycle()
+                scope.callback(operation.close)
+                guest = None
+                if needs_boot_setup:
+                    operation.lock(vm_name)
+                if diagnostic_root and started_now:
+                    guest_setup.wait_for_control(vm_name, timeout=boot_timeout)
+                if needs_boot_setup and not diagnostic_root:
+                    guest = scope.enter_context(
+                        guest_setup.bootstrap_session(
+                            vm_name, runtime_user, env_names=forward_env or [], timeout=boot_timeout
+                        )
                     )
-                )
-                if not boot_prepared:
-                    guest_setup.prepare_boot(vm_name, runtime_user, forward_env or [], guest=guest)
-                elif not _sync_forwarded_env_or_error(vm_name, forward_env or [], guest=guest):
+                    if not boot_prepared:
+                        guest_setup.prepare_boot(
+                            vm_name, runtime_user, forward_env or [], guest=guest
+                        )
+                    elif not _sync_forwarded_env_or_error(vm_name, forward_env or [], guest=guest):
+                        return 1
+                elif not diagnostic_root and not _sync_forwarded_env_or_error(
+                    vm_name, forward_env or []
+                ):
                     return 1
-            elif not diagnostic_root and not _sync_forwarded_env_or_error(
-                vm_name, forward_env or []
-            ):
-                return 1
-            if auth_port:
-                port_rc = network.expose_auth_port(vm_name, auth_host_port, auth_guest_port)
-                if port_rc != 0:
-                    return port_rc
-            if validate_agent and not provision and not metadata.get("provisioned"):
-                print(
-                    f"sbx: VM {vm_name!r} has not completed provisioning; "
-                    f"run `sbx run {vm_name} --reprovision --no-attach`",
-                    file=sys.stderr,
-                )
-                return 1
-            if provision:
-                if copy_initial_state and not was_provisioned:
-                    guest.phase("credentials")
-                if runtime_user != "root":
+                if auth_port:
+                    port_rc = network.expose_auth_port(vm_name, auth_host_port, auth_guest_port)
+                    if port_rc != 0:
+                        return port_rc
+                if validate_agent and not provision and not metadata.get("provisioned"):
+                    print(
+                        f"sbx: VM {vm_name!r} has not completed provisioning; "
+                        f"run `sbx run {vm_name} --reprovision --no-attach`",
+                        file=sys.stderr,
+                    )
+                    return 1
+                if provision:
+                    if copy_initial_state and not was_provisioned:
+                        guest.phase("credentials")
+                    if runtime_user != "root":
+                        guest_setup.ensure_kvm_access(vm_name, runtime_user, guest=guest)
+                    guest_setup.install_runtime_tools(
+                        vm_name, runtime_user, runtime_install or [], install_timeout, guest=guest
+                    )
+                    if not was_provisioned:
+                        guest_setup.install_git_config(
+                            vm_name, runtime_user, git_config_text, guest=guest
+                        )
+                    if runtime_user != "root":
+                        guest_setup.ensure_rootless_docker(vm_name, runtime_user, guest=guest)
+                elif needs_boot_setup and not diagnostic_root and runtime_user != "root":
                     guest_setup.ensure_kvm_access(vm_name, runtime_user, guest=guest)
-                guest_setup.install_runtime_tools(
-                    vm_name, runtime_user, runtime_install or [], install_timeout, guest=guest
-                )
-                if not was_provisioned:
-                    guest_setup.install_git_config(
-                        vm_name, runtime_user, git_config_text, guest=guest
-                    )
-                if runtime_user != "root":
                     guest_setup.ensure_rootless_docker(vm_name, runtime_user, guest=guest)
-            elif needs_boot_setup and not diagnostic_root and runtime_user != "root":
-                guest_setup.ensure_kvm_access(vm_name, runtime_user, guest=guest)
-                guest_setup.ensure_rootless_docker(vm_name, runtime_user, guest=guest)
-            resolved_command = command
-            if validate_agent:
-                try:
-                    resolved = guest_setup.command_path(
-                        vm_name, run_user or "root", command, run_capture=runtime.run_capture
-                    )
-                except ConfigError as exc:
-                    print(
-                        f"sbx: failed to check agent {agent_name or command!r}: {exc}",
-                        file=sys.stderr,
-                    )
-                    return 1
-                if resolved is None:
-                    print(
-                        f"sbx: agent {agent_name or command!r} was not found for user "
-                        f"{run_user or 'root'!r}; "
-                        "request its runtime installer or install it manually",
-                        file=sys.stderr,
-                    )
-                    return 1
-                resolved_command = resolved
+                resolved_command = command
+                if validate_agent:
+                    try:
+                        resolved = guest_setup.command_path(
+                            vm_name, run_user or "root", command, run_capture=runtime.run_capture
+                        )
+                    except ConfigError as exc:
+                        print(
+                            f"sbx: failed to check agent {agent_name or command!r}: {exc}",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    if resolved is None:
+                        print(
+                            f"sbx: agent {agent_name or command!r} was not found for user "
+                            f"{run_user or 'root'!r}; "
+                            "request its runtime installer or install it manually",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    resolved_command = resolved
+                if provision:
+                    guest.phase("check")
+                    vm_metadata.mark_provisioned(vm_name)
+                if attach:
+                    with session_state.session_lock():
+                        # Boot setup still owns the lifecycle lock; read-only reuse does not.
+                        if not needs_boot_setup and _get_existing_vm_status(vm_name) != "running":
+                            print(
+                                f"sbx: VM {vm_name!r} stopped before attachment; "
+                                f"retry `sbx run {vm_name}`",
+                                file=sys.stderr,
+                            )
+                            return 1
+                        session_state.register_session(vm_name, session_kind)
+                        registered = True
+        except Exception as exc:  # noqa: BLE001 - preserve provisioning diagnostics.
             if provision:
-                guest.phase("check")
-                vm_metadata.mark_provisioned(vm_name)
-    except Exception as exc:  # noqa: BLE001 - preserve provisioning diagnostics.
-        if provision:
-            _print_provisioning_failure(vm_name, exc, was_provisioned=was_provisioned)
-        elif isinstance(exc, ConfigError):
-            print(f"sbx: runtime startup check failed for VM {vm_name!r}: {exc}", file=sys.stderr)
-            print(f"sbx: VM {vm_name!r} is still running.", file=sys.stderr)
-            print(f"sbx: Inspect: sbx shell {vm_name} --root", file=sys.stderr)
-            print(f"sbx: Retry:   sbx run {vm_name} --reprovision --no-attach", file=sys.stderr)
-            print(f"sbx: Or stop/start: sbx stop {vm_name}; sbx run {vm_name}", file=sys.stderr)
-        else:
-            raise
-        return 1
-    # shortcut: running VMs skip failed boot work; use --reprovision to retry it.
+                _print_provisioning_failure(vm_name, exc, was_provisioned=was_provisioned)
+            elif isinstance(exc, ConfigError):
+                print(
+                    f"sbx: runtime startup check failed for VM {vm_name!r}: {exc}", file=sys.stderr
+                )
+                print(f"sbx: VM {vm_name!r} is still running.", file=sys.stderr)
+                print(f"sbx: Inspect: sbx shell {vm_name} --root", file=sys.stderr)
+                print(f"sbx: Retry:   sbx run {vm_name} --reprovision --no-attach", file=sys.stderr)
+                print(f"sbx: Or stop/start: sbx stop {vm_name}; sbx run {vm_name}", file=sys.stderr)
+            else:
+                raise
+            return 1
+        # shortcut: running VMs skip failed boot work; use --reprovision to retry it.
 
-    if created_config is not None:
-        _print_created(
-            vm_name,
-            config_created=created_config,
-            agent=agent_name or command,
-            attach=attach,
-            run_user=run_user,
-        )
-    if not attach:
-        return 0
-    session_state.register_session(vm_name, session_kind)
-    try:
+        if created_config is not None:
+            _print_created(
+                vm_name,
+                config_created=created_config,
+                agent=agent_name or command,
+                attach=attach,
+                run_user=run_user,
+            )
+        if not attach:
+            return 0
+        attempted_attach = True
         rc = guest_setup.attach(vm_name, resolved_command, user=run_user, cwd=cwd, run=runtime.run)
         if rc != 0 and validate_agent:
             print(
@@ -619,9 +633,12 @@ def _post_start_actions(
             )
         return rc
     finally:
-        remaining = session_state.unregister_session(vm_name)
-        runtime.debug(f"unregistered session for {vm_name}; remaining={remaining}")
-        _stop_vm_if_last_session(vm_name, stop_on_exit=stop_on_exit)
+        if registered:
+            with session_state.session_lock():
+                remaining = session_state.unregister_session(vm_name)
+            runtime.debug(f"unregistered session for {vm_name}; remaining={remaining}")
+            if attempted_attach:
+                _stop_vm_if_last_session(vm_name, stop_on_exit=stop_on_exit)
 
 
 def _arg_or_config(
@@ -1375,7 +1392,7 @@ def _cmd_shell(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
         run_user=run_user,
         auth_port=False,
         stop_on_exit=stop_on_exit,
-        cwd=project_guest_cwd,
+        cwd=None if args.root else project_guest_cwd,
         session_kind="shell",
         forward_env=forward_env,
         validate_agent=False,
