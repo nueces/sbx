@@ -7,9 +7,13 @@ import sys
 import tempfile
 import tomllib
 from collections.abc import Mapping, Sequence
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from pathlib import Path
 from typing import Any
+
+import smolvm
+import smolvm.utils
+from smolvm.exceptions import OperationTimeoutError
 
 import sbx.image.ls
 import sbx.network as network
@@ -235,11 +239,12 @@ def _sync_existing_vm_start_config(
     writable_mounts: bool,
     port_forwards: Sequence[str],
     project: Mapping[str, str] | None = None,
+    json_output: bool = False,
 ) -> None:
     if project is not None:
         vm_metadata.validate_vm_project(vm_name, project)
     current = vm_state.existing_vm_start_config(vm_name)
-    if current is None or current[0] == "running":
+    if current is None or current[0] in {"running", "paused"}:
         return
 
     desired_mounts = (
@@ -263,7 +268,10 @@ def _sync_existing_vm_start_config(
             "UPDATE vms SET config = ? WHERE id = ?",
             (json.dumps(config, separators=(",", ":")), vm_name),
         )
-    print(f"sbx: updated {', '.join(updated)} for existing VM '{vm_name}'")
+    print(
+        f"sbx: updated {', '.join(updated)} for existing VM '{vm_name}'",
+        file=sys.stderr if json_output else sys.stdout,
+    )
 
 
 def _project_guest_cwd(path_value: Any) -> str | None:
@@ -272,9 +280,9 @@ def _project_guest_cwd(path_value: Any) -> str | None:
     return str(_resolve_project_path(str(path_value)))
 
 
-def _sync_forwarded_env_or_error(vm_id: str, names: list[str]) -> bool:
+def _sync_forwarded_env_or_error(vm_id: str, names: list[str], *, guest=None) -> bool:
     try:
-        guest_setup.sync_forwarded_env(vm_id, names, run_capture=runtime.run_capture)
+        guest_setup.sync_forwarded_env(vm_id, names, run_capture=runtime.run_capture, guest=guest)
     except Exception as exc:  # noqa: BLE001 - keep CLI errors user-friendly.
         print(f"sbx: failed to sync environment for VM {vm_id!r}: {exc}", file=sys.stderr)
         return False
@@ -423,18 +431,14 @@ def _start_existing_vm_if_needed(
                 )
                 print(f"sbx: Run `sbx recreate {vm_id} --force`.", file=sys.stderr)
                 return 1
-    command = ["sandbox", "start", vm_id, "--boot-timeout", f"{boot_timeout:g}"]
-    completed = runtime.run_smolvm_capture(command)
-    if completed is None:
-        return 127
-    if completed.stderr:
-        print(completed.stderr, end="", file=sys.stderr)
-    if completed.stdout and (not json_output or completed.returncode != 0):
-        print(completed.stdout, end="", file=sys.stderr if json_output else sys.stdout)
-    rc = completed.returncode
-    if rc != 0:
-        _maybe_print_boot_timeout_running_hint(vm_id, boot_timeout)
-    return rc
+    try:
+        guest_setup.start_vm(vm_id, boot_timeout=boot_timeout, status=status)
+    except Exception as exc:  # noqa: BLE001 - preserve CLI startup diagnostics.
+        print(f"sbx: failed to start VM {vm_id!r}: {exc}", file=sys.stderr)
+        if isinstance(exc, (TimeoutError, OperationTimeoutError)):
+            _maybe_print_boot_timeout_running_hint(vm_id, boot_timeout)
+        return 1
+    return 0
 
 
 def _stop_vm_if_last_session(vm_id: str, *, stop_on_exit: bool) -> None:
@@ -445,7 +449,10 @@ def _stop_vm_if_last_session(vm_id: str, *, stop_on_exit: bool) -> None:
         runtime.debug(f"not stopping {vm_id}: other sbx sessions still active")
         return
     runtime.debug(f"stopping {vm_id}: no other sbx sessions active")
-    runtime.run_smolvm(["sandbox", "stop", vm_id])
+    try:
+        guest_setup.stop_vm(vm_id)
+    except ConfigError as exc:
+        print(f"sbx: warning: {exc}", file=sys.stderr)
 
 
 def _warn_initial_state_copy(vm_name: str) -> None:
@@ -489,6 +496,10 @@ def _post_start_actions(
     validate_agent: bool = True,
     agent_name: str | None = None,
     diagnostic_root: bool = False,
+    operation: vm_metadata.Lifecycle | None = None,
+    boot_prepared: bool = False,
+    created_config: bool | None = None,
+    boot_timeout: float = DEFAULT_BOOT_TIMEOUT,
 ) -> int:
     metadata = vm_metadata.load_vm(vm_name)
     runtime_user = metadata.get("run_user") if metadata else None
@@ -500,63 +511,79 @@ def _post_start_actions(
     needs_boot_setup = started_now or provision
 
     try:
-        if needs_boot_setup:
-            for action in (guest_setup.set_hostname, guest_setup.sync_guest_clock):
+        with ExitStack() as scope:
+            operation = operation or vm_metadata.Lifecycle()
+            scope.callback(operation.close)
+            guest = None
+            if diagnostic_root and started_now:
+                guest_setup.wait_for_control(vm_name, timeout=boot_timeout)
+            if needs_boot_setup and not diagnostic_root:
+                operation.lock(vm_name)
+                guest = scope.enter_context(
+                    guest_setup.bootstrap_session(
+                        vm_name, runtime_user, env_names=forward_env or [], timeout=boot_timeout
+                    )
+                )
+                if not boot_prepared:
+                    guest_setup.prepare_boot(vm_name, runtime_user, forward_env or [], guest=guest)
+                elif not _sync_forwarded_env_or_error(vm_name, forward_env or [], guest=guest):
+                    return 1
+            elif not diagnostic_root and not _sync_forwarded_env_or_error(
+                vm_name, forward_env or []
+            ):
+                return 1
+            if auth_port:
+                port_rc = network.expose_auth_port(vm_name, auth_host_port, auth_guest_port)
+                if port_rc != 0:
+                    return port_rc
+            if validate_agent and not provision and not metadata.get("provisioned"):
+                print(
+                    f"sbx: VM {vm_name!r} has not completed provisioning; "
+                    f"run `sbx run {vm_name} --reprovision --no-attach`",
+                    file=sys.stderr,
+                )
+                return 1
+            if provision:
+                if copy_initial_state and not was_provisioned:
+                    guest.phase("credentials")
+                if runtime_user != "root":
+                    guest_setup.ensure_kvm_access(vm_name, runtime_user, guest=guest)
+                guest_setup.install_runtime_tools(
+                    vm_name, runtime_user, runtime_install or [], install_timeout, guest=guest
+                )
+                if not was_provisioned:
+                    guest_setup.install_git_config(
+                        vm_name, runtime_user, git_config_text, guest=guest
+                    )
+                if runtime_user != "root":
+                    guest_setup.ensure_rootless_docker(vm_name, runtime_user, guest=guest)
+            elif needs_boot_setup and not diagnostic_root and runtime_user != "root":
+                guest_setup.ensure_kvm_access(vm_name, runtime_user, guest=guest)
+                guest_setup.ensure_rootless_docker(vm_name, runtime_user, guest=guest)
+            resolved_command = command
+            if validate_agent:
                 try:
-                    action(vm_name, run_capture=runtime.run_capture)
+                    resolved = guest_setup.command_path(
+                        vm_name, run_user or "root", command, run_capture=runtime.run_capture
+                    )
                 except ConfigError as exc:
-                    if not diagnostic_root:
-                        raise
-                    print(f"sbx: warning: {exc}", file=sys.stderr)
-        if not _sync_forwarded_env_or_error(vm_name, forward_env or []):
-            return 1
-        if auth_port:
-            port_rc = network.expose_auth_port(vm_name, auth_host_port, auth_guest_port)
-            if port_rc != 0:
-                return port_rc
-        if validate_agent and not provision and not metadata.get("provisioned"):
-            print(
-                f"sbx: VM {vm_name!r} has not completed provisioning; "
-                f"run `sbx run {vm_name} --reprovision --no-attach`",
-                file=sys.stderr,
-            )
-            return 1
-
-        if provision:
-            guest_setup.prepare_run_user(
-                vm_name,
-                runtime_user,
-                copy_initial_state=copy_initial_state and not was_provisioned,
-                run_capture=runtime.run_capture,
-            )
-            if runtime_user != "root":
-                guest_setup.ensure_kvm_access(
-                    vm_name, runtime_user, run_capture=runtime.run_capture
-                )
-            guest_setup.install_runtime_tools(
-                vm_name,
-                runtime_user,
-                runtime_install or [],
-                install_timeout,
-                run_capture=runtime.run_capture,
-            )
-            if not was_provisioned:
-                guest_setup.install_git_config(
-                    vm_name, runtime_user, git_config_text, run_capture=runtime.run_capture
-                )
-            if runtime_user != "root":
-                guest_setup.ensure_rootless_docker(
-                    vm_name, runtime_user, run_capture=runtime.run_capture
-                )
-            vm_metadata.mark_provisioned(vm_name)
-        elif needs_boot_setup and runtime_user != "root":
-            for action in (guest_setup.ensure_kvm_access, guest_setup.ensure_rootless_docker):
-                try:
-                    action(vm_name, runtime_user, run_capture=runtime.run_capture)
-                except ConfigError as exc:
-                    if not diagnostic_root:
-                        raise
-                    print(f"sbx: warning: {exc}", file=sys.stderr)
+                    print(
+                        f"sbx: failed to check agent {agent_name or command!r}: {exc}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                if resolved is None:
+                    print(
+                        f"sbx: agent {agent_name or command!r} was not found for user "
+                        f"{run_user or 'root'!r}; "
+                        "request its runtime installer or install it manually",
+                        file=sys.stderr,
+                    )
+                    return 1
+                resolved_command = resolved
+            if provision:
+                guest.phase("check")
+                vm_metadata.mark_provisioned(vm_name)
     except Exception as exc:  # noqa: BLE001 - preserve provisioning diagnostics.
         if provision:
             _print_provisioning_failure(vm_name, exc, was_provisioned=was_provisioned)
@@ -571,24 +598,14 @@ def _post_start_actions(
         return 1
     # shortcut: running VMs skip failed boot work; use --reprovision to retry it.
 
-    resolved_command = command
-    if validate_agent:
-        try:
-            resolved = guest_setup.command_path(
-                vm_name, run_user or "root", command, run_capture=runtime.run_capture
-            )
-        except ConfigError as exc:
-            print(f"sbx: failed to check agent {agent_name or command!r}: {exc}", file=sys.stderr)
-            return 1
-        if resolved is None:
-            print(
-                f"sbx: agent {agent_name or command!r} was not found for user "
-                f"{run_user or 'root'!r}; request its runtime installer or install it manually",
-                file=sys.stderr,
-            )
-            return 1
-        resolved_command = resolved
-
+    if created_config is not None:
+        _print_created(
+            vm_name,
+            config_created=created_config,
+            agent=agent_name or command,
+            attach=attach,
+            run_user=run_user,
+        )
     if not attach:
         return 0
     session_state.register_session(vm_name, session_kind)
@@ -811,10 +828,8 @@ def _start_local_image(
     copy_initial_state: bool = False,
     forward_env: list[str] | None = None,
     port_forwards: Sequence[str] = (),
+    operation: vm_metadata.Lifecycle | None = None,
 ) -> int:
-    from smolvm import SmolVM, VMConfig
-    from smolvm.utils import ensure_ssh_key
-
     _warn_obsolete_manifest_fields(manifest)
 
     kernel_path = lifecycle_warnings.manifest_path(image_dir, manifest, "kernel")
@@ -837,7 +852,7 @@ def _start_local_image(
     if boot_args is None:
         boot_args = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init"
 
-    private_key, public_key = ensure_ssh_key()
+    private_key, public_key = smolvm.utils.ensure_ssh_key()
     requested_name = _arg_or_config(args, "name", config, "sbx")
     memory = int(_arg_or_config(args, "memory", config, "sbx", default=512))
     cpus_value = _arg_or_config(args, "cpus", config, "sbx")
@@ -873,58 +888,51 @@ def _start_local_image(
     if requested_name:
         vm_config["vm_id"] = str(requested_name)
 
-    vm = SmolVM(
-        VMConfig(**vm_config),
+    vm = smolvm.SmolVM(
+        smolvm.VMConfig(**vm_config),
         ssh_key_path=str(private_key),
         mounts=list(mounts),
         writable_mounts=writable_mounts,
     )
-    try:
-        vm.start(boot_timeout=boot_timeout)
-        vm.wait_for_ssh(timeout=boot_timeout)
-        vm_name = vm.vm_id
-        vm_metadata.claim_vm(
-            str(vm_name), _project_identity(args, config), run_user or "root", created=True
+    with operation or vm_metadata.Lifecycle() as operation:
+        try:
+            vm_name = str(vm.vm_id)
+            operation.lock(vm_name)
+            vm_metadata.claim_vm(
+                vm_name, _project_identity(args, config), run_user or "root", created=True
+            )
+            guest_setup.start_vm(vm_name, boot_timeout=boot_timeout, status="created")
+        finally:
+            vm.close()
+        config_created = _maybe_write_project_config(
+            args, config, vm_name=vm_name, agent=agent, created=True
         )
-    except Exception:
-        vm.close()
-        raise
-    vm.close()
-
-    config_created = _maybe_write_project_config(
-        args, config, vm_name=str(vm_name), agent=agent, created=True
-    )
-    json_output = bool(getattr(args, "json", False))
-    if not json_output:
-        _print_created(
-            str(vm_name),
-            config_created=config_created,
-            agent=agent,
+        json_output = bool(getattr(args, "json", False))
+        rc = _post_start_actions(
+            vm_name=vm_name,
+            started_now=True,
+            command=LAUNCH_COMMANDS[agent],
             attach=attach,
             run_user=run_user,
+            auth_port=auth_port,
+            auth_host_port=auth_host_port,
+            auth_guest_port=auth_guest_port,
+            stop_on_exit=stop_on_exit,
+            cwd=cwd,
+            git_config_text=git_config_text,
+            forward_env=forward_env,
+            provision=True,
+            runtime_install=runtime_install,
+            install_timeout=install_timeout,
+            copy_initial_state=copy_initial_state,
+            agent_name=agent,
+            operation=operation,
+            created_config=None if json_output else config_created,
+            boot_timeout=boot_timeout,
         )
-    rc = _post_start_actions(
-        vm_name=str(vm_name),
-        started_now=True,
-        command=LAUNCH_COMMANDS[agent],
-        attach=attach,
-        run_user=run_user,
-        auth_port=auth_port,
-        auth_host_port=auth_host_port,
-        auth_guest_port=auth_guest_port,
-        stop_on_exit=stop_on_exit,
-        cwd=cwd,
-        git_config_text=git_config_text,
-        forward_env=forward_env,
-        provision=True,
-        runtime_install=runtime_install,
-        install_timeout=install_timeout,
-        copy_initial_state=copy_initial_state,
-        agent_name=agent,
-    )
-    if rc == 0 and json_output:
-        print(json.dumps({"vm": {"name": str(vm_name), "status": "running"}}))
-    return rc
+        if rc == 0 and json_output:
+            print(json.dumps({"vm": {"name": vm_name, "status": "running"}}))
+        return rc
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -948,7 +956,14 @@ def cmd_image_ls(args: argparse.Namespace) -> int:
     return sbx.image.ls.main_from_args(args)
 
 
-def cmd_start(args: argparse.Namespace) -> int:
+def cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle | None = None) -> int:
+    if operation is not None:
+        return _cmd_start(args, operation)
+    with vm_metadata.Lifecycle() as operation:
+        return _cmd_start(args, operation)
+
+
+def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> int:
     config = args.config_data
     sbx_cfg = _sbx_config(config)
     project_identity = _project_identity(args, config)
@@ -1042,6 +1057,14 @@ def cmd_start(args: argparse.Namespace) -> int:
     if requested_name:
         requested_name = guest_setup.validate_vm_name(str(requested_name))
         existing_status = _get_existing_vm_status(str(requested_name))
+        saved_identity = vm_metadata.load_vm(str(requested_name))
+        claim_changes = saved_identity is not None and any(
+            saved_identity.get(key) != project_identity[key]
+            for key in ("project_root", "config_path")
+        )
+        if existing_status != "running" or reprovision or forward_env or claim_changes:
+            operation.lock(str(requested_name))
+            existing_status = _get_existing_vm_status(str(requested_name))
         runtime.debug(f"existing VM lookup: name={requested_name!r}, status={existing_status!r}")
         if existing_status is not None:
             if image is not None:
@@ -1064,6 +1087,7 @@ def cmd_start(args: argparse.Namespace) -> int:
                         writable_mounts=writable_mounts,
                         port_forwards=port_forwards,
                         project=project_identity,
+                        json_output=bool(args.json),
                     )
                 except ConfigError as exc:
                     print(f"sbx: {exc}", file=sys.stderr)
@@ -1107,6 +1131,8 @@ def cmd_start(args: argparse.Namespace) -> int:
                 install_timeout=install_timeout,
                 copy_initial_state=copy_host_credentials,
                 agent_name=str(agent),
+                operation=operation,
+                boot_timeout=boot_timeout,
             )
             if rc == 0 and args.json:
                 print(json.dumps({"vm": {"name": str(requested_name), "status": "running"}}))
@@ -1145,12 +1171,15 @@ def cmd_start(args: argparse.Namespace) -> int:
                 copy_initial_state=copy_host_credentials,
                 forward_env=forward_env,
                 port_forwards=port_forwards,
+                operation=operation,
             )
         except ConfigError as exc:
             print(f"sbx: {exc}", file=sys.stderr)
             return 2
         except Exception as exc:  # noqa: BLE001 - keep CLI errors user-friendly.
-            if _maybe_print_boot_timeout_running_hint(
+            if isinstance(
+                exc, (TimeoutError, OperationTimeoutError)
+            ) and _maybe_print_boot_timeout_running_hint(
                 str(requested_name) if requested_name else None, boot_timeout
             ):
                 return 1
@@ -1190,10 +1219,15 @@ def cmd_start(args: argparse.Namespace) -> int:
             before_provision=lambda new_vm_name: vm_metadata.claim_vm(
                 new_vm_name, project_identity, str(run_user or "root"), created=True
             ),
+            run_user=str(run_user),
+            forward_env=forward_env,
+            operation=operation,
         )
         vm_name = str(vm.vm_id)
     except Exception as exc:  # noqa: BLE001 - keep CLI errors user-friendly.
-        if _maybe_print_boot_timeout_running_hint(
+        if isinstance(
+            exc, (TimeoutError, OperationTimeoutError)
+        ) and _maybe_print_boot_timeout_running_hint(
             str(requested_name) if requested_name else None, boot_timeout
         ):
             return 1
@@ -1209,15 +1243,6 @@ def cmd_start(args: argparse.Namespace) -> int:
     config_created = _maybe_write_project_config(
         args, config, vm_name=vm_name, agent=str(agent), created=True
     )
-    if not args.json:
-        _print_created(
-            vm_name,
-            config_created=config_created,
-            agent=str(agent),
-            attach=attach,
-            run_user=str(run_user) if run_user is not None else None,
-        )
-
     if git_config:
         git_config_text = guest_setup.host_git_config(project_root)
     rc = _post_start_actions(
@@ -1238,6 +1263,10 @@ def cmd_start(args: argparse.Namespace) -> int:
         install_timeout=install_timeout,
         copy_initial_state=copy_host_credentials,
         agent_name=str(agent),
+        operation=operation,
+        boot_prepared=True,
+        created_config=None if args.json else config_created,
+        boot_timeout=boot_timeout,
     )
     if rc == 0 and args.json:
         print(json.dumps({"vm": {"name": vm_name, "status": "running"}}))
@@ -1255,6 +1284,11 @@ def _confirm_destructive_action(message: str, *, force: bool) -> bool:
 
 
 def cmd_shell(args: argparse.Namespace) -> int:
+    with vm_metadata.Lifecycle() as operation:
+        return _cmd_shell(args, operation)
+
+
+def _cmd_shell(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> int:
     config = args.config_data
     project_identity = _project_identity(args, config)
     name = runtime.vm_name_from_arg_or_config(args, config, "shell")
@@ -1294,6 +1328,12 @@ def cmd_shell(args: argparse.Namespace) -> int:
     if existing_status is None:
         print(f"sbx: {runtime.missing_vm_message(name)}", file=sys.stderr)
         return 1
+    saved_identity = vm_metadata.load_vm(name)
+    claim_changes = saved_identity is not None and any(
+        saved_identity.get(key) != project_identity[key] for key in ("project_root", "config_path")
+    )
+    if existing_status != "running" or (forward_env and not args.root) or claim_changes:
+        operation.lock(name)
     vm_metadata.claim_vm(
         name, project_identity, str(run_user) if run_user is not None else None, created=False
     )
@@ -1305,6 +1345,7 @@ def cmd_shell(args: argparse.Namespace) -> int:
                 writable_mounts=False,
                 port_forwards=port_forwards,
                 project=project_identity,
+                json_output=False,
             )
         except ConfigError as exc:
             print(f"sbx: {exc}", file=sys.stderr)
@@ -1338,6 +1379,7 @@ def cmd_shell(args: argparse.Namespace) -> int:
         session_kind="shell",
         forward_env=forward_env,
         validate_agent=False,
+        operation=operation,
     )
 
 
@@ -1346,7 +1388,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
     name = runtime.vm_name_from_arg_or_config(args, config, "stop")
     if name is None:
         return 2
-    return runtime.run_smolvm(["sandbox", "stop", name])
+    return guest_setup.stop_vm(name)
 
 
 def cmd_remove(args: argparse.Namespace) -> int:
@@ -1356,10 +1398,14 @@ def cmd_remove(args: argparse.Namespace) -> int:
         return 2
     if not _confirm_destructive_action(f"Destroy VM '{name}'?", force=args.force):
         return 2
-    return _delete_vm(name)
+    with vm_metadata.Lifecycle() as operation:
+        operation.lock(name)
+        return _delete_vm(name)
 
 
 def _delete_vm(vm_id: str, extra_args: Sequence[str] | None = None, *, quiet: bool = False) -> int:
+    if guest_setup.stop_if_owned(vm_id):
+        return 1
     extra = list(extra_args or [])
     completed = runtime.run_smolvm_capture(["sandbox", "delete", vm_id, *extra, "--json"])
     if completed is None:
@@ -1409,14 +1455,16 @@ def cmd_recreate(args: argparse.Namespace) -> int:
     if not _confirm_destructive_action(f"Destroy and recreate VM '{name}'?", force=force):
         return 2
 
-    json_output = bool(getattr(args, "json", False))
-    destroy_rc = _delete_vm(str(name), quiet=True) if json_output else _delete_vm(str(name))
-    if destroy_rc != 0:
-        return destroy_rc
-    args.name = str(name)
-    args.attach = False
-    args.auth_port = False
-    return cmd_start(args)
+    with vm_metadata.Lifecycle() as operation:
+        operation.lock(str(name))
+        json_output = bool(getattr(args, "json", False))
+        destroy_rc = _delete_vm(str(name), quiet=True) if json_output else _delete_vm(str(name))
+        if destroy_rc != 0:
+            return destroy_rc
+        args.name = str(name)
+        args.attach = False
+        args.auth_port = False
+        return cmd_start(args, operation=operation)
 
 
 def _add_start_options(parser: argparse.ArgumentParser) -> None:

@@ -1,8 +1,11 @@
+import fcntl
 import json
 import os
 import re
+import stat
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +52,39 @@ def load_vm_metadata() -> dict[str, dict[str, Any]]:
 def _ensure_directory() -> None:
     SBX_VMS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     SBX_VMS_DIR.chmod(0o700)
+
+
+@contextmanager
+def lifecycle_lock(vm_name: str) -> Iterator[None]:
+    path = metadata_path(vm_name).with_suffix(".lock")
+    _ensure_directory()
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ConfigError(f"untrusted lifecycle lock for VM {vm_name!r}")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ConfigError(
+                f"VM {vm_name!r} has a lifecycle operation in progress; retry later"
+            ) from exc
+        yield
+    finally:
+        os.close(fd)
+
+
+class Lifecycle(ExitStack):
+    """Own lifecycle locks until guest work is complete, never through attachment."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.names: set[str] = set()
+
+    def lock(self, vm_name: str) -> None:
+        if vm_name not in self.names:
+            self.enter_context(lifecycle_lock(vm_name))
+            self.names.add(vm_name)
 
 
 def _write(vm_name: str, data: Mapping[str, Any], *, exclusive: bool = False) -> bool:
@@ -118,8 +154,9 @@ def claim_vm(
             f"VM {vm_name!r} is provisioned for {recorded_user!r}, not {run_user!r}; "
             f"run `sbx recreate {vm_name} --force`"
         )
-    saved.update(project_root=project["project_root"], config_path=project["config_path"])
-    _write(vm_name, saved)
+    if any(saved.get(key) != project[key] for key in ("project_root", "config_path")):
+        saved.update(project_root=project["project_root"], config_path=project["config_path"])
+        _write(vm_name, saved)
     return saved
 
 
