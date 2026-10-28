@@ -42,7 +42,22 @@ RUNTIME_INSTALLERS = ("pi", "specify")
 MIB = 1024 * 1024
 LAUNCH_COMMANDS = {"pi": "pi", "claude": "claude", "codex": "codex"}
 DEFAULT_CONFIG_PATHS = (Path.home() / ".config" / "sbx" / "config.toml",)
-LOCAL_CONFIG_PATHS = (Path.cwd() / ".sbx.toml",)
+
+
+class ProjectConfig(dict):
+    project_config: Path | None = None
+
+
+def _find_project_config() -> Path | None:
+    cwd = Path.cwd().resolve()
+    for directory in (cwd, *cwd.parents):
+        candidate = directory / ".sbx.toml"
+        try:
+            if candidate.exists() or candidate.is_symlink():
+                return candidate.resolve(strict=False)
+        except OSError as exc:
+            raise ConfigError(f"{candidate}: {exc}") from exc
+    return None
 
 
 def _deep_merge(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
@@ -68,29 +83,54 @@ def _read_toml(path: Path) -> dict[str, Any]:
     return data
 
 
-def load_config(explicit_path: str | None = None) -> dict[str, Any]:
+def load_config(explicit_path: str | None = None) -> ProjectConfig:
     """Load sbx config.
 
     Precedence, lowest to highest:
       1. default config path: ~/.config/sbx/config.toml
-      2. current directory config: ./.sbx.toml
+      2. nearest ancestor .sbx.toml
       3. --config PATH, when provided
       4. CLI flags, applied separately by each command
     """
-    paths = [*DEFAULT_CONFIG_PATHS, *LOCAL_CONFIG_PATHS]
+    project_config = _find_project_config()
+    paths = [path for path in DEFAULT_CONFIG_PATHS if path.exists()]
+    if project_config is not None:
+        paths.append(project_config)
     if explicit_path:
         explicit = Path(explicit_path).expanduser()
         if not explicit.exists():
             raise ConfigError(f"{explicit}: config file does not exist")
+        project_config = explicit.resolve()
         paths.append(explicit)
 
-    config: dict[str, Any] = {}
+    config = ProjectConfig()
+    config.project_config = project_config
     for path in paths:
-        if path.exists():
-            runtime.debug(f"loading config: {path}")
-            config = _deep_merge(config, _read_toml(path))
+        path = path.expanduser().resolve(strict=False)
+        runtime.debug(f"loading config: {path}")
+        layer = _read_toml(path)
+        sbx = _section(layer, "sbx")
+        # Normalize each layer before merging so inherited paths keep their own base.
+        for key in ("project_path", "image"):
+            if sbx.get(key) is not None:
+                sbx[key] = _config_path(str(sbx[key]), path.parent)
+        if sbx.get("mount") is not None:
+            mounts = []
+            for mount in _list_value(sbx["mount"], key="[sbx].mount"):
+                host, separator, guest = mount.rpartition(":")
+                if separator:
+                    mounts.append(f"{_config_path(host, path.parent)}:{guest}")
+                else:
+                    mounts.append(_config_path(mount, path.parent))
+            sbx["mount"] = mounts
+        config.update(_deep_merge(config, layer))
     runtime.debug(f"merged config: {config}")
     return config
+
+
+def _config_path(value: str, base: Path) -> str:
+    path = Path(value).expanduser()
+    return str((path if path.is_absolute() else base / path).resolve(strict=False))
 
 
 def _section(config: Mapping[str, Any], name: str) -> Mapping[str, Any]:
@@ -162,11 +202,22 @@ def _resolve_project_path(path_value: str) -> Path:
 
 def _project_identity(args: argparse.Namespace, config: Mapping[str, Any]) -> dict[str, str]:
     explicit = getattr(args, "config", None)
-    if explicit:
+    local_write = bool(getattr(args, "write_config", False))
+    if local_write:
+        config_path = _project_config_path().resolve(strict=False)
+        root = config_path.parent
+        name = getattr(args, "name", None) or _cfg(config, "sbx", "name")
+        saved = vm_metadata.load_vm(str(name)) if name else None
+        if saved and saved.get("project_root") != str(root):
+            raise ConfigError(
+                f"VM {name!r} belongs to {saved.get('project_root')}; choose a different VM name "
+                f"for the local project or invoke from {saved.get('project_root')}"
+            )
+    elif explicit:
         config_path = Path(str(explicit)).expanduser().resolve(strict=False)
         root = config_path.parent
-    elif LOCAL_CONFIG_PATHS[0].exists():
-        config_path = LOCAL_CONFIG_PATHS[0].resolve(strict=False)
+    elif (selected := getattr(config, "project_config", None)) is not None:
+        config_path = selected.resolve(strict=False)
         root = config_path.parent
     else:
         project_path = _cfg(config, "sbx", "project_path")
@@ -274,10 +325,30 @@ def _sync_existing_vm_start_config(
     )
 
 
-def _project_guest_cwd(path_value: Any) -> str | None:
+def _project_guest_cwd(path_value: Any, *, explicit: bool = False) -> str | None:
     if path_value is None:
         return None
-    return str(_resolve_project_path(str(path_value)))
+    project = _resolve_project_path(str(path_value))
+    cwd = Path.cwd().resolve()
+    return str(cwd if not explicit and cwd.is_relative_to(project) else project)
+
+
+def _mounted_guest_cwd(vm_name: str, requested: str | None) -> str | None:
+    current = vm_state.existing_vm_start_config(vm_name)
+    if current is None:
+        return requested
+    target = Path(requested) if requested is not None else Path.cwd().resolve()
+    mounts = current[1].get("workspace_mounts", [])
+    for mount in sorted(mounts, key=lambda item: len(Path(item["host_path"]).parts), reverse=True):
+        host = Path(mount["host_path"]).resolve()
+        if target.is_relative_to(host):
+            return str(Path(mount["guest_path"]) / target.relative_to(host))
+    if requested is not None:
+        raise ConfigError(
+            f"session directory {requested!r} is not mounted in VM {vm_name!r}; "
+            "stop the VM and use `sbx run` to apply project mounts"
+        )
+    return None
 
 
 def _sync_forwarded_env_or_error(vm_id: str, names: list[str], *, guest=None) -> bool:
@@ -473,7 +544,7 @@ def _post_start_actions(
     *,
     vm_name: str,
     started_now: bool,
-    command: str,
+    command: str | None,
     attach: bool,
     run_user: str | None,
     auth_port: bool,
@@ -547,6 +618,7 @@ def _post_start_actions(
                 if provision:
                     if copy_initial_state and not was_provisioned:
                         guest.phase("credentials")
+                    guest.phase("ssh", {"public_key": guest.vm.info.config.ssh_public_key})
                     if runtime_user != "root":
                         guest_setup.ensure_kvm_access(vm_name, runtime_user, guest=guest)
                     guest_setup.install_runtime_tools(
@@ -561,11 +633,18 @@ def _post_start_actions(
                 elif needs_boot_setup and not diagnostic_root and runtime_user != "root":
                     guest_setup.ensure_kvm_access(vm_name, runtime_user, guest=guest)
                     guest_setup.ensure_rootless_docker(vm_name, runtime_user, guest=guest)
+                session_cwd = (
+                    _mounted_guest_cwd(vm_name, cwd) if attach and not diagnostic_root else None
+                )
                 resolved_command = command
                 if validate_agent:
                     try:
                         resolved = guest_setup.command_path(
-                            vm_name, run_user or "root", command, run_capture=runtime.run_capture
+                            vm_name,
+                            run_user or "root",
+                            command,
+                            cwd=session_cwd,
+                            run_capture=runtime.run_capture,
                         )
                     except ConfigError as exc:
                         print(
@@ -623,10 +702,10 @@ def _post_start_actions(
             )
         if not attach:
             return 0
-        attempted_attach = True
         try:
+            attempted_attach = True
             rc = guest_setup.attach(
-                vm_name, resolved_command, user=run_user, cwd=cwd, run=runtime.run
+                vm_name, resolved_command, user=run_user, cwd=session_cwd, run=runtime.run
             )
         except ConfigError as exc:
             attempted_attach = False
@@ -690,7 +769,7 @@ def _manifest_run_user(manifest: Mapping[str, Any]) -> str | None:
 
 
 def _project_config_path() -> Path:
-    return LOCAL_CONFIG_PATHS[0]
+    return Path.cwd() / ".sbx.toml"
 
 
 def _toml_value(value: Any) -> str:
@@ -707,17 +786,44 @@ def _toml_value(value: Any) -> str:
 def _project_config_values(
     args: argparse.Namespace, config: Mapping[str, Any], *, vm_name: str, agent: str
 ) -> dict[str, Any]:
-    values: dict[str, Any] = {"name": vm_name, "agent": agent}
-    for key in ("image", "memory", "cpus", "disk_size", "project_path", "run_user"):
+    # A new local project must retain choices loaded from its previous config source.
+    inherit = getattr(args, "write_config", False) and not _project_config_path().exists()
+    inherited = _sbx_config(config) if inherit else {}
+    values = {
+        key: inherited[key]
+        for key in (
+            "os",
+            "backend",
+            "copy_host_credentials",
+            "git_config",
+            "port_forwards",
+            "auth_port",
+            "auth_host_port",
+            "auth_guest_port",
+        )
+        if key in inherited
+    }
+    values.update(name=vm_name, agent=agent)
+    for key in (
+        "image",
+        "memory",
+        "cpus",
+        "disk_size",
+        "project_path",
+        "run_user",
+        "mount",
+        "writable_mounts",
+        "env",
+        "runtime_install",
+        "boot_timeout",
+        "install_timeout",
+        "stop_on_exit",
+    ):
         value = getattr(args, key, None)
+        if value is None:
+            value = inherited.get(key)
         if value is not None:
             values[key] = value
-    if getattr(args, "writable_mounts", None) is not None:
-        values["writable_mounts"] = bool(args.writable_mounts)
-    if getattr(args, "env", None) is not None:
-        values["env"] = list(args.env)
-    if getattr(args, "runtime_install", None) is not None:
-        values["runtime_install"] = list(args.runtime_install)
     return values
 
 
@@ -774,11 +880,14 @@ def _maybe_write_project_config(
     agent: str,
     created: bool,
 ) -> bool:
-    if getattr(args, "action", None) not in {"run", "create"}:
-        return False
+    action = getattr(args, "action", None)
     write_config = getattr(args, "write_config", None)
+    if action not in {"run", "create"} and not (action == "recreate" and write_config):
+        return False
     path = _project_config_path()
     exists = path.exists()
+    if getattr(config, "project_config", None) is not None and write_config is not True:
+        return False
     if exists and write_config is not True:
         return False
     if not exists and not created and write_config is not True:
@@ -1034,7 +1143,7 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
     effective_mounts: list[str] = []
 
     project_path = _arg_or_config(args, "project_path", config, "sbx")
-    project_guest_cwd = _project_guest_cwd(project_path)
+    project_guest_cwd = _project_guest_cwd(project_path, explicit=args.project_path is not None)
     if project_path is not None:
         effective_mounts.append(_same_path_mount(str(project_path)))
 
@@ -1337,7 +1446,7 @@ def _cmd_shell(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
     elif not args.root:
         run_user = guest_setup.host_username()
     project_path = args.project_path or _cfg(config, "sbx", "project_path")
-    project_guest_cwd = _project_guest_cwd(project_path)
+    project_guest_cwd = _project_guest_cwd(project_path, explicit=args.project_path is not None)
     keep_running = bool(getattr(args, "keep_running", False))
     stop_on_exit = bool(_cfg(config, "sbx", "stop_on_exit", True)) and not keep_running
     try:
@@ -1394,7 +1503,7 @@ def _cmd_shell(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
         vm_name=name,
         started_now=existing_status != "running",
         diagnostic_root=bool(args.root),
-        command="bash",
+        command=None,
         attach=True,
         run_user=run_user,
         auth_port=False,
@@ -1481,6 +1590,8 @@ def cmd_recreate(args: argparse.Namespace) -> int:
 
     with vm_metadata.Lifecycle() as operation:
         operation.lock(str(name))
+        if getattr(args, "write_config", False):
+            _project_identity(args, config)  # Reject foreign ownership before destructive work.
         json_output = bool(getattr(args, "json", False))
         destroy_rc = _delete_vm(str(name), quiet=True) if json_output else _delete_vm(str(name))
         if destroy_rc != 0:
@@ -1574,7 +1685,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="sbx", description="Run coding agents inside a SmolVM sandbox."
     )
     parser.add_argument(
-        "--config", help="Path to a TOML config file. Overrides default and local config files."
+        "--config", help="TOML override for user defaults and the nearest ancestor .sbx.toml."
     )
     parser.add_argument(
         "--debug", action="store_true", help="Print sbx debug diagnostics to stderr."
@@ -1622,7 +1733,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     shell.add_argument(
         "--project-path",
-        help="Start the shell in this mounted project path (default: [sbx].project_path).",
+        help="Start here instead of preserving the invoking subdirectory of the project mount.",
     )
     shell.add_argument(
         "--root",

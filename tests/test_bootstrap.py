@@ -1010,3 +1010,116 @@ def test_staging_rejects_active_shared_storage(
 def test_resource_compiles_without_checkout_execution():
     resource = files("sbx.image").joinpath("resources/scripts/sbx-bootstrap.py")
     compile(resource.read_text(), str(resource), "exec")
+
+
+@pytest.fixture
+def ssh_guest(guest_script):
+    guest_script.module.Runtime(data()).account()
+    guest = guest_script.module.Runtime(
+        data(phase="ssh", arguments={"public_key": "ssh-ed25519 cHVibGlj sbx comment"})
+    )
+    return guest_script, guest, Path(guest_script.accounts["agent"].pw_dir)
+
+
+def test_authorize_user_key_is_idempotent_and_preserves_restricted_entries(ssh_guest):
+    script, guest, home = ssh_guest
+    directory = home / ".ssh"
+    directory.mkdir()
+    path = directory / "authorized_keys"
+    original = '# Keep this\ncommand="echo no access",no-pty ssh-ed25519 cHVibGlj existing\n'
+    path.write_text(original)
+    path.chmod(0o666)
+    guest.execute()
+    guest.execute()
+    assert path.read_text() == original
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert directory.stat().st_mode & 0o777 == 0o700
+    assert path.stat().st_uid == script.accounts["agent"].pw_uid
+
+
+@pytest.mark.parametrize("trailing_newline", [False, True])
+def test_authorize_user_key_appends_without_replacing_existing_file(ssh_guest, trailing_newline):
+    _, guest, home = ssh_guest
+    directory = home / ".ssh"
+    directory.mkdir()
+    path = directory / "authorized_keys"
+    original = "ssh-ed25519 b3RoZXI= unrelated" + ("\n" if trailing_newline else "")
+    path.write_text(original)
+    inode = path.stat().st_ino
+    # A previous implementation's abandoned file is unrelated to append-only installation.
+    abandoned = directory / ".sbx-authorized-keys"
+    abandoned.write_text("leave this alone")
+    guest.execute()
+    guest.execute()
+    assert path.read_text() == "ssh-ed25519 b3RoZXI= unrelated\nssh-ed25519 cHVibGlj\n"
+    assert path.stat().st_ino == inode
+    assert abandoned.read_text() == "leave this alone"
+
+
+@pytest.mark.parametrize("options", ["", 'from="192.0.2.1" ', 'command="echo restricted",no-pty '])
+@pytest.mark.parametrize("comment", ["Alice's laptop", 'unmatched "quote', "trailing backslash\\"])
+def test_authorization_key_comment_is_opaque(ssh_guest, options, comment):
+    _, guest, home = ssh_guest
+    identity = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN9OphNCyuOQM8NJB2xJX6qsi9wMDh4L3iWVhDbRUJ4b"
+    guest.args["public_key"] = identity
+    directory = home / ".ssh"
+    directory.mkdir()
+    path = directory / "authorized_keys"
+    original = f"{options}{identity} {comment}\n"
+    path.write_text(original)
+    guest.execute()
+    guest.execute()
+    assert path.read_text() == original
+
+
+def test_authorization_rejects_unparseable_prefix_without_granting_access(ssh_guest):
+    _, guest, home = ssh_guest
+    directory = home / ".ssh"
+    directory.mkdir()
+    path = directory / "authorized_keys"
+    original = 'command="unterminated ssh-ed25519 cHVibGlj\n'
+    path.write_text(original)
+    with pytest.raises(ValueError, match="authorized_keys"):
+        guest.execute()
+    assert path.read_text() == original
+
+
+@pytest.mark.parametrize("unsafe", ["directory-link", "file-link", "hardlink", "shared"])
+def test_authorize_user_key_refuses_unsafe_layouts(ssh_guest, monkeypatch, unsafe):
+    script, guest, home = ssh_guest
+    directory = home / ".ssh"
+    protected = script.root / "must-not-change"
+    protected.write_text("private data")
+    if unsafe == "directory-link":
+        directory.symlink_to(script.root, target_is_directory=True)
+    else:
+        directory.mkdir()
+        if unsafe == "file-link":
+            (directory / "authorized_keys").symlink_to(protected)
+        elif unsafe == "hardlink":
+            os.link(protected, directory / "authorized_keys")
+        else:
+            monkeypatch.setattr(
+                guest, "current_mounts", lambda: {"home": {"target": str(home), "fstype": "9p"}}
+            )
+    with pytest.raises((ValueError, OSError)):
+        guest.execute()
+    assert protected.read_text() == "private data"
+
+
+def test_initial_ssh_copy_precedes_authorization(ssh_guest):
+    script, guest, home = ssh_guest
+    source = script.module.ROOT_HOME / ".ssh"
+    source.mkdir()
+    (source / "config").write_text("existing ssh config")
+    script.module.Runtime(data(phase="credentials")).execute()
+    guest.execute()
+    assert (home / ".ssh/config").read_text() == "existing ssh config"
+    assert (home / ".ssh/authorized_keys").read_text() == "ssh-ed25519 cHVibGlj\n"
+
+
+@pytest.mark.parametrize("key", [None, "", "ssh-ed25519 !!", "ssh-ed25519 cHVibGlj\ninjected"])
+def test_ssh_phase_rejects_invalid_key_before_writes(guest_script, key):
+    with pytest.raises(ValueError):
+        guest_script.module.Runtime(data(phase="ssh", arguments={"public_key": key}))
+    assert guest_script.commands == []

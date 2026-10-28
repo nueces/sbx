@@ -194,7 +194,7 @@ def guest_ssh_key_path(vm_id: str, config: Any) -> Path:
     return private_key
 
 
-def ssh_command(vm_id: str) -> list[str]:
+def ssh_command(vm_id: str, *, user: str = "root") -> list[str]:
     with ExitStack() as cleanup:
         try:
             vm = smolvm.facade.SmolVM.from_id(vm_id)
@@ -202,7 +202,7 @@ def ssh_command(vm_id: str) -> list[str]:
             raise ConfigError(missing_vm_message(vm_id)) from exc
         cleanup.callback(vm.close)
         key = guest_ssh_key_path(vm_id, vm.info.config)
-        vm = smolvm.facade.SmolVM.from_id(vm_id, ssh_key_path=str(key))
+        vm = smolvm.facade.SmolVM.from_id(vm_id, ssh_key_path=str(key), ssh_user=user)
         cleanup.callback(vm.close)
         return list(vm._ssh_direct_command())
 

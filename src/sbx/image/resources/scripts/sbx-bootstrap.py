@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Trusted, root-run sbx provisioning phases. Configuration is JSON data, never code."""
 
+import base64
 import ctypes
 import errno
 import fcntl
@@ -8,6 +9,7 @@ import json
 import os
 import pwd
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -31,6 +33,7 @@ PHASES = {
     "account": set(),
     "mounts": set(),
     "credentials": set(),
+    "ssh": {"public_key"},
     "hostname": set(),
     "clock": {"timestamp", "timezone"},
     "git": {"text"},
@@ -198,6 +201,14 @@ class Runtime:
                 raise ValueError("unsupported runtime installer")
             if type(timeout) is not int or timeout <= 0:
                 raise ValueError("invalid installer deadline")
+        if self.phase == "ssh":
+            key = self.args["public_key"]
+            if not isinstance(key, str) or len(key.splitlines()) != 1:
+                raise ValueError("invalid SSH public key")
+            fields = key.split()
+            if len(fields) < 2 or fields[0] != "ssh-ed25519":
+                raise ValueError("expected the existing Ed25519 public key")
+            base64.b64decode(fields[1], validate=True)
         self.lock_fd = None
 
     def redact(self, text):
@@ -365,6 +376,63 @@ class Runtime:
                     f"lowerdir={lower},upperdir={upper},workdir={work}",
                 )
 
+    def ssh(self):
+        account = self.existing_account()
+        home = Path(account.pw_dir)
+        directory = home / ".ssh"
+        if self.covered(directory) or self.covered(directory / "authorized_keys"):
+            raise ValueError(
+                "SSH authorization must not be in a shared folder; explicit repair required"
+            )
+        # Pin directory descriptors: user-owned home entries must not redirect root writes.
+        home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            with suppress(FileExistsError):
+                os.mkdir(".ssh", mode=0o700, dir_fd=home_fd)
+            ssh_fd = os.open(".ssh", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=home_fd)
+        finally:
+            os.close(home_fd)
+        try:
+            os.fchown(ssh_fd, account.pw_uid, account.pw_gid)
+            os.fchmod(ssh_fd, 0o700)
+            fd = os.open(
+                "authorized_keys",
+                os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK,
+                0o600,
+                dir_fd=ssh_fd,
+            )
+            with os.fdopen(fd, "a+", encoding="utf-8") as handle:
+                info = os.fstat(handle.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise ValueError("unsafe authorized_keys; explicit repair required")
+                os.fchown(handle.fileno(), account.pw_uid, account.pw_gid)
+                os.fchmod(handle.fileno(), 0o600)
+                handle.seek(0)
+                text = handle.read()
+                identity = self.args["public_key"].split()[:2]
+                for line in text.splitlines():
+                    if not line.strip() or line.lstrip().startswith("#"):
+                        continue
+                    fields = shlex.shlex(line, posix=True)
+                    fields.whitespace_split = True
+                    fields.commenters = ""
+                    try:
+                        key_type = next(fields)
+                        if key_type != identity[0]:
+                            key_type = next(fields)  # Skip the optional key-options field.
+                        # Stop at the key blob: the remaining comment is not shell syntax.
+                        if key_type == identity[0] and next(fields) == identity[1]:
+                            return
+                    except (ValueError, StopIteration) as error:
+                        raise ValueError(
+                            "cannot parse authorized_keys prefix; explicit repair required"
+                        ) from error
+                # Follow ssh-copy-id: preserve existing bytes and append on a fresh line.
+                newline = "\n" if text and not text.endswith("\n") else ""
+                handle.write(newline + " ".join(identity) + "\n")
+        finally:
+            os.close(ssh_fd)
+
     def credentials(self):
         if self.user == "root":
             return
@@ -486,7 +554,7 @@ class Runtime:
     def execute(self):
         if self.phase == "mounts":
             self.mounts_phase()
-        elif self.phase in ("account", "credentials", "git", "tools"):
+        elif self.phase in ("account", "credentials", "ssh", "git", "tools"):
             getattr(self, self.phase)()
         elif self.phase == "hostname":
             self.run(["hostname", self.name])

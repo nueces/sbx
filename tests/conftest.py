@@ -11,7 +11,9 @@ def fake_guest_lifecycle(monkeypatch, tmp_path):
     """Keep CLI orchestration tests out of real VM/network/guest state."""
     monkeypatch.setattr(session_state, "SBX_STATE_DIR", tmp_path / "state")
     monkeypatch.setattr(session_state, "SESSIONS_FILE", tmp_path / "state" / "sessions.json")
-    config = SimpleNamespace(env_vars={}, comm_channel="ssh", workspace_mounts=[])
+    config = SimpleNamespace(
+        env_vars={}, comm_channel="ssh", workspace_mounts=[], ssh_public_key="ssh-ed25519 cHVibGlj"
+    )
     vm = SimpleNamespace(
         info=SimpleNamespace(config=config),
         set_env_vars=lambda *a, **kw: None,

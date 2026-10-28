@@ -215,10 +215,22 @@ git_config = true
 `sbx` reads configuration in this order, with later values winning:
 
 1. `~/.config/sbx/config.toml` — user defaults;
-2. `./.sbx.toml` — project defaults; and
+2. the nearest `.sbx.toml` in the current directory or its ancestors — project defaults; and
 3. `--config PATH` — an explicit override.
 
 CLI options override configuration. Repeated `--runtime-install` values replace the configured list for that invocation and imply reprovisioning for an existing VM. When `run_user` is omitted, `sbx` uses the current host username and records it in a newly generated `.sbx.toml`. Keep durable choices such as the image, VM resources, user, mounts, runtime installation, and forwarded environment names in `.sbx.toml`; use `sbx run --reprovision` after changing provisioning config. Changing the runtime user of an existing VM requires `sbx recreate`.
+
+All config-consuming commands use the same ancestor discovery, including `stop` and `rm`. An explicit VM name still wins. Nested projects use the nearest config only, not a merge of every ancestor. Relative `project_path`, image and mount host paths resolve against the file that supplies them (including user defaults); CLI-relative paths resolve against the invoking directory. This changes relative-path behavior for configs stored outside that directory.
+
+`sbx run` and `sbx shell` preserve your current subdirectory through the VM's actual mounts, including renamed guest mount targets. `--project-path` explicitly selects the starting project directory instead. Config discovery does not add mounts or make them writable. Overlapping guest mount targets remain user-controlled: a nested remap can expose different files at the mapped directory. SBX does not reject intentional shadowing. If the requested directory is not mounted, stop the VM and use `sbx run` to apply the mounts. A new run does not create a child config that shadows an existing ancestor/explicit config; `--write-config` still writes local `.sbx.toml` deliberately. When creating a local config below an ancestor project, choose a new VM name, for example `sbx run local-vm --write-config`: the new VM belongs to the local project immediately, and the generated config retains inherited settings and CLI overrides. Selecting the ancestor's VM instead reports an ownership conflict; SBX never silently reassigns it. Existing local configs still receive missing values only.
+
+### Guest login and shell
+
+User sessions connect directly over SSH as the runtime user. Provisioning authorizes the existing SBX public key in that user's home, independently of `copy_host_credentials`; administrative control and `shell --root` retain root SSH. Existing VMs need `sbx run --reprovision --no-attach` once to authorize user access. Key installation follows `ssh-copy-id`'s append-only approach, preserving existing entries and adding a missing newline before a new key when necessary. Comments are opaque text; quotes in a comment never justify an unrestricted duplicate of an existing key. SSH failures never fall back to root or generate replacement keys.
+
+`sbx shell` changes to the mapped project directory, then starts the guest account's interactive login shell (verified with Bash and Zsh). User startup files may change directory afterward; SBX does not override them. `sbx run` uses a quoted `cd ... && exec <agent>` remote command; failed `cd` prevents launch. Remote commands are non-interactive and not necessarily login shells, so they do not promise login-profile or interactive rc-file loading.
+
+SBX publishes managed environment in `/etc/profile.d/` and assumes the guest's packaged shell handles system-profile integration. It does not manually source profiles, adapt individual shells, mirror the host shell or import the host home. New accounts keep the provisioning default; existing users' shells are preserved. Normal-user public-key login is an image responsibility (SSH defaults or the image Containerfile), not runtime policy repair.
 
 Security-sensitive behavior is configuration-only:
 
