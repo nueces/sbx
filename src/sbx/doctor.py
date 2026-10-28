@@ -33,24 +33,25 @@ def doctor_metadata(*, fix: bool) -> int:
 
 
 def doctor_sessions(*, fix: bool) -> None:
-    data = session_state.load_sessions()
-    changed = False
-    for vm_id, vm_data in list(data.items()):
-        raw = vm_data.get("sessions", []) if isinstance(vm_data, dict) else []
-        sessions = [item for item in raw if isinstance(item, dict)]
-        active = session_state.live_sessions(raw)
-        if active == sessions:
-            continue
-        changed = True
-        print(f"sbx sessions: {vm_id}: stale session record(s)")
-        if fix:
-            if active:
-                data.setdefault(vm_id, {})["sessions"] = active
-            else:
-                data.pop(vm_id, None)
-    if changed and fix:
-        session_state.save_sessions(data)
-        print("  fixed: removed stale session record(s)")
+    with session_state.session_lock():
+        data = session_state.load_sessions()
+        changed = False
+        for vm_id, vm_data in list(data.items()):
+            raw = vm_data.get("sessions", []) if isinstance(vm_data, dict) else []
+            sessions = [item for item in raw if isinstance(item, dict)]
+            active = session_state.live_sessions(raw)
+            if active == sessions:
+                continue
+            changed = True
+            print(f"sbx sessions: {vm_id}: stale session record(s)")
+            if fix:
+                if active:
+                    data.setdefault(vm_id, {})["sessions"] = active
+                else:
+                    data.pop(vm_id, None)
+        if changed and fix:
+            session_state.save_sessions(data)
+            print("  fixed: removed stale session record(s)")
 
 
 def doctor_tunnels(*, fix: bool) -> None:

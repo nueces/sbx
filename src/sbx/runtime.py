@@ -1,13 +1,19 @@
+import fcntl
 import json
 import os
+import pwd
 import shlex
+import stat
 import subprocess
 import sys
 from argparse import Namespace
 from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from pathlib import Path
 from typing import Any
+
+import smolvm.facade
+from smolvm.exceptions import VMNotFoundError
 
 DEBUG = False
 SMOLVM_DISABLE_VERSION_CHECK_ENV = "SMOLVM_DISABLE_VERSION_CHECK"
@@ -30,6 +36,27 @@ def without_stale_sudo_env() -> Iterator[None]:
 
 class ConfigError(ValueError):
     pass
+
+
+@contextmanager
+def exclusive_lock(path: Path, *, busy_message: str, blocking: bool = False) -> Iterator[None]:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.parent.chmod(0o700)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        raise ConfigError(f"cannot open lock file {path}: {exc.strerror}") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ConfigError(f"untrusted lock file: {path}")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError as exc:
+            raise ConfigError(busy_message) from exc
+        yield
+    finally:
+        os.close(fd)
 
 
 def vm_name_from_arg_or_config(
@@ -138,18 +165,46 @@ def missing_vm_message(vm_id: str) -> str:
     )
 
 
-def ssh_command(vm_id: str) -> list[str]:
-    from smolvm.exceptions import VMNotFoundError
-    from smolvm.facade import SmolVM
+def guest_ssh_key_path(vm_id: str, config: Any) -> Path:
+    if config.comm_channel not in {"ssh", "vsock"} or not getattr(config, "ssh_capable", False):
+        raise ConfigError(
+            f"VM {vm_id!r} requires explicit SSH metadata; recreate it with a supported image"
+        )
+    injected_key = getattr(config, "ssh_public_key", None)
+    if not isinstance(injected_key, str) or len(injected_key.split()) < 2:
+        raise ConfigError(f"VM {vm_id!r} has no trusted SSH identity; recreate it")
+    key_home = Path.home()
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        with suppress(KeyError):
+            key_home = Path(pwd.getpwnam(sudo_user).pw_dir)
+    # shortcut: pinned key layout; use upstream read-only resolution when available.
+    key_dir = key_home / ".smolvm" / "keys"
+    public_key, private_key = key_dir / "id_ed25519.pub", key_dir / "id_ed25519"
+    try:
+        if not public_key.is_file() or not private_key.is_file():
+            raise ConfigError("missing smolvm SSH key; restore the existing key pair")
+        authorized = public_key.read_text(encoding="utf-8").split()[:2]
+    except (OSError, UnicodeError) as exc:
+        raise ConfigError("cannot read smolvm SSH key; restore the existing key pair") from exc
+    if authorized != injected_key.split()[:2]:
+        raise ConfigError(
+            f"VM {vm_id!r} SSH identity does not match; restore its key pair or recreate it"
+        )
+    return private_key
 
-    try:
-        vm = SmolVM.from_id(vm_id)
-    except VMNotFoundError as exc:
-        raise ConfigError(missing_vm_message(vm_id)) from exc
-    try:
+
+def ssh_command(vm_id: str) -> list[str]:
+    with ExitStack() as cleanup:
+        try:
+            vm = smolvm.facade.SmolVM.from_id(vm_id)
+        except VMNotFoundError as exc:
+            raise ConfigError(missing_vm_message(vm_id)) from exc
+        cleanup.callback(vm.close)
+        key = guest_ssh_key_path(vm_id, vm.info.config)
+        vm = smolvm.facade.SmolVM.from_id(vm_id, ssh_key_path=str(key))
+        cleanup.callback(vm.close)
         return list(vm._ssh_direct_command())
-    finally:
-        vm.close()
 
 
 def read_json_object(path: Path, *, error: str | None = None) -> dict[str, Any]:

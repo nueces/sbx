@@ -2,13 +2,14 @@
 
 import os
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 
 from smolvm import SmolVM
 from smolvm.facade import _build_auto_config
 from smolvm.presets import apply_preset, get_preset
 from smolvm.types import PortForwardConfig
 
+from sbx import guest_setup, vm_metadata
 from sbx.constants import DEFAULT_BACKEND
 
 # ponytail: private SmolVM seams; remove when upstream exposes preset creation.
@@ -41,13 +42,17 @@ def create_preset(
     install_timeout: int,
     host_env: Mapping[str, str],
     before_provision: Callable[[str], None] | None = None,
+    run_user: str = "root",
+    forward_env: Sequence[str] = (),
+    operation: vm_metadata.Lifecycle | None = None,
 ) -> SmolVM:
     """Create and provision a running preset VM; the caller must close the facade."""
     preset = get_preset("claude-code" if preset_name == "claude" else preset_name)
     memory_mib = preset.default_mem_mib if memory_mib is None else memory_mib
     disk_size_mib = preset.default_disk_mib if disk_size_mib is None else disk_size_mib
 
-    with _environment(host_env):
+    with _environment(host_env), ExitStack() as cleanup:
+        operation = operation or cleanup.enter_context(vm_metadata.Lifecycle())
         config, ssh_key_path = _build_auto_config(
             vm_name=vm_name,
             name_prefix=preset_name,
@@ -58,7 +63,9 @@ def create_preset(
             ssh_key_path=None,
         )
         updates: dict[str, object] = {
-            "port_forwards": [PortForwardConfig(**value) for value in port_forwards]
+            "port_forwards": [PortForwardConfig(**value) for value in port_forwards],
+            "comm_channel": "ssh",
+            "ssh_capable": True,
         }
         if cpus is not None:
             updates["vcpu_count"] = cpus
@@ -70,12 +77,20 @@ def create_preset(
             writable_mounts=writable_mounts,
         )
         try:
-            vm.start(boot_timeout=boot_timeout)
-            vm.wait_for_ssh(timeout=boot_timeout)
+            operation.lock(str(vm.vm_id))
             if before_provision is not None:
                 before_provision(str(vm.vm_id))
-            channel = vm._ensure_ssh_for_env()
-            apply_preset(channel, preset, install_timeout=install_timeout)
+            guest_setup.start_vm(str(vm.vm_id), boot_timeout=boot_timeout, status="created")
+            vm.refresh()
+            with guest_setup.bootstrap_session(
+                str(vm.vm_id), run_user, env_names=forward_env, timeout=boot_timeout
+            ) as guest:
+                guest_setup.prepare_boot(
+                    str(vm.vm_id), run_user, list(forward_env), guest=guest, mounts=False
+                )
+                # Copy initial root configuration before shares can cover its destinations.
+                apply_preset(guest, preset, install_timeout=install_timeout)
+                guest_setup.mount_workspaces(str(vm.vm_id), run_user, guest=guest)
         except BaseException:
             with suppress(Exception):
                 vm.close()

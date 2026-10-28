@@ -68,11 +68,11 @@ sbx run the-quest \
 
 On first creation, `sbx`:
 
-1. creates and starts the VM;
-2. mounts the project at the same absolute path inside the VM;
-3. writes the project settings to `./.sbx.toml`;
-4. creates a guest user matching your host username; and
-5. installs the explicitly requested Pi runtime as that user, then launches it.
+1. creates and starts the VM with its share devices configured;
+2. writes the project settings to `./.sbx.toml`;
+3. creates the guest account and skeleton-initialized home matching your host username, before creating workspace targets;
+4. mounts the project at the same absolute path inside the VM; and
+5. completes boot setup, installs the explicitly requested Pi runtime as that user, validates it is available, then launches it.
 
 ### 3. Use the sandbox day to day
 
@@ -86,7 +86,13 @@ sbx ls        # list all sandboxes, including stopped ones
 sbx rm        # remove the VM after confirmation
 ```
 
-Boot setup (hostname, clock, KVM access, and rootless Docker) runs when sbx starts the VM or reprovisioning is requested—not on each attachment to a running VM. To repair setup in a running VM, use `sbx run --reprovision --no-attach`. See [guest setup lifecycle](docs/ergonomics.md#guest-setup-lifecycle) for recovery and diagnostic-root behavior.
+Normal boot setup (account/home checks, workspace mounting, hostname, clock, optional KVM access, and rootless Docker) runs when sbx starts the VM or reprovisioning is requested—not on each attachment to a running VM. To repair setup in a running VM, use `sbx run --reprovision --no-attach`. See [guest setup lifecycle](docs/ergonomics.md#guest-setup-lifecycle) for recovery and diagnostic-root behavior.
+
+For recovery, `sbx shell --root` opens in a safe default directory, not the project directory. It can start an incomplete VM without mandatory account, environment synchronization, workspace mounts or KVM/Docker setup. After a diagnostic boot, use `sbx run --reprovision --no-attach` or stop/start normally to apply that setup.
+
+Automatic stop-on-exit leaves the VM running if another session joins during its filesystem flush. An explicit `sbx stop` is different: it requests a stop even when sessions are active and may disconnect them. Flushing is best effort, not a crash-durability guarantee.
+
+Nested KVM remains opt-in through `sbx image build --nested-kvm`; ordinary images do not require guest `/dev/kvm` or the optional KVM helper.
 
 ## Customize the sandbox
 

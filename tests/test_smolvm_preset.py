@@ -1,214 +1,198 @@
 import os
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
 from smolvm.types import PortForwardConfig
 
-from sbx import smolvm_preset
+from sbx import guest_setup, smolvm_preset, vm_metadata
 
 
-class FakeConfig:
-    def __init__(self, events: list[str]) -> None:
-        self.events = events
-        self.updates: dict[str, object] = {}
+@pytest.fixture
+def preset_sdk(monkeypatch, tmp_path):
+    events = []
+    captured = SimpleNamespace(events=events, failure=None, build=None, updates=None)
 
-    def model_copy(self, *, update: dict[str, object]) -> "FakeConfig":
-        self.events.append("update")
-        self.updates = update
-        return self
+    class Config:
+        env_vars = {}
+
+        def model_copy(self, *, update):
+            captured.updates = update
+            return self
+
+    class VM:
+        vm_id = "demo"
+        info = SimpleNamespace(config=Config())
+
+        def start(self, **kwargs):
+            pytest.fail("facade startup would mount before account creation")
+
+        def refresh(self):
+            events.append("refresh")
+
+        def close(self):
+            events.append("close")
+
+    vm = VM()
+    captured.vm = vm
+    captured.guest = SimpleNamespace(
+        vm=vm, mounts=[], phase=lambda name, *args, **kwargs: events.append(name)
+    )
+
+    def build(**kwargs):
+        captured.build = kwargs
+        captured.build_env = dict(os.environ)
+        events.append("build")
+        return Config(), "private-key"
+
+    def construct(*args, **kwargs):
+        captured.construct = (args, kwargs)
+        events.append("construct")
+        return vm
+
+    @contextmanager
+    def session(*args, **kwargs):
+        events.append("session")
+        captured.session = (args, kwargs)
+        yield captured.guest
+        events.append("session-close")
+
+    def apply(channel, preset, **kwargs):
+        assert channel is captured.guest
+        captured.apply_env = dict(os.environ)
+        captured.apply_options = kwargs
+        events.append("apply")
+        if captured.failure:
+            raise captured.failure
+
+    monkeypatch.setattr(vm_metadata, "SBX_VMS_DIR", tmp_path / "metadata")
+    monkeypatch.setattr(
+        smolvm_preset,
+        "get_preset",
+        lambda name: SimpleNamespace(name=name, default_mem_mib=2048, default_disk_mib=8192),
+    )
+    monkeypatch.setattr(smolvm_preset, "_build_auto_config", build)
+    monkeypatch.setattr(smolvm_preset, "SmolVM", construct)
+    monkeypatch.setattr(smolvm_preset, "apply_preset", apply)
+    monkeypatch.setattr(guest_setup, "bootstrap_session", session)
+    monkeypatch.setattr(
+        guest_setup, "start_vm", lambda *args, **kwargs: events.append("manager-start")
+    )
+    monkeypatch.setattr(
+        guest_setup, "sync_forwarded_env", lambda *args, **kwargs: events.append("env")
+    )
+    monkeypatch.setattr(guest_setup, "host_timezone", lambda: "UTC")
+    return captured
 
 
-class FakeVM:
-    vm_id = "demo"
-
-    def __init__(self, events: list[str]) -> None:
-        self.events = events
-
-    def start(self, *, boot_timeout: float) -> None:
-        self.events.append(f"start:{boot_timeout:g}")
-
-    def wait_for_ssh(self, *, timeout: float) -> None:
-        self.events.append(f"wait:{timeout:g}")
-
-    def _ensure_ssh_for_env(self) -> str:
-        self.events.append("channel")
-        return "channel"
-
-    def close(self) -> None:
-        self.events.append("close")
-
-
-def create_preset(**overrides: object) -> object:
-    options = {
-        "preset_name": "pi",
-        "vm_name": None,
-        "guest_os": "ubuntu",
-        "cpus": None,
-        "memory_mib": None,
-        "disk_size_mib": None,
-        "mounts": [],
-        "writable_mounts": False,
-        "port_forwards": [],
-        "boot_timeout": 60,
-        "install_timeout": 600,
-        "host_env": {"HOME": "/isolated"},
-    }
+def create_preset(**overrides):
+    options = dict(
+        preset_name="pi",
+        vm_name=None,
+        guest_os="ubuntu",
+        cpus=None,
+        memory_mib=None,
+        disk_size_mib=None,
+        mounts=[],
+        writable_mounts=False,
+        port_forwards=[],
+        boot_timeout=60,
+        install_timeout=600,
+        host_env={"HOME": "/isolated"},
+        run_user="agent",
+        forward_env=[],
+    )
     return smolvm_preset.create_preset(**(options | overrides))
 
 
-@pytest.mark.parametrize(
-    ("memory", "disk", "cpus", "expected_memory", "expected_disk"),
-    [(None, None, None, 2048, 8192), (4096, 16384, 4, 4096, 16384)],
-)
-def test_create_preset(
-    monkeypatch: pytest.MonkeyPatch,
-    memory: int | None,
-    disk: int | None,
-    cpus: int | None,
-    expected_memory: int,
-    expected_disk: int,
-) -> None:
-    events: list[str] = []
-    captured: dict[str, object] = {}
-    config = FakeConfig(events)
-    vm = FakeVM(events)
+@pytest.mark.parametrize("memory,disk,cpus", [(None, None, None), (4096, 16384, 4)])
+def test_create_preset_orders_account_environment_install_and_mounts(
+    preset_sdk, monkeypatch, memory, disk, cpus
+):
     monkeypatch.setenv("ORIGINAL", "kept")
-
-    def get_preset(name: str) -> SimpleNamespace:
-        captured["preset_name"] = name
-        return SimpleNamespace(name=name, default_mem_mib=2048, default_disk_mib=8192)
-
-    def build_auto_config(**kwargs: object) -> tuple[FakeConfig, str]:
-        events.append("build")
-        captured["build"] = kwargs
-        captured["build_env"] = dict(os.environ)
-        return config, "private-key"
-
-    def construct_vm(*args: object, **kwargs: object) -> FakeVM:
-        events.append("construct")
-        captured["construct"] = (args, kwargs)
-        return vm
-
-    def apply_preset(channel: object, preset: object, *, install_timeout: int) -> None:
-        events.append(f"apply:{install_timeout}")
-        captured["apply"] = (channel, preset)
-        captured["apply_env"] = dict(os.environ)
-
-    monkeypatch.setattr(smolvm_preset, "get_preset", get_preset)
-    monkeypatch.setattr(smolvm_preset, "_build_auto_config", build_auto_config)
-    monkeypatch.setattr(smolvm_preset, "SmolVM", construct_vm)
-    monkeypatch.setattr(smolvm_preset, "apply_preset", apply_preset)
-
     result = create_preset(
         preset_name="claude",
         vm_name="demo",
-        cpus=cpus,
         memory_mib=memory,
         disk_size_mib=disk,
+        cpus=cpus,
         mounts=["/host:/guest"],
         writable_mounts=True,
         port_forwards=[{"host_address": "0.0.0.0", "host_port": 3000, "guest_port": 30}],
         boot_timeout=75,
         install_timeout=900,
         host_env={"HOME": "/isolated", "ALLOWED_SECRET": "secret"},
-        before_provision=lambda vm_id: events.append(f"claim:{vm_id}"),
+        before_provision=lambda name: preset_sdk.events.append("claim"),
     )
-
-    assert result is vm
-    assert captured["preset_name"] == "claude-code"
-    assert captured["build"] == {
-        "vm_name": "demo",
-        "name_prefix": "claude",
-        "os": "ubuntu",
-        "backend": "qemu",
-        "memory": expected_memory,
-        "disk_size_mib": expected_disk,
-        "ssh_key_path": None,
-    }
-    assert captured["build_env"] == {"HOME": "/isolated", "ALLOWED_SECRET": "secret"}
-    assert captured["apply_env"] == {"HOME": "/isolated", "ALLOWED_SECRET": "secret"}
+    assert result is preset_sdk.vm
+    assert preset_sdk.build == dict(
+        vm_name="demo",
+        name_prefix="claude",
+        os="ubuntu",
+        backend="qemu",
+        memory=memory or 2048,
+        disk_size_mib=disk or 8192,
+        ssh_key_path=None,
+    )
+    assert preset_sdk.events == [
+        "build",
+        "construct",
+        "claim",
+        "manager-start",
+        "refresh",
+        "session",
+        "account",
+        "hostname",
+        "clock",
+        "env",
+        "apply",
+        "mounts",
+        "session-close",
+    ]
+    assert preset_sdk.apply_options == {"install_timeout": 900}
+    assert (
+        preset_sdk.build_env
+        == preset_sdk.apply_env
+        == {"HOME": "/isolated", "ALLOWED_SECRET": "secret"}
+    )
     assert os.environ["ORIGINAL"] == "kept"
     assert "ALLOWED_SECRET" not in os.environ
-    assert events == [
-        "build",
-        "update",
-        "construct",
-        "start:75",
-        "wait:75",
-        "claim:demo",
-        "channel",
-        "apply:900",
+    assert preset_sdk.updates["port_forwards"] == [
+        PortForwardConfig(host_address="0.0.0.0", host_port=3000, guest_port=30)
     ]
-    assert config.updates.get("vcpu_count") == cpus
-    if cpus is None:
-        assert "vcpu_count" not in config.updates
-    forwards = config.updates["port_forwards"]
-    assert isinstance(forwards, list)
-    assert forwards[0] == PortForwardConfig(host_address="0.0.0.0", host_port=3000, guest_port=30)
-    assert captured["construct"] == (
-        (config,),
-        {
-            "ssh_key_path": "private-key",
-            "mounts": ["/host:/guest"],
-            "writable_mounts": True,
-        },
+    assert preset_sdk.updates.get("vcpu_count") == cpus
+    assert preset_sdk.updates["comm_channel"] == "ssh"
+    assert preset_sdk.updates["ssh_capable"] is True
+    assert preset_sdk.construct[1] == dict(
+        ssh_key_path="private-key", mounts=["/host:/guest"], writable_mounts=True
     )
 
 
-@pytest.mark.parametrize("error", [RuntimeError("failed"), KeyboardInterrupt()])
+@pytest.mark.parametrize("failure", [RuntimeError("failed"), KeyboardInterrupt()])
 def test_create_preset_closes_and_restores_environment_on_failure(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    error: BaseException,
-) -> None:
-    events: list[str] = []
-    vm = FakeVM(events)
+    preset_sdk, monkeypatch, capsys, failure
+):
     monkeypatch.setenv("ORIGINAL", "kept")
-    monkeypatch.setattr(
-        smolvm_preset,
-        "get_preset",
-        lambda name: SimpleNamespace(name=name, default_mem_mib=1, default_disk_mib=1),
-    )
-    monkeypatch.setattr(
-        smolvm_preset,
-        "_build_auto_config",
-        lambda **kwargs: (FakeConfig(events), "key"),
-    )
-    monkeypatch.setattr(smolvm_preset, "SmolVM", lambda *args, **kwargs: vm)
-    monkeypatch.setattr(
-        smolvm_preset,
-        "apply_preset",
-        lambda *args, **kwargs: (_ for _ in ()).throw(error),
-    )
-
-    with pytest.raises(type(error)):
+    preset_sdk.failure = failure
+    with pytest.raises(type(failure)):
         create_preset(host_env={"HOME": "/isolated", "SECRET": "hidden"})
-
-    assert events[-1] == "close"
-    assert events.count("close") == 1
+    assert preset_sdk.events[-1] == "close"
+    assert preset_sdk.events.count("close") == 1
+    assert "mounts" not in preset_sdk.events
     assert os.environ["ORIGINAL"] == "kept"
     assert "SECRET" not in os.environ
     output = capsys.readouterr()
-    assert "hidden" not in output.out
-    assert "hidden" not in output.err
+    assert "hidden" not in output.out + output.err
 
 
-def test_create_preset_restores_environment_before_vm_construction(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_create_preset_restores_environment_on_config_failure(preset_sdk, monkeypatch):
     monkeypatch.setenv("ORIGINAL", "kept")
-    monkeypatch.setattr(
-        smolvm_preset,
-        "get_preset",
-        lambda name: SimpleNamespace(name=name, default_mem_mib=1, default_disk_mib=1),
-    )
     monkeypatch.setattr(
         smolvm_preset,
         "_build_auto_config",
         lambda **kwargs: (_ for _ in ()).throw(RuntimeError("build failed")),
     )
-
     with pytest.raises(RuntimeError, match="build failed"):
         create_preset()
-
     assert os.environ["ORIGINAL"] == "kept"
+    assert "close" not in preset_sdk.events

@@ -1,5 +1,4 @@
 import json
-import shlex
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -13,9 +12,11 @@ import smolvm.utils
 
 from sbx import cli, guest_setup, lifecycle_warnings, runtime, session_state, vm_metadata, vm_state
 
+_ORIGINAL_ATTACH = guest_setup.attach
+
 
 @pytest.fixture(autouse=True)
-def isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_guest_lifecycle) -> None:
     monkeypatch.setattr(cli.runtime, "DEBUG", False)
     monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATHS", (tmp_path / "home-config.toml",))
     monkeypatch.setattr(cli, "LOCAL_CONFIG_PATHS", (tmp_path / ".sbx.toml",))
@@ -33,6 +34,12 @@ def isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         callback = kwargs.get("before_provision")
         if callable(callback):
             callback(vm_id)
+        guest_setup.prepare_boot(
+            vm_id,
+            str(kwargs.get("run_user", "root")),
+            list(kwargs.get("forward_env", [])),
+            guest=fake_guest_lifecycle,
+        )
         return SimpleNamespace(vm_id=vm_id, close=lambda: None)
 
     monkeypatch.setattr(cli.smolvm_preset, "create_preset", create_preset)
@@ -93,6 +100,12 @@ def fake_smolvm_sdk(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str
     monkeypatch.setattr(smolvm, "SmolVM", FakeSmolVM)
     monkeypatch.setattr(smolvm, "VMConfig", fake_vm_config)
     monkeypatch.setattr(smolvm.utils, "ensure_ssh_key", lambda: (private_key, public_key))
+
+    def start_vm(vm_id, **kwargs):
+        captured["started"] = True
+        captured["start_kwargs"] = {"boot_timeout": kwargs["boot_timeout"]}
+
+    monkeypatch.setattr(guest_setup, "start_vm", start_vm)
     return captured
 
 
@@ -435,9 +448,9 @@ def test_start_local_image_happy_path(
     assert rc == 0
     assert calls == ["attach"]
     assert fake_smolvm_sdk["started"] is True
-    assert fake_smolvm_sdk["waited"] is True
+    assert "waited" not in fake_smolvm_sdk  # Readiness now belongs to the bootstrap session.
     assert fake_smolvm_sdk["start_kwargs"] == {"boot_timeout": 60.0}
-    assert fake_smolvm_sdk["wait_kwargs"] == {"timeout": 60.0}
+    assert "wait_kwargs" not in fake_smolvm_sdk
     vm_config = fake_smolvm_sdk["vm_config"]
     assert isinstance(vm_config, dict)
     assert vm_config["vm_id"] == "vm-from-cli"
@@ -561,21 +574,13 @@ def test_main_preserves_sudo_env_when_effectively_root(monkeypatch: pytest.Monke
     assert observed == ["developer"]
 
 
-def test_ssh_command_and_pid_alive(monkeypatch: pytest.MonkeyPatch) -> None:
-    class FakeVm:
-        def _ssh_direct_command(self) -> list[str]:
-            return ["ssh", "root@host"]
-
-        def close(self) -> None:
-            pass
-
-    class FakeSmolVM:
-        @classmethod
-        def from_id(cls, vm_id: str) -> FakeVm:
-            return FakeVm()
-
-    monkeypatch.setattr(smolvm.facade, "SmolVM", FakeSmolVM)
+def test_ssh_command_and_pid_alive(monkeypatch: pytest.MonkeyPatch, forwarded_env_vm) -> None:
     assert guest_setup.ssh_command("vm1") == ["ssh", "root@host"]
+    assert ("ssh", str(forwarded_env_vm.private)) in forwarded_env_vm.calls
+    assert forwarded_env_vm.calls[-2:] == [
+        ("close", str(forwarded_env_vm.private)),
+        ("close", None),
+    ]
 
     monkeypatch.setattr(session_state.os, "kill", lambda pid, sig: None)
     assert session_state.pid_is_alive(123) is True
@@ -679,6 +684,9 @@ def test_start_local_image_closes_on_start_failure(
             closed.append(True)
 
     monkeypatch.setattr(smolvm, "SmolVM", FailingSmolVM)
+    monkeypatch.setattr(
+        guest_setup, "start_vm", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
     args = type("Args", (), {"name": None, "memory": None})()
     with pytest.raises(RuntimeError, match="boom"):
         cli._start_local_image(
@@ -811,89 +819,36 @@ def test_git_config_missing_git_and_escaping(monkeypatch: pytest.MonkeyPatch) ->
     assert guest_setup.host_git_config() == '[user]\n\tname = "Ada \\"Back\\\\slash\\""\n'
 
 
-def test_install_git_config_for_root_and_user(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    commands: list[list[str]] = []
-    monkeypatch.setattr(guest_setup, "ssh_command", lambda vm_id: ["ssh", "root@host"])
-
-    def fake_run_capture(argv: list[str], *, env: dict[str, str] | None = None):
-        commands.append(argv)
-        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(cli.runtime, "run_capture", fake_run_capture)
-
-    guest_setup.install_git_config("vm1", None, "[user]\n", run_capture=fake_run_capture)
-    guest_setup.install_git_config("vm1", "agent", "[user]\n", run_capture=fake_run_capture)
-    guest_setup.install_git_config("vm1", "agent", None, run_capture=fake_run_capture)
-
-    assert "getent passwd root" in commands[0][-1]
-    assert "getent passwd agent" in commands[1][-1]
-    assert '"$home/.gitconfig"' in commands[0][-1]
-    assert len(commands) == 2
+def test_install_git_config_for_root_and_user(fake_guest_lifecycle) -> None:
+    guest_setup.install_git_config("vm1", None, "[user]\n")
+    guest_setup.install_git_config("vm1", "agent", "[user]\n")
+    guest_setup.install_git_config("vm1", "agent", None)
+    assert [args for args, _ in fake_guest_lifecycle.opened] == [("vm1", "root"), ("vm1", "agent")]
+    assert [(name, data) for name, data, _ in fake_guest_lifecycle.phases] == [
+        ("git", {"text": "[user]\n"})
+    ] * 2
 
 
-def test_prepare_run_user_success_and_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(guest_setup, "ssh_command", lambda vm_id: ["ssh", "root@host"])
-    captured: dict[str, object] = {}
-
-    def fake_ok(argv: list[str], *, env: dict[str, str] | None = None):
-        captured["argv"] = argv
-        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(cli.runtime, "run_capture", fake_ok)
-    guest_setup.prepare_run_user("vm1", "agent", run_capture=fake_ok)
-    script = captured["argv"][-1]
-    assert "getent hosts" in script
-    assert "127.0.1.1" in script
-    assert ".ssh .pi .codex .claude .claude.json" in script
-    assert "/var/lib/sbx/run-user" not in script
-    assert "useradd -m -U" in script
-    assert "visudo -cf" in script
-    assert 'chown -R agent:"$group" "$home"' not in script
-    assert ".npmrc" not in script
-    assert ".nodejs" not in script
-    assert (
-        subprocess.run(
-            ["bash", "-n"], input=shlex.split(script)[2], text=True, check=False
-        ).returncode
-        == 0
-    )
-
-    captured.clear()
-    guest_setup.prepare_run_user("vm1", "root", run_capture=fake_ok)
-    assert captured == {}
-
-    monkeypatch.setattr(cli.runtime, "run_capture", lambda argv, **kwargs: None)
-    with pytest.raises(cli.ConfigError, match="ssh command not found"):
-        guest_setup.prepare_run_user("vm1", "agent", run_capture=lambda argv: None)
-
-    def fake_fail(argv: list[str], *, env: dict[str, str] | None = None):
-        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="bad")
-
-    monkeypatch.setattr(cli.runtime, "run_capture", fake_fail)
+def test_prepare_run_user_success_and_failure(fake_guest_lifecycle) -> None:
+    guest_setup.prepare_run_user("vm1", "agent", copy_initial_state=True)
+    guest_setup.prepare_run_user("vm1", "root")
+    assert [name for name, _, _ in fake_guest_lifecycle.phases] == [
+        "account",
+        "credentials",
+        "account",
+    ]
+    assert fake_guest_lifecycle.closed == 3
+    fake_guest_lifecycle.phase = lambda *a, **kw: (_ for _ in ()).throw(cli.ConfigError("bad"))
     with pytest.raises(cli.ConfigError, match="bad"):
-        guest_setup.prepare_run_user("vm1", "agent", run_capture=fake_fail)
+        guest_setup.prepare_run_user("vm1", "agent")
+    assert fake_guest_lifecycle.closed == 4
 
 
-def test_ensure_kvm_access_runs_optional_helper_each_time(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[list[str]] = []
-
-    def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        calls.append(argv)
-        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-
-    guest_setup.ensure_kvm_access(
-        "vm1", "agent", run_capture=fake_run, ssh=lambda vm_id: ["ssh", vm_id]
-    )
-
-    assert calls[0][:2] == ["ssh", "vm1"]
-    assert "[ -x /usr/local/bin/sbx-prepare-kvm ]" in calls[0][-1]
-    assert "/usr/local/bin/sbx-prepare-kvm agent" in calls[0][-1]
+def test_ensure_kvm_access_runs_optional_helper_each_time(fake_guest_lifecycle) -> None:
+    guest_setup.ensure_kvm_access("vm1", "agent")
+    guest_setup.ensure_kvm_access("vm1", "agent")
+    guest_setup.ensure_kvm_access("vm1", "root")
+    assert [name for name, _, _ in fake_guest_lifecycle.phases] == ["kvm", "kvm"]
 
 
 def test_attach_commands(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -916,22 +871,13 @@ def test_attach_commands(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "sudo -iu agent" in commands[1][-1]
 
 
-def test_sync_guest_clock_sets_host_time_and_timezone(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured: list[str] = []
-
-    def fake_run_capture(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        captured.extend(argv)
-        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(guest_setup, "ssh_command", lambda vm_id: ["ssh", vm_id])
+def test_sync_guest_clock_sets_host_time_and_timezone(monkeypatch, fake_guest_lifecycle) -> None:
     monkeypatch.setattr(guest_setup, "host_timezone", lambda: "America/Chicago")
-
-    guest_setup.sync_guest_clock("vm1", run_capture=fake_run_capture)
-
-    assert captured[:2] == ["ssh", "vm1"]
-    assert "America/Chicago" in captured[2]
-    assert "ln -sf" in captured[2]
-    assert "date -u -s" in captured[2]
+    guest_setup.sync_guest_clock("vm1")
+    name, arguments, _ = fake_guest_lifecycle.phases[0]
+    assert name == "clock"
+    assert arguments["timezone"] == "America/Chicago"
+    assert len(arguments["timestamp"]) == 19
 
 
 def test_post_start_actions_paths(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1009,9 +955,9 @@ def test_post_start_actions_paths(monkeypatch: pytest.MonkeyPatch) -> None:
         == 0
     )
     assert [name for name, _ in calls] == [
+        "prepare",
         "clock",
         "port",
-        "prepare",
         "kvm",
         "install",
         "git",
@@ -1214,79 +1160,252 @@ def test_network_status_variants(
     assert "busy/untracked" in capsys.readouterr().out
 
 
-def test_sync_forwarded_env_sets_present_and_unsets_missing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.fixture
+def forwarded_env_vm(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespace:
+    key_dir = tmp_path / ".smolvm" / "keys"
+    key_dir.mkdir(parents=True)
+    private = key_dir / "id_ed25519"
+    public = key_dir / "id_ed25519.pub"
+    private.write_text("PRIVATE_KEY_SENTINEL", encoding="utf-8")
+    public.write_text("ssh-ed25519 injected-key comment\n", encoding="utf-8")
     calls: list[tuple[str, object]] = []
+    config = SimpleNamespace(
+        comm_channel="ssh", ssh_capable=True, ssh_public_key="ssh-ed25519 injected-key"
+    )
+    state = SimpleNamespace(
+        private=private, public=public, config=config, calls=calls, failure=None
+    )
 
     class FakeSmolVM:
-        _info = SimpleNamespace(config=SimpleNamespace(comm_channel="ssh"))
+        info = SimpleNamespace(config=config)
+
+        def __init__(self, key: object) -> None:
+            self.key = key
 
         @classmethod
         def from_id(cls, vm_id: str, **kwargs: object) -> Self:
+            assert vm_id == "vm1"
             calls.append(("from_id", kwargs))
-            return cls()
+            if kwargs and state.failure == "connect":
+                raise RuntimeError("connection failed")
+            return cls(kwargs.get("ssh_key_path"))
+
+        def check_key(self) -> None:
+            if config.comm_channel == "ssh":
+                assert self.key == str(private), "known key must precede environment operations"
+
+        def _ssh_direct_command(self):
+            self.check_key()
+            calls.append(("ssh", self.key))
+            return ["ssh", "root@host"]
+
+        def run(self, command, **kwargs):
+            self.check_key()
+            return SimpleNamespace(exit_code=75 if state.failure == "busy" else 0)
 
         def set_env_vars(self, values: dict[str, str]) -> None:
+            self.check_key()
             calls.append(("set", values))
+            if state.failure == "set":
+                raise RuntimeError("set failed")
 
         def unset_env_vars(self, names: list[str]) -> None:
+            self.check_key()
             calls.append(("unset", names))
+            if state.failure == "unset":
+                raise RuntimeError("unset failed")
 
         def close(self) -> None:
-            calls.append(("close", None))
+            calls.append(("close", self.key))
 
-    monkeypatch.setattr(smolvm.facade, "SmolVM", FakeSmolVM, raising=False)
-    monkeypatch.setenv("SBX_PRESENT", "value")
+    def reject_key_generation():
+        pytest.fail("existing VM authentication must never generate keys")
+
+    monkeypatch.delenv("SUDO_USER", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(smolvm.facade, "SmolVM", FakeSmolVM)
+    monkeypatch.setattr(smolvm.utils, "ensure_ssh_key", reject_key_generation)
+    monkeypatch.setenv("SBX_PRESENT", "ENV_SECRET_SENTINEL")
     monkeypatch.delenv("SBX_MISSING", raising=False)
+    return state
 
+
+@pytest.mark.parametrize(
+    "names",
+    [["SBX_PRESENT"], ["SBX_MISSING"], ["SBX_PRESENT", "SBX_MISSING"]],
+)
+def test_sync_forwarded_env_sets_present_and_unsets_missing(
+    forwarded_env_vm: SimpleNamespace, names: list[str]
+) -> None:
+    guest_setup.sync_forwarded_env("vm1", names)
+
+    expected: list[tuple[str, object]] = [
+        ("from_id", {}),
+        ("from_id", {"ssh_key_path": str(forwarded_env_vm.private)}),
+    ]
+    if "SBX_PRESENT" in names:
+        expected.append(("set", {"SBX_PRESENT": "ENV_SECRET_SENTINEL"}))
+    if "SBX_MISSING" in names:
+        expected.append(("unset", ["SBX_MISSING"]))
+    expected.extend([("close", str(forwarded_env_vm.private)), ("close", None)])
+    assert forwarded_env_vm.calls == expected
+
+
+@pytest.mark.parametrize("failure", ["connect", "set", "unset"])
+def test_sync_forwarded_env_closes_on_failure(
+    forwarded_env_vm: SimpleNamespace, failure: str
+) -> None:
+    forwarded_env_vm.failure = failure
+    with pytest.raises((OSError, RuntimeError), match="failed"):
+        guest_setup.sync_forwarded_env("vm1", ["SBX_PRESENT", "SBX_MISSING"])
+
+    assert forwarded_env_vm.calls[-1] == ("close", None)
+    closed_keys = [value for action, value in forwarded_env_vm.calls if action == "close"]
+    assert len(closed_keys) == (2 if failure in {"set", "unset"} else 1)
+
+
+@pytest.mark.parametrize("missing", ["private", "public"])
+def test_sync_forwarded_env_does_not_generate_missing_known_key(
+    forwarded_env_vm: SimpleNamespace, missing: str
+) -> None:
+    getattr(forwarded_env_vm, missing).unlink()
+    with pytest.raises(cli.ConfigError, match="SSH key"):
+        guest_setup.sync_forwarded_env("vm1", ["SBX_PRESENT"])
+
+    assert forwarded_env_vm.calls == [("from_id", {}), ("close", None)]
+    assert not getattr(forwarded_env_vm, missing).exists()
+
+
+@pytest.mark.parametrize("injected", [None, "", "ssh-ed25519 different-key", "ssh-ed25519"])
+@pytest.mark.parametrize("operation", ["control", "interactive"])
+def test_guest_control_rejects_unproven_ssh_identity(forwarded_env_vm, injected, operation):
+    forwarded_env_vm.config.ssh_public_key = injected
+    with pytest.raises(cli.ConfigError, match="SSH"):
+        if operation == "control":
+            guest_setup.sync_forwarded_env("vm1", ["SBX_PRESENT"])
+        else:
+            guest_setup.ssh_command("vm1")
+    assert forwarded_env_vm.calls == [("from_id", {}), ("close", None)]
+
+
+@pytest.mark.parametrize("content", [b"\xff", b"", b"ssh-ed25519"])
+def test_guest_control_rejects_invalid_public_key_file(forwarded_env_vm, content):
+    forwarded_env_vm.public.write_bytes(content)
+    with pytest.raises(cli.ConfigError, match="SSH"):
+        guest_setup.sync_forwarded_env("vm1", ["SBX_PRESENT"])
+    assert forwarded_env_vm.calls == [("from_id", {}), ("close", None)]
+
+
+def test_sync_forwarded_env_resolves_sudo_identity(
+    forwarded_env_vm: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    looked_up: list[str] = []
+
+    def user_info(user: str) -> SimpleNamespace:
+        looked_up.append(user)
+        return SimpleNamespace(pw_dir=str(tmp_path))
+
+    monkeypatch.setenv("SUDO_USER", "developer")
+    monkeypatch.setattr(guest_setup.pwd, "getpwnam", user_info)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "root-home")
+    guest_setup.sync_forwarded_env("vm1", ["SBX_PRESENT"])
+
+    assert looked_up == ["developer"]
+    assert ("from_id", {"ssh_key_path": str(forwarded_env_vm.private)}) in forwarded_env_vm.calls
+
+
+@pytest.mark.parametrize("failure", ["missing_key", "connect", "set", "unset"])
+def test_sync_forwarded_env_failure_prevents_cli_attach(
+    forwarded_env_vm: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: str,
+) -> None:
+    forwarded_env_vm.failure = failure
+    if failure == "missing_key":
+        forwarded_env_vm.private.unlink()
+    vm_metadata.claim_vm(
+        "vm1",
+        {"project_root": "/project", "config_path": "/project/sbx.toml"},
+        "root",
+        created=True,
+    )
+
+    def reject_attach(*args: object, **kwargs: object) -> None:
+        raise AssertionError("must not attach after environment failure")
+
+    monkeypatch.setattr(guest_setup, "attach", reject_attach)
+    assert (
+        cli._post_start_actions(
+            vm_name="vm1",
+            started_now=False,
+            command="bash",
+            attach=True,
+            run_user="root",
+            auth_port=False,
+            stop_on_exit=False,
+            forward_env=["SBX_PRESENT", "SBX_MISSING"],
+            validate_agent=False,
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert "failed" in captured.err
+    assert "ENV_SECRET_SENTINEL" not in captured.out + captured.err
+    assert "PRIVATE_KEY_SENTINEL" not in captured.out + captured.err
+
+
+def test_sync_forwarded_env_preserves_explicit_vsock_transport(forwarded_env_vm) -> None:
+    forwarded_env_vm.config.comm_channel = "vsock"
     guest_setup.sync_forwarded_env("vm1", ["SBX_PRESENT", "SBX_MISSING"])
 
-    assert calls == [
+    assert forwarded_env_vm.calls == [
         ("from_id", {}),
-        ("set", {"SBX_PRESENT": "value"}),
+        ("set", {"SBX_PRESENT": "ENV_SECRET_SENTINEL"}),
         ("unset", ["SBX_MISSING"]),
         ("close", None),
     ]
 
 
-def test_sync_forwarded_env_uses_direct_ssh_for_legacy_vm(
+def test_sync_forwarded_env_does_not_log_secrets(
+    forwarded_env_vm: SimpleNamespace,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(runtime, "DEBUG", True)
+    guest_setup.sync_forwarded_env("vm1", ["SBX_PRESENT"])
+    captured = capsys.readouterr()
+    for secret in ("ENV_SECRET_SENTINEL", "PRIVATE_KEY_SENTINEL"):
+        assert secret not in captured.out + captured.err + caplog.text
 
-    class FakeSmolVM:
-        _info = SimpleNamespace(config=SimpleNamespace(comm_channel=None))
 
-        @classmethod
-        def from_id(cls, vm_id: str, **kwargs: object) -> Self:
-            calls.append(("from_id", kwargs))
-            return cls()
-
-        def close(self) -> None:
-            calls.append(("close", None))
-
-    def fake_run_capture(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        calls.append(("ssh", argv[-1]))
-        return subprocess.CompletedProcess(argv, 0, "export OLD=kept\nexport SBX_TOKEN=old\n", "")
-
-    monkeypatch.setattr(smolvm.facade, "SmolVM", FakeSmolVM, raising=False)
-    monkeypatch.setattr(guest_setup, "ssh_command", lambda vm_id: ["ssh", vm_id])
-    monkeypatch.setattr(cli.runtime, "run_capture", fake_run_capture)
-    monkeypatch.setenv("SBX_TOKEN", "value")
-
-    guest_setup.sync_forwarded_env("vm1", ["SBX_TOKEN", "MISSING"], run_capture=fake_run_capture)
-
-    assert calls[0] == ("from_id", {})
-    assert calls[1] == ("ssh", "cat /etc/profile.d/smolvm_env.sh 2>/dev/null || true")
-    assert calls[2][0] == "ssh"
-    assert "base64 -d" in str(calls[2][1])
-    assert calls[3] == ("close", None)
+@pytest.mark.parametrize("channel,capable", [(None, True), ("auto", True), ("ssh", False)])
+@pytest.mark.parametrize("operation", ["control", "interactive"])
+def test_guest_control_rejects_legacy_or_incomplete_ssh_metadata(
+    forwarded_env_vm, channel, capable, operation
+):
+    forwarded_env_vm.config.comm_channel = channel
+    forwarded_env_vm.config.ssh_capable = capable
+    with pytest.raises(cli.ConfigError, match="SSH"):
+        if operation == "control":
+            with guest_setup.open_guest("vm1"):
+                pytest.fail("legacy/incomplete metadata must not reach guest operations")
+        else:
+            guest_setup.ssh_command("vm1")
+    assert forwarded_env_vm.calls == [("from_id", {}), ("close", None)]
 
 
 def test_sync_forwarded_env_empty_allowlist_skips_smolvm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    def reject_key_resolution() -> None:
+        raise AssertionError("SSH key should not be resolved")
+
+    monkeypatch.setattr(smolvm.utils, "ensure_ssh_key", reject_key_resolution)
+
     class FakeSmolVM:
         @classmethod
         def from_id(cls, vm_id: str) -> Self:
@@ -1473,7 +1592,8 @@ def test_start_local_image_defaults_and_no_attach(
     assert vm_config["vm_id"] == "from-config"
     assert vm_config["boot_args"].endswith("init=/init")
     assert captured["attach"] is False
-    assert "Started 'local-vm'." in capsys.readouterr().out
+    assert capsys.readouterr().out == ""  # No success announcement before required setup.
+    assert captured["created_config"] is False
 
 
 def test_read_toml_oserror_and_create_alias(
@@ -1774,7 +1894,9 @@ def test_recreate_success_deletes_then_starts(monkeypatch: pytest.MonkeyPatch) -
     calls: list[tuple[str, object]] = []
     monkeypatch.setattr(cli, "_confirm_destructive_action", lambda *args, **kwargs: True)
     monkeypatch.setattr(cli, "_delete_vm", lambda name: calls.append(("delete", name)) or 0)
-    monkeypatch.setattr(cli, "cmd_start", lambda args: calls.append(("start", args.name)) or 0)
+    monkeypatch.setattr(
+        cli, "cmd_start", lambda args, **kwargs: calls.append(("start", args.name)) or 0
+    )
     args = type(
         "Args",
         (),
@@ -1794,19 +1916,16 @@ def test_recreate_success_deletes_then_starts(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_start_existing_vm_if_needed_variants(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[list[str]] = []
+    calls = []
     monkeypatch.setattr(
-        cli.runtime,
-        "run_smolvm_capture",
-        lambda argv: subprocess.CompletedProcess(calls.append(list(argv)) or argv, 0, "", ""),
+        guest_setup, "start_vm", lambda name, **kwargs: calls.append((name, kwargs))
     )
-
     assert cli._start_existing_vm_if_needed("vm1", "running", 60) == 0
     assert calls == []
     assert cli._start_existing_vm_if_needed("vm1", "stopped", 60) == 0
-    assert calls == [["sandbox", "start", "vm1", "--boot-timeout", "60"]]
+    assert calls == [("vm1", {"boot_timeout": 60, "status": "stopped"})]
     assert cli._start_existing_vm_if_needed("vm1", "error", 60) == 1
-    assert calls == [["sandbox", "start", "vm1", "--boot-timeout", "60"]]
+    assert len(calls) == 1
 
 
 def test_mark_error_vm_stopped_for_restart_clears_stale_runtime_fields() -> None:
@@ -1833,9 +1952,9 @@ def test_start_existing_vm_timeout_hint_when_vm_is_running(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(
-        cli.runtime,
-        "run_smolvm_capture",
-        lambda argv: subprocess.CompletedProcess(argv, 1, "", ""),
+        guest_setup,
+        "start_vm",
+        lambda *a, **kw: (_ for _ in ()).throw(TimeoutError("startup timed out")),
     )
     monkeypatch.setattr(cli, "_get_existing_vm_status", lambda vm_id: "running")
 
@@ -1844,6 +1963,19 @@ def test_start_existing_vm_timeout_hint_when_vm_is_running(
     err = capsys.readouterr().err
     assert "VM 'vm1' started, but SSH was not ready within 60s" in err
     assert "sbx run vm1 --boot-timeout" in err
+
+
+def test_non_timeout_start_failure_is_not_reported_as_ssh_timeout(monkeypatch, capsys):
+    monkeypatch.setattr(
+        guest_setup,
+        "start_vm",
+        lambda *a, **kw: (_ for _ in ()).throw(cli.ConfigError("invalid guest setup")),
+    )
+    monkeypatch.setattr(cli, "_get_existing_vm_status", lambda name: "running")
+    assert cli._start_existing_vm_if_needed("vm1", "stopped", 60) == 1
+    error = capsys.readouterr().err
+    assert "invalid guest setup" in error
+    assert "SSH was not ready" not in error
 
 
 def test_auth_tunnel_success_records_when_port_becomes_ready(
@@ -1954,129 +2086,19 @@ def test_runtime_install_is_strict_and_cli_replaces_config() -> None:
         cli._install_timeout(0)
 
 
-def test_empty_runtime_install_does_nothing() -> None:
-    calls: list[list[str]] = []
-
-    guest_setup.install_runtime_tools(
-        "vm1",
-        "agent",
-        [],
-        600,
-        run_capture=lambda argv: calls.append(argv),
-        ssh=lambda vm_id: ["ssh", vm_id],
-    )
-
-    assert calls == []
+def test_empty_runtime_install_does_nothing(fake_guest_lifecycle) -> None:
+    guest_setup.install_runtime_tools("vm1", "agent", [], 600)
+    assert fake_guest_lifecycle.opened == []
 
 
 @pytest.mark.parametrize("user", ["agent", "root"])
-def test_runtime_pi_install_uses_explicit_user_prefix_without_npm_config(user: str) -> None:
-    calls: list[list[str]] = []
-    results = iter(
-        [
-            subprocess.CompletedProcess([], 127, "", ""),
-            subprocess.CompletedProcess([], 0, "installed\n", ""),
-        ]
-    )
-
-    def run_capture(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        calls.append(argv)
-        return next(results)
-
-    guest_setup.install_runtime_tools(
-        "vm1",
-        user,
-        ["pi"],
-        321,
-        run_capture=run_capture,
-        ssh=lambda vm_id: ["ssh", vm_id],
-    )
-
-    assert len(calls) == 2
-    assert 'export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"' in calls[0][-1]
-    install_script = calls[1][-1]
-    assert f"sudo -iu {user}" in install_script
-    assert "321s npm install --global" in install_script
-    assert '--prefix "$HOME/.local"' in install_script
-    assert "@earendil-works/pi-coding-agent" in install_script
-    assert "NPM_CONFIG_USERCONFIG=/dev/stdin" in install_script
-    assert "NPM_CONFIG_GLOBALCONFIG=/dev/null" in install_script
-    assert "@earendil-works/pi-coding-agent </dev/null" in install_script
-    assert "if [ -r /etc/profile.d/smolvm_env.sh ]" in install_script
-    assert ".npmrc" not in install_script
-    assert "npm config" not in install_script
-
-
-def test_runtime_specify_install_uses_uv_as_selected_user() -> None:
-    calls: list[list[str]] = []
-    results = iter(
-        [
-            subprocess.CompletedProcess([], 127, "", ""),
-            subprocess.CompletedProcess([], 0, "installed\n", ""),
-        ]
-    )
-
-    def run_capture(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        calls.append(argv)
-        return next(results)
-
-    guest_setup.install_runtime_tools(
-        "vm1",
-        "developer",
-        ["specify"],
-        123,
-        run_capture=run_capture,
-        ssh=lambda vm_id: ["ssh", vm_id],
-    )
-
-    assert len(calls) == 2
-    install_script = calls[1][-1]
-    assert "sudo -iu developer" in install_script
-    assert "123s uv tool install specify-cli" in install_script
-    assert "--from git+https://github.com/github/spec-kit.git" in install_script
-    assert "NPM_CONFIG" not in install_script
-    assert "chown" not in install_script
-
-
 @pytest.mark.parametrize("tool", ["pi", "specify"])
-def test_runtime_install_preserves_existing_command(tool: str) -> None:
-    calls: list[list[str]] = []
-
-    def run_capture(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        calls.append(argv)
-        return subprocess.CompletedProcess(argv, 0, f"/custom/bin/{tool}\n", "")
-
-    guest_setup.install_runtime_tools(
-        "vm1",
-        "agent",
-        [tool],
-        600,
-        run_capture=run_capture,
-        ssh=lambda vm_id: ["ssh", vm_id],
-    )
-
-    assert len(calls) == 1
-    assert "npm install" not in calls[0][-1]
-    assert "uv tool install" not in calls[0][-1]
-
-
-def test_runtime_specify_install_failure_is_actionable() -> None:
-    results = iter(
-        [
-            subprocess.CompletedProcess([], 127, "", ""),
-            subprocess.CompletedProcess([], 127, "", "timeout: failed to run command 'uv'"),
-        ]
-    )
-
-    with pytest.raises(cli.ConfigError, match="failed to install 'specify'.*failed to run"):
-        guest_setup.install_runtime_tools(
-            "vm1",
-            "agent",
-            ["specify"],
-            600,
-            run_capture=lambda argv: next(results),
-            ssh=lambda vm_id: ["ssh", vm_id],
-        )
+def test_runtime_install_passes_user_tool_and_deadline(fake_guest_lifecycle, user, tool) -> None:
+    guest_setup.install_runtime_tools("vm1", user, [tool], 321)
+    assert fake_guest_lifecycle.opened[0][0] == ("vm1", user)
+    assert fake_guest_lifecycle.phases == [
+        ("tools", {"tools": [tool], "install_timeout": 321}, {"timeout": 366})
+    ]
 
 
 @pytest.mark.parametrize("tool", ["pi", "specify"])
@@ -2199,6 +2221,7 @@ def boot_flow(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespac
         ("hostname", "set_hostname"),
         ("clock", "sync_guest_clock"),
         ("prepare", "prepare_run_user"),
+        ("mounts", "mount_workspaces"),
         ("kvm", "ensure_kvm_access"),
         ("tools", "install_runtime_tools"),
         ("git", "install_git_config"),
@@ -2213,13 +2236,13 @@ def boot_flow(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespac
     monkeypatch.setattr(cli, "_sync_existing_vm_start_config", lambda *a, **kw: None)
     monkeypatch.setattr(cli, "_warn_running_mount_drift", lambda *a, **kw: None)
 
-    def start(argv):
-        flow.events.append(("start", tuple(argv), {}))
-        if flow.start_rc == 0:
-            flow.status = "running"
-        return subprocess.CompletedProcess(argv, flow.start_rc, stdout="", stderr="")
+    def start(vm_id, **kwargs):
+        flow.events.append(("start", (vm_id,), kwargs))
+        if flow.start_rc:
+            raise cli.ConfigError("startup failed")
+        flow.status = "running"
 
-    monkeypatch.setattr(runtime, "run_smolvm_capture", start)
+    monkeypatch.setattr(guest_setup, "start_vm", start)
     monkeypatch.setattr(cli, "_maybe_print_boot_timeout_running_hint", lambda *args: False)
     real_mark = vm_metadata.mark_provisioned
 
@@ -2249,7 +2272,11 @@ def test_boot_setup_follows_start_not_attachment(
     assert [name for name in names if name in boot] == (boot if status == "stopped" else [])
     assert names.count("start") == int(status == "stopped")
     assert ("attach" in names) is not no_attach
-    assert not {"prepare", "tools", "git", "mark"}.intersection(names)
+    assert not {"tools", "git", "mark"}.intersection(names)
+    assert ("prepare" in names) is (status == "stopped")
+    assert ("mounts" in names) is (status == "stopped")
+    if status == "stopped":
+        assert names.index("prepare") < names.index("mounts")
     if status == "running":
         assert boot_flow.hostname == "smolvm"
     if status == "stopped":
@@ -2267,18 +2294,19 @@ def test_boot_reprovision_runs_once_and_marks_last(
     boot_flow.status = status
     assert boot_flow.run("run", *options, "--no-attach") == 0
     assert [name for name in boot_flow.names() if name != "start"] == [
+        "prepare",
         "hostname",
         "clock",
         "env",
-        "prepare",
+        "mounts",
         "kvm",
         "tools",
         "docker",
-        "mark",
         "command",
+        "mark",
     ]
     prepare = next(kwargs for name, _, kwargs in boot_flow.events if name == "prepare")
-    assert prepare["copy_initial_state"] is False
+    assert prepare.get("copy_initial_state", False) is False
 
 
 @pytest.mark.parametrize("creation", ["preset", "image", "recreate"])
@@ -2318,17 +2346,16 @@ def test_boot_creation_paths_share_setup(
         args = ["run"]
         expected_name = "vm1"
     assert boot_flow.run(*args, "--no-attach", "--json") == 0
-    assert [name for name in boot_flow.names() if name != "start"] == [
-        "hostname",
-        "clock",
-        "env",
-        "prepare",
+    expected = ["prepare", "hostname", "clock", "env", "mounts"]
+    if creation != "image":
+        expected.append("env")  # Reattach sync after the preset's initial boot work.
+    assert [name for name in boot_flow.names() if name != "start"] == expected + [
         "kvm",
         "tools",
         "git",
         "docker",
-        "mark",
         "command",
+        "mark",
     ]
     assert vm_metadata.load_vm(expected_name)["provisioned"] is True
     assert json.loads(capsys.readouterr().out)["vm"]["name"] == expected_name
@@ -2363,6 +2390,102 @@ def test_boot_failure_blocks_normal_completion(
     assert vm_metadata.load_vm("vm1")["provisioned"] is True
 
 
+@pytest.mark.parametrize("status", ["running", "stopped"])
+@pytest.mark.parametrize("root_shell", [False, True])
+def test_shell_working_directory_does_not_block_root_recovery(
+    boot_flow, monkeypatch, tmp_path, status, root_shell
+):
+    boot_flow.status = status
+    missing = tmp_path / "absent-guest-project"
+    with boot_flow.config.open("a") as handle:
+        handle.write(f"project_path = {json.dumps(str(missing))}\n")
+    commands = []
+
+    def attach(*args, **kwargs):
+        return _ORIGINAL_ATTACH(
+            *args,
+            **(
+                kwargs
+                | {
+                    "run": lambda argv: commands.append(argv) or 0,
+                    "ssh": lambda name: ["ssh", "synthetic-host"],
+                }
+            ),
+        )
+
+    monkeypatch.setattr(guest_setup, "attach", attach)
+    assert boot_flow.run("shell", *(["--root"] if root_shell else [])) == 0
+    assert (str(missing) in commands[0][-1]) is not root_shell
+    assert not missing.exists()
+    if root_shell:
+        assert not {"prepare", "mounts", "env", "mark"}.intersection(boot_flow.names())
+
+
+def test_failure_before_attachment_unregisters_without_automatic_stop(boot_flow, monkeypatch):
+    boot_flow.status = "running"
+    stopped = []
+    monkeypatch.setattr(
+        cli, "_print_created", lambda *a, **kw: (_ for _ in ()).throw(OSError("closed output"))
+    )
+    monkeypatch.setattr(guest_setup, "stop_vm", lambda *a, **kw: stopped.append(a))
+    with pytest.raises(OSError, match="closed output"):
+        cli._post_start_actions(
+            vm_name="vm1",
+            started_now=False,
+            command="pi",
+            attach=True,
+            run_user="agent",
+            auth_port=False,
+            stop_on_exit=True,
+            created_config=True,
+        )
+    assert session_state.active_sessions("vm1") == []
+    assert "attach" not in boot_flow.names()
+    assert not stopped
+
+
+def test_rejected_ssh_identity_unregisters_without_stopping_vm(boot_flow, monkeypatch, capsys):
+    boot_flow.status = "running"
+    stopped = []
+
+    def reject(*args, **kwargs):
+        raise cli.ConfigError("SSH identity does not match; restore its key pair")
+
+    monkeypatch.setattr(guest_setup, "attach", reject)
+    monkeypatch.setattr(guest_setup, "stop_vm", lambda *a, **kw: stopped.append(a))
+    assert (
+        cli._post_start_actions(
+            vm_name="vm1",
+            started_now=False,
+            command="bash",
+            attach=True,
+            run_user=None,
+            auth_port=False,
+            stop_on_exit=True,
+            validate_agent=False,
+            diagnostic_root=True,
+        )
+        == 2
+    )
+    assert session_state.active_sessions("vm1") == []
+    assert not stopped
+    assert "restore its key pair" in capsys.readouterr().err
+
+
+def test_running_attachment_rechecks_vm_before_registering(boot_flow, monkeypatch, capsys):
+    boot_flow.status = "running"
+
+    def command(*args, **kwargs):
+        boot_flow.status = "stopped"
+        return "/usr/bin/pi"
+
+    monkeypatch.setattr(guest_setup, "command_path", command)
+    assert boot_flow.run("run") == 1
+    assert "attach" not in boot_flow.names()
+    assert session_state.active_sessions("vm1") == []
+    assert "retry" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("failed", [None, "hostname", "clock", "kvm", "docker"])
 def test_boot_root_shell_prepares_recorded_user_and_allows_diagnosis(
     boot_flow: SimpleNamespace,
@@ -2372,16 +2495,14 @@ def test_boot_root_shell_prepares_recorded_user_and_allows_diagnosis(
     boot_flow.fail = failed
     boot_flow.attach_rc = 7
     assert boot_flow.run("shell", "--root") == 7
-    assert boot_flow.names() == ["start", "hostname", "clock", "env", "kvm", "docker", "attach"]
+    assert boot_flow.names() == ["start", "attach"]
     for name, args, kwargs in boot_flow.events:
         if name in ("kvm", "docker"):
             assert args == ("vm1", "agent")
         if name == "attach":
             assert kwargs["user"] is None
-    if failed:
-        assert f"warning: {failed} failed" in capsys.readouterr().err
-    else:
-        assert boot_flow.kvm and boot_flow.docker
+    assert capsys.readouterr().err == ""
+    assert not boot_flow.kvm and not boot_flow.docker
     boot_flow.events.clear()
     boot_flow.attach_rc = 0
     assert boot_flow.run("run") == 0
@@ -2394,7 +2515,7 @@ def test_boot_start_failure_skips_guest_operations(
     command: str,
 ) -> None:
     boot_flow.start_rc = 9
-    assert boot_flow.run(command, *(["--root"] if command == "shell" else [])) == 9
+    assert boot_flow.run(command, *(["--root"] if command == "shell" else [])) == 1
     assert boot_flow.names() == ["start"]
 
 
@@ -2408,7 +2529,7 @@ def test_boot_identity_checked_before_guest_mutation(
     vm_metadata.metadata_path("vm1").write_text(json.dumps(metadata), encoding="utf-8")
     if user == "root":
         assert boot_flow.run("shell", "--root") == 0
-        assert boot_flow.names() == ["start", "hostname", "clock", "env", "attach"]
+        assert boot_flow.names() == ["start", "attach"]
     else:
         assert boot_flow.run("shell", "--root") == 2
         assert not {"hostname", "clock", "kvm", "docker", "attach"}.intersection(boot_flow.names())
@@ -2455,17 +2576,17 @@ def test_boot_root_diagnostics_do_not_bypass_host_validation(
 
 
 @pytest.mark.parametrize("root_shell", [False, True])
-def test_boot_does_not_create_missing_runtime_account(
+def test_boot_account_failure_blocks_mounts_but_not_root_diagnostics(
     boot_flow: SimpleNamespace,
     root_shell: bool,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    boot_flow.account_exists = False
+    boot_flow.fail = "prepare"
     args = ["shell", "--root"] if root_shell else ["run", "--no-attach"]
     assert boot_flow.run(*args) == (0 if root_shell else 1)
-    assert not boot_flow.account_exists
-    assert "prepare" not in boot_flow.names()
-    assert "runtime user does not exist" in capsys.readouterr().err
+    assert "mounts" not in boot_flow.names()
+    assert ("prepare" in boot_flow.names()) is not root_shell
+    assert ("prepare failed" in capsys.readouterr().err) is not root_shell
     assert ("attach" in boot_flow.names()) is root_shell
 
 
@@ -2513,14 +2634,51 @@ def test_boot_running_session_keeps_environment_tunnel_and_cleanup(
     assert stopped == ([] if keep_running else [["sandbox", "stop", "vm1"]])
 
 
-@pytest.mark.parametrize("completed", [None, subprocess.CompletedProcess([], 1, "", "denied")])
-def test_guest_clock_errors_are_not_best_effort(completed) -> None:
-    with pytest.raises(cli.ConfigError, match="failed to sync VM clock"):
-        guest_setup.sync_guest_clock(
-            "vm1",
-            ssh=lambda name: ["ssh", name],
-            run_capture=lambda argv: completed,
-        )
+def test_guest_clock_errors_are_not_best_effort(fake_guest_lifecycle) -> None:
+    fake_guest_lifecycle.phase = lambda *a, **kw: (_ for _ in ()).throw(
+        cli.ConfigError("clock failed")
+    )
+    with pytest.raises(cli.ConfigError, match="clock failed"):
+        guest_setup.sync_guest_clock("vm1")
+
+
+def test_missing_agent_does_not_mark_initial_setup_successful(boot_flow, monkeypatch):
+    metadata = vm_metadata.load_vm("vm1")
+    metadata["provisioned"] = False
+    vm_metadata.metadata_path("vm1").write_text(json.dumps(metadata))
+    monkeypatch.setattr(guest_setup, "command_path", lambda *a, **kw: None)
+    assert boot_flow.run("run", "--reprovision", "--no-attach") == 1
+    assert vm_metadata.load_vm("vm1")["provisioned"] is False
+    assert "mark" not in boot_flow.names()
+
+
+@pytest.mark.parametrize("mode", ["stopped", "reprovision", "environment"])
+def test_concurrent_lifecycle_mutation_fails_before_guest_work(boot_flow, mode):
+    boot_flow.status = "stopped" if mode == "stopped" else "running"
+    if mode == "environment":
+        with boot_flow.config.open("a") as handle:
+            handle.write('env = ["SBX_SECRET"]\n')
+    options = ["--reprovision"] if mode == "reprovision" else []
+    with vm_metadata.Lifecycle() as active:
+        active.lock("vm1")
+        assert boot_flow.run("run", "--no-attach", *options) == 2
+    assert boot_flow.events == []
+
+
+def test_read_only_running_attachment_does_not_wait_for_mutation_lock(boot_flow):
+    boot_flow.status = "running"
+    with vm_metadata.Lifecycle() as active:
+        active.lock("vm1")
+        assert boot_flow.run("run") == 0
+    assert boot_flow.names() == ["env", "command", "attach"]
+
+
+def test_environment_sync_rejects_surviving_remote_phase(forwarded_env_vm):
+    forwarded_env_vm.failure = "busy"
+    with pytest.raises(cli.ConfigError, match="provisioning is active"):
+        guest_setup.sync_forwarded_env("vm1", ["SBX_PRESENT"])
+    assert not any(name in ("set", "unset") for name, _ in forwarded_env_vm.calls)
+    assert forwarded_env_vm.calls[-1] == ("close", None)
 
 
 def test_boot_root_diagnostics_do_not_hide_programming_errors(
@@ -2530,7 +2688,7 @@ def test_boot_root_diagnostics_do_not_hide_programming_errors(
     def broken(*args, **kwargs):
         raise RuntimeError("unexpected bug")
 
-    monkeypatch.setattr(guest_setup, "set_hostname", broken)
+    monkeypatch.setattr(guest_setup, "wait_for_control", broken)
     with pytest.raises(RuntimeError, match="unexpected bug"):
         boot_flow.run("shell", "--root")
     assert "attach" not in boot_flow.names()

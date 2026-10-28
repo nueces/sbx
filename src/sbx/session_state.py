@@ -1,9 +1,22 @@
+"""Session registry; callers hold session_lock across each read-modify-write."""
+
 import os
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from typing import Any
 
 from sbx.constants import SBX_STATE_DIR, SESSIONS_FILE
-from sbx.runtime import pid_is_alive, read_json_object, write_json_object
+from sbx.runtime import exclusive_lock, pid_is_alive, read_json_object, write_json_object
+
+
+@contextmanager
+def session_lock(*, blocking: bool = True) -> Iterator[None]:
+    with exclusive_lock(
+        SESSIONS_FILE.with_suffix(".lock"),
+        busy_message="session registry is busy; retry the attachment or stop later",
+        blocking=blocking,
+    ):
+        yield
 
 
 def load_sessions() -> dict[str, Any]:

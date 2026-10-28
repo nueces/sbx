@@ -2,12 +2,13 @@ import json
 import os
 import re
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
 
 from sbx.constants import SBX_VMS_DIR
-from sbx.runtime import ConfigError
+from sbx.runtime import ConfigError, exclusive_lock
 
 VM_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
@@ -49,6 +50,28 @@ def load_vm_metadata() -> dict[str, dict[str, Any]]:
 def _ensure_directory() -> None:
     SBX_VMS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     SBX_VMS_DIR.chmod(0o700)
+
+
+@contextmanager
+def lifecycle_lock(vm_name: str) -> Iterator[None]:
+    path = metadata_path(vm_name).with_suffix(".lock")
+    with exclusive_lock(
+        path, busy_message=f"VM {vm_name!r} has a lifecycle operation in progress; retry later"
+    ):
+        yield
+
+
+class Lifecycle(ExitStack):
+    """Own lifecycle locks until guest work is complete, never through attachment."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.names: set[str] = set()
+
+    def lock(self, vm_name: str) -> None:
+        if vm_name not in self.names:
+            self.enter_context(lifecycle_lock(vm_name))
+            self.names.add(vm_name)
 
 
 def _write(vm_name: str, data: Mapping[str, Any], *, exclusive: bool = False) -> bool:
@@ -118,8 +141,9 @@ def claim_vm(
             f"VM {vm_name!r} is provisioned for {recorded_user!r}, not {run_user!r}; "
             f"run `sbx recreate {vm_name} --force`"
         )
-    saved.update(project_root=project["project_root"], config_path=project["config_path"])
-    _write(vm_name, saved)
+    if any(saved.get(key) != project[key] for key in ("project_root", "config_path")):
+        saved.update(project_root=project["project_root"], config_path=project["config_path"])
+        _write(vm_name, saved)
     return saved
 
 

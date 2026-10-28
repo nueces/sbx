@@ -13,7 +13,7 @@ _ORIGINAL_HOST_GIT_CONFIG = guest_setup.host_git_config
 
 
 @pytest.fixture(autouse=True)
-def isolated_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def isolated_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_guest_lifecycle) -> None:
     monkeypatch.setattr(cli.runtime, "DEBUG", False)
     monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATHS", (tmp_path / "home-config.toml",))
     monkeypatch.setattr(cli, "LOCAL_CONFIG_PATHS", (tmp_path / ".sbx.toml",))
@@ -45,6 +45,12 @@ def isolated_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         callback = kwargs.get("before_provision")
         if callable(callback):
             callback(vm_id)
+        guest_setup.prepare_boot(
+            vm_id,
+            str(kwargs.get("run_user", "root")),
+            list(kwargs.get("forward_env", [])),
+            guest=fake_guest_lifecycle,
+        )
         return SimpleNamespace(vm_id=vm_id, close=lambda: None)
 
     monkeypatch.setattr(cli.smolvm_preset, "create_preset", create_preset)
@@ -78,6 +84,13 @@ def capture_preset(
         callback = kwargs.get("before_provision")
         if callable(callback):
             callback(vm_id)
+        with guest_setup.bootstrap_session(vm_id, str(kwargs.get("run_user", "root"))) as guest:
+            guest_setup.prepare_boot(
+                vm_id,
+                str(kwargs.get("run_user", "root")),
+                list(kwargs.get("forward_env", [])),
+                guest=guest,
+            )
         return SimpleNamespace(
             vm_id=vm_id,
             close=lambda: captured.setdefault("preset_closed", True),
@@ -418,7 +431,7 @@ def test_shell_uses_configured_project_path_as_cwd(
     assert captured["attach"] == ("vm1", "agent", "bash", str(project))
 
 
-def test_shell_root_uses_configured_project_path_as_cwd(
+def test_shell_root_ignores_configured_project_path_as_cwd(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -441,7 +454,7 @@ def test_shell_root_uses_configured_project_path_as_cwd(
     rc = cli.main(["--config", str(config), "shell", "--root", "--keep-running"])
 
     assert rc == 0
-    assert captured["attach"] == ("vm1", "bash", str(project))
+    assert captured["attach"] == ("vm1", "bash", None)
 
 
 def test_shell_root_ignores_configured_run_user(
@@ -558,7 +571,7 @@ mount = [".:/workspace"]
     assert preset_name == "codex"
     assert preset_kwargs["vm_name"] == "demo"
     assert preset_kwargs["mounts"] == [".:/workspace"]
-    assert capfd.readouterr().out == "Started 'demo'. Launching codex as user hostuser...\n"
+    assert capfd.readouterr().out == ""  # Mocked setup must not announce success early.
 
 
 def test_run_supports_all_exposed_options_from_config(
@@ -1210,9 +1223,9 @@ def test_run_existing_vm_starts_without_creating(
     assert attached["user"] == "agent"
     assert calls == [
         ["smolvm", "sandbox", "info", "vm1", "--json"],
-        ["smolvm", "sandbox", "start", "vm1", "--boot-timeout", "60"],
+        ["smolvm", "sandbox", "info", "vm1", "--json"],
         ["smolvm", "sandbox", "stop", "vm1"],
-    ]
+    ]  # Startup uses the manager API, not a CLI subprocess.
 
 
 def test_run_existing_error_vm_suggests_recreate(
@@ -1789,7 +1802,7 @@ name = "from-config"
     preset_name, preset_kwargs = captured["preset"]
     assert preset_name == "claude"
     assert preset_kwargs["vm_name"] == "from-cli"
-    assert "Created sandbox 'from-cli'." in capfd.readouterr().out
+    assert capfd.readouterr().out == ""  # Announcement belongs to verified post-start setup.
 
 
 def test_invalid_agent_in_config_returns_usage_error(
