@@ -574,21 +574,13 @@ def test_main_preserves_sudo_env_when_effectively_root(monkeypatch: pytest.Monke
     assert observed == ["developer"]
 
 
-def test_ssh_command_and_pid_alive(monkeypatch: pytest.MonkeyPatch) -> None:
-    class FakeVm:
-        def _ssh_direct_command(self) -> list[str]:
-            return ["ssh", "root@host"]
-
-        def close(self) -> None:
-            pass
-
-    class FakeSmolVM:
-        @classmethod
-        def from_id(cls, vm_id: str) -> FakeVm:
-            return FakeVm()
-
-    monkeypatch.setattr(smolvm.facade, "SmolVM", FakeSmolVM)
+def test_ssh_command_and_pid_alive(monkeypatch: pytest.MonkeyPatch, forwarded_env_vm) -> None:
     assert guest_setup.ssh_command("vm1") == ["ssh", "root@host"]
+    assert ("ssh", str(forwarded_env_vm.private)) in forwarded_env_vm.calls
+    assert forwarded_env_vm.calls[-2:] == [
+        ("close", str(forwarded_env_vm.private)),
+        ("close", None),
+    ]
 
     monkeypatch.setattr(session_state.os, "kill", lambda pid, sig: None)
     assert session_state.pid_is_alive(123) is True
@@ -1177,9 +1169,11 @@ def forwarded_env_vm(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleN
     private.write_text("PRIVATE_KEY_SENTINEL", encoding="utf-8")
     public.write_text("ssh-ed25519 injected-key comment\n", encoding="utf-8")
     calls: list[tuple[str, object]] = []
-    config = SimpleNamespace(comm_channel="ssh", ssh_public_key="ssh-ed25519 injected-key")
+    config = SimpleNamespace(
+        comm_channel="ssh", ssh_capable=True, ssh_public_key="ssh-ed25519 injected-key"
+    )
     state = SimpleNamespace(
-        private=private, public=public, config=config, calls=calls, failure=None, require_key=True
+        private=private, public=public, config=config, calls=calls, failure=None
     )
 
     class FakeSmolVM:
@@ -1197,12 +1191,13 @@ def forwarded_env_vm(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleN
             return cls(kwargs.get("ssh_key_path"))
 
         def check_key(self) -> None:
-            if (
-                state.require_key
-                and config.comm_channel == "ssh"
-                and config.ssh_public_key == "ssh-ed25519 injected-key"
-            ):
+            if config.comm_channel == "ssh":
                 assert self.key == str(private), "known key must precede environment operations"
+
+        def _ssh_direct_command(self):
+            self.check_key()
+            calls.append(("ssh", self.key))
+            return ["ssh", "root@host"]
 
         def run(self, command, **kwargs):
             self.check_key()
@@ -1223,16 +1218,13 @@ def forwarded_env_vm(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleN
         def close(self) -> None:
             calls.append(("close", self.key))
 
-    def resolve_key() -> tuple[Path, Path]:
-        calls.append(("key", None))
-        if state.failure == "key":
-            raise OSError("key resolution failed")
-        return private, public
+    def reject_key_generation():
+        pytest.fail("existing VM authentication must never generate keys")
 
     monkeypatch.delenv("SUDO_USER", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(smolvm.facade, "SmolVM", FakeSmolVM)
-    monkeypatch.setattr(smolvm.utils, "ensure_ssh_key", resolve_key)
+    monkeypatch.setattr(smolvm.utils, "ensure_ssh_key", reject_key_generation)
     monkeypatch.setenv("SBX_PRESENT", "ENV_SECRET_SENTINEL")
     monkeypatch.delenv("SBX_MISSING", raising=False)
     return state
@@ -1249,7 +1241,6 @@ def test_sync_forwarded_env_sets_present_and_unsets_missing(
 
     expected: list[tuple[str, object]] = [
         ("from_id", {}),
-        ("key", None),
         ("from_id", {"ssh_key_path": str(forwarded_env_vm.private)}),
     ]
     if "SBX_PRESENT" in names:
@@ -1260,7 +1251,7 @@ def test_sync_forwarded_env_sets_present_and_unsets_missing(
     assert forwarded_env_vm.calls == expected
 
 
-@pytest.mark.parametrize("failure", ["key", "connect", "set", "unset"])
+@pytest.mark.parametrize("failure", ["connect", "set", "unset"])
 def test_sync_forwarded_env_closes_on_failure(
     forwarded_env_vm: SimpleNamespace, failure: str
 ) -> None:
@@ -1273,30 +1264,36 @@ def test_sync_forwarded_env_closes_on_failure(
     assert len(closed_keys) == (2 if failure in {"set", "unset"} else 1)
 
 
+@pytest.mark.parametrize("missing", ["private", "public"])
 def test_sync_forwarded_env_does_not_generate_missing_known_key(
-    forwarded_env_vm: SimpleNamespace,
+    forwarded_env_vm: SimpleNamespace, missing: str
 ) -> None:
-    forwarded_env_vm.private.unlink()
+    getattr(forwarded_env_vm, missing).unlink()
     with pytest.raises(cli.ConfigError, match="SSH key"):
         guest_setup.sync_forwarded_env("vm1", ["SBX_PRESENT"])
 
     assert forwarded_env_vm.calls == [("from_id", {}), ("close", None)]
-    assert not forwarded_env_vm.private.exists()
+    assert not getattr(forwarded_env_vm, missing).exists()
 
 
-def test_sync_forwarded_env_keeps_existing_auth_without_public_key_proof(
-    forwarded_env_vm: SimpleNamespace,
-) -> None:
-    forwarded_env_vm.public.unlink()
-    forwarded_env_vm.require_key = False
-    guest_setup.sync_forwarded_env("vm1", ["SBX_PRESENT"])
+@pytest.mark.parametrize("injected", [None, "", "ssh-ed25519 different-key", "ssh-ed25519"])
+@pytest.mark.parametrize("operation", ["control", "interactive"])
+def test_guest_control_rejects_unproven_ssh_identity(forwarded_env_vm, injected, operation):
+    forwarded_env_vm.config.ssh_public_key = injected
+    with pytest.raises(cli.ConfigError, match="SSH"):
+        if operation == "control":
+            guest_setup.sync_forwarded_env("vm1", ["SBX_PRESENT"])
+        else:
+            guest_setup.ssh_command("vm1")
+    assert forwarded_env_vm.calls == [("from_id", {}), ("close", None)]
 
-    assert forwarded_env_vm.calls == [
-        ("from_id", {}),
-        ("set", {"SBX_PRESENT": "ENV_SECRET_SENTINEL"}),
-        ("close", None),
-    ]
-    assert not forwarded_env_vm.public.exists()
+
+@pytest.mark.parametrize("content", [b"\xff", b"", b"ssh-ed25519"])
+def test_guest_control_rejects_invalid_public_key_file(forwarded_env_vm, content):
+    forwarded_env_vm.public.write_bytes(content)
+    with pytest.raises(cli.ConfigError, match="SSH"):
+        guest_setup.sync_forwarded_env("vm1", ["SBX_PRESENT"])
+    assert forwarded_env_vm.calls == [("from_id", {}), ("close", None)]
 
 
 def test_sync_forwarded_env_resolves_sudo_identity(
@@ -1319,7 +1316,7 @@ def test_sync_forwarded_env_resolves_sudo_identity(
     assert ("from_id", {"ssh_key_path": str(forwarded_env_vm.private)}) in forwarded_env_vm.calls
 
 
-@pytest.mark.parametrize("failure", ["key", "connect", "set", "unset"])
+@pytest.mark.parametrize("failure", ["missing_key", "connect", "set", "unset"])
 def test_sync_forwarded_env_failure_prevents_cli_attach(
     forwarded_env_vm: SimpleNamespace,
     monkeypatch: pytest.MonkeyPatch,
@@ -1327,6 +1324,8 @@ def test_sync_forwarded_env_failure_prevents_cli_attach(
     failure: str,
 ) -> None:
     forwarded_env_vm.failure = failure
+    if failure == "missing_key":
+        forwarded_env_vm.private.unlink()
     vm_metadata.claim_vm(
         "vm1",
         {"project_root": "/project", "config_path": "/project/sbx.toml"},
@@ -1358,19 +1357,8 @@ def test_sync_forwarded_env_failure_prevents_cli_attach(
     assert "PRIVATE_KEY_SENTINEL" not in captured.out + captured.err
 
 
-@pytest.mark.parametrize(
-    ("channel", "injected_key"),
-    [
-        ("vsock", "ssh-ed25519 injected-key"),
-        ("ssh", "ssh-ed25519 different-authorized-key"),
-        ("ssh", None),
-    ],
-)
-def test_sync_forwarded_env_preserves_other_auth_and_transports(
-    forwarded_env_vm: SimpleNamespace, channel: str, injected_key: str | None
-) -> None:
-    forwarded_env_vm.config.comm_channel = channel
-    forwarded_env_vm.config.ssh_public_key = injected_key
+def test_sync_forwarded_env_preserves_explicit_vsock_transport(forwarded_env_vm) -> None:
+    forwarded_env_vm.config.comm_channel = "vsock"
     guest_setup.sync_forwarded_env("vm1", ["SBX_PRESENT", "SBX_MISSING"])
 
     assert forwarded_env_vm.calls == [
@@ -1394,40 +1382,20 @@ def test_sync_forwarded_env_does_not_log_secrets(
         assert secret not in captured.out + captured.err + caplog.text
 
 
-def test_sync_forwarded_env_uses_direct_ssh_for_legacy_vm(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[tuple[str, object]] = []
-
-    class FakeSmolVM:
-        info = SimpleNamespace(config=SimpleNamespace(comm_channel=None))
-
-        @classmethod
-        def from_id(cls, vm_id: str, **kwargs: object) -> Self:
-            calls.append(("from_id", kwargs))
-            return cls()
-
-        def close(self) -> None:
-            calls.append(("close", None))
-
-    def fake_run_capture(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        calls.append(("ssh", argv[-1]))
-        return subprocess.CompletedProcess(argv, 0, "export OLD=kept\nexport SBX_TOKEN=old\n", "")
-
-    monkeypatch.setattr(smolvm.facade, "SmolVM", FakeSmolVM, raising=False)
-    monkeypatch.setattr(guest_setup, "ssh_command", lambda vm_id: ["ssh", vm_id])
-    monkeypatch.setattr(cli.runtime, "run_capture", fake_run_capture)
-    monkeypatch.setenv("SBX_TOKEN", "value")
-
-    guest_setup.sync_forwarded_env("vm1", ["SBX_TOKEN", "MISSING"], run_capture=fake_run_capture)
-
-    assert calls[0] == ("from_id", {})
-    assert calls[1][0] == "ssh"
-    assert "cat /etc/profile.d/smolvm_env.sh 2>/dev/null || true" in calls[1][1]
-    assert "execution.lock" in calls[1][1]
-    assert calls[2][0] == "ssh"
-    assert "base64 -d" in str(calls[2][1])
-    assert calls[3] == ("close", None)
+@pytest.mark.parametrize("channel,capable", [(None, True), ("auto", True), ("ssh", False)])
+@pytest.mark.parametrize("operation", ["control", "interactive"])
+def test_guest_control_rejects_legacy_or_incomplete_ssh_metadata(
+    forwarded_env_vm, channel, capable, operation
+):
+    forwarded_env_vm.config.comm_channel = channel
+    forwarded_env_vm.config.ssh_capable = capable
+    with pytest.raises(cli.ConfigError, match="SSH"):
+        if operation == "control":
+            with guest_setup.open_guest("vm1"):
+                pytest.fail("legacy/incomplete metadata must not reach guest operations")
+        else:
+            guest_setup.ssh_command("vm1")
+    assert forwarded_env_vm.calls == [("from_id", {}), ("close", None)]
 
 
 def test_sync_forwarded_env_empty_allowlist_skips_smolvm(
@@ -2474,6 +2442,34 @@ def test_failure_before_attachment_unregisters_without_automatic_stop(boot_flow,
     assert session_state.active_sessions("vm1") == []
     assert "attach" not in boot_flow.names()
     assert not stopped
+
+
+def test_rejected_ssh_identity_unregisters_without_stopping_vm(boot_flow, monkeypatch, capsys):
+    boot_flow.status = "running"
+    stopped = []
+
+    def reject(*args, **kwargs):
+        raise cli.ConfigError("SSH identity does not match; restore its key pair")
+
+    monkeypatch.setattr(guest_setup, "attach", reject)
+    monkeypatch.setattr(guest_setup, "stop_vm", lambda *a, **kw: stopped.append(a))
+    assert (
+        cli._post_start_actions(
+            vm_name="vm1",
+            started_now=False,
+            command="bash",
+            attach=True,
+            run_user=None,
+            auth_port=False,
+            stop_on_exit=True,
+            validate_agent=False,
+            diagnostic_root=True,
+        )
+        == 2
+    )
+    assert session_state.active_sessions("vm1") == []
+    assert not stopped
+    assert "restore its key pair" in capsys.readouterr().err
 
 
 def test_running_attachment_rechecks_vm_before_registering(boot_flow, monkeypatch, capsys):

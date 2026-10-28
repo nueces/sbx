@@ -161,6 +161,8 @@ def test_create_preset_orders_account_environment_install_and_mounts(
         PortForwardConfig(host_address="0.0.0.0", host_port=3000, guest_port=30)
     ]
     assert preset_sdk.updates.get("vcpu_count") == cpus
+    assert preset_sdk.updates["comm_channel"] == "ssh"
+    assert preset_sdk.updates["ssh_capable"] is True
     assert preset_sdk.construct[1] == dict(
         ssh_key_path="private-key", mounts=["/host:/guest"], writable_mounts=True
     )

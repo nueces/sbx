@@ -336,31 +336,9 @@ class Runtime:
                 continue
             self.run(["modprobe", module], check=False)
         if any(kind not in FILESYSTEMS.read_text().split() for kind in needed):
-            release = ETC / "os-release"
-            values = (
-                dict(line.split("=", 1) for line in release.read_text().splitlines() if "=" in line)
-                if release.exists()
-                else {}
+            raise ValueError(
+                "guest kernel lacks required workspace support; rebuild a supported image"
             )
-            if values.get("ID", "").strip('"') != "ubuntu":
-                raise ValueError("guest kernel lacks 9p/overlay support")
-            repair = """set -eu
-export DEBIAN_FRONTEND=noninteractive
-deadline=$(( $(date +%s) + 120 ))
-LOCKS='/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock'
-while command -v fuser >/dev/null 2>&1 && fuser $LOCKS >/dev/null 2>&1; do
-  [ "$(date +%s)" -lt "$deadline" ] || exit 43
-  sleep 2
-done
-APT_OPTS='-o DPkg::Lock::Timeout=120 -o Acquire::Retries=3'
-apt-get $APT_OPTS update -qq
-apt-get $APT_OPTS install -y -qq "linux-modules-extra-$(uname -r)"
-modprobe 9p
-modprobe 9pnet_virtio
-"""
-            if "overlay" in needed:
-                repair += "modprobe overlay\n"
-            self.run(["bash", "-c", repair], timeout=240)
         for mount in self.mounts:
             target, tag = mount["target"], mount["tag"]
             if mount["writable"]:

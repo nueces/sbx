@@ -63,7 +63,9 @@ def create_preset(
             ssh_key_path=None,
         )
         updates: dict[str, object] = {
-            "port_forwards": [PortForwardConfig(**value) for value in port_forwards]
+            "port_forwards": [PortForwardConfig(**value) for value in port_forwards],
+            "comm_channel": "ssh",
+            "ssh_capable": True,
         }
         if cpus is not None:
             updates["vcpu_count"] = cpus

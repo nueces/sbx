@@ -112,6 +112,8 @@ When using a local image, `sbx doctor` should also warn if `[sbx].disk_size` is 
 
 Guest bootstrap uses the configured control transport (SSH for the curated image) and has three normal-operation scopes:
 
+SSH requires explicit VM metadata (`comm_channel="ssh"`, `ssh_capable=true`, and the injected public key) and the matching existing local key pair. Local-image and preset creation record this metadata. Bootstrap, command checks, interactive shells and SSH tunnels do not discover another identity or generate replacement keys for existing VMs. Legacy unset-channel VMs must be explicitly recreated (which deletes their disk). For missing or mismatched keys, restore the original pair or recreate the VM; existing VM keys are never replaced automatically. Explicit vsock control remains a separate transport, not a legacy SSH fallback.
+
 | Scope | Operations |
 | --- | --- |
 | Creation or requested reprovisioning | Prepare the runtime account, install requested tools, and apply initial-state/Git configuration safeguards. |
@@ -135,9 +137,17 @@ Diagnostic `sbx shell --root` bypasses mandatory account setup, environment sync
 
 Hostname, clock, account, mount and helper failures stop normal startup/provisioning before attachment or no-attach success. The VM remains available for root inspection and explicit repair/retry.
 
+Supported images must provide the kernel support for 9p workspaces and, when used, overlays. Startup may load modules already included in the image; it never installs kernel packages or repairs an unsupported image. Missing support fails before workspace targets are created, with instructions to rebuild a supported image.
+
 Nested KVM is optional. Default images omit its helper, so the KVM phase skips KVM-specific work without requiring guest `/dev/kvm`. Images built with `--nested-kvm` include the kernel support and helper; if that helper cannot access `/dev/kvm`, normal setup fails with host/CPU-exposure guidance. Root runtime users skip the non-root helper.
 
 There is no persistent boot-readiness tracking: a later ordinary attachment to that running VM does not retry failed setup and may proceed if provisioning eligibility checks pass. Use the explicit repair commands above. sbx also does not detect a reboot performed outside sbx when it next finds the VM already running.
+
+### Current limitation after interrupted provisioning
+
+Environment updates check the guest execution lock but do not hold it throughout the managed-environment API call. Host locks serialize normal CLI mutations; after a CLI disconnect, however, a surviving guest phase can acquire its lock between that check and the update. An installer may then consume unintended environment values, including forwarded credential settings. This remains a deferred limitation for the single-operator, disposable-VM workflow, not a guarantee of race-free recovery.
+
+Do not immediately retry environment/provisioning changes after interruption while earlier work may still run. Wait for it to finish or reach its existing deadline; inspect with `sbx shell NAME --root --keep-running` without synchronizing environment or automatically stopping on exit. If state is uncertain, explicitly stop/recreate the disposable VM after preserving needed guest-only data; recreation deletes its disk. A dependency upgrade alone is not known to fix this limitation.
 
 ### Automatic stop versus explicit stop
 

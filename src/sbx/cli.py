@@ -282,7 +282,7 @@ def _project_guest_cwd(path_value: Any) -> str | None:
 
 def _sync_forwarded_env_or_error(vm_id: str, names: list[str], *, guest=None) -> bool:
     try:
-        guest_setup.sync_forwarded_env(vm_id, names, run_capture=runtime.run_capture, guest=guest)
+        guest_setup.sync_forwarded_env(vm_id, names, guest=guest)
     except Exception as exc:  # noqa: BLE001 - keep CLI errors user-friendly.
         print(f"sbx: failed to sync environment for VM {vm_id!r}: {exc}", file=sys.stderr)
         return False
@@ -624,7 +624,14 @@ def _post_start_actions(
         if not attach:
             return 0
         attempted_attach = True
-        rc = guest_setup.attach(vm_name, resolved_command, user=run_user, cwd=cwd, run=runtime.run)
+        try:
+            rc = guest_setup.attach(
+                vm_name, resolved_command, user=run_user, cwd=cwd, run=runtime.run
+            )
+        except ConfigError as exc:
+            attempted_attach = False
+            print(f"sbx: {exc}", file=sys.stderr)
+            return 2
         if rc != 0 and validate_agent:
             print(
                 f"sbx: agent {agent_name or command!r} at {resolved_command!r} "

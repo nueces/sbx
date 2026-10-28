@@ -1,5 +1,4 @@
 import atexit
-import base64
 import os
 import pwd
 import re
@@ -12,8 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import smolvm.facade
-import smolvm.utils
-from smolvm.env import ENV_FILE, build_env_script
+from smolvm.env import ENV_FILE
 from smolvm.vm import SmolVMManager
 
 from sbx import bootstrap, runtime, session_state, vm_metadata
@@ -145,93 +143,22 @@ def host_git_config(project_root: Path | None = None) -> str | None:
     return "\n".join(lines)
 
 
-def parse_managed_env_script(text: str) -> dict[str, str]:
-    env: dict[str, str] = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("export ") and "=" in line:
-            key, raw_value = line[len("export ") :].split("=", 1)
-            with suppress(ValueError):
-                env[key] = (shlex.split(raw_value) or [""])[0]
-    return env
-
-
-def sync_forwarded_env_direct_ssh(
-    vm_id: str,
-    values: dict[str, str],
-    missing: list[str],
-    *,
-    run_capture: Callable[[list[str]], subprocess.CompletedProcess[str] | None] | None = None,
-    ssh: Callable[[str], list[str]] | None = None,
-) -> None:
-    run_capture = run_capture or runtime.run_capture
-    ssh = ssh or ssh_command
-    ssh_cmd = ssh(vm_id)
-    read_command = (
-        f"{bootstrap.LEASE_CHECK} && {{ cat {shlex.quote(ENV_FILE)} 2>/dev/null || true; }}"
-    )
-    completed = run_capture([*ssh_cmd, read_command])
-    if completed is None:
-        raise ConfigError("failed to sync environment: ssh command not found")
-    if completed.returncode != 0:
-        stderr = completed.stderr.strip() or completed.stdout.strip()
-        raise ConfigError(f"failed to read environment: {stderr}")
-    env = parse_managed_env_script(completed.stdout)
-    env.update(values)
-    for name in missing:
-        env.pop(name, None)
-    encoded = base64.b64encode(build_env_script(env).encode("utf-8")).decode("ascii")
-    write_script = f"""
-set -eu
-_t=$(mktemp /tmp/.smolvm_env.XXXXXXXXXX)
-trap 'rm -f "$_t"' EXIT
-printf %s {shlex.quote(encoded)} | base64 -d > "$_t"
-chmod 0644 "$_t"
-mv "$_t" {shlex.quote(ENV_FILE)}
-"""
-    completed = run_capture([*ssh_cmd, "bash -lc " + shlex.quote(write_script)])
-    if completed is None:
-        raise ConfigError("failed to sync environment: ssh command not found")
-    if completed.returncode != 0:
-        stderr = completed.stderr.strip() or completed.stdout.strip()
-        raise ConfigError(f"failed to write environment: {stderr}")
-
-
 @contextmanager
-def open_guest(vm_id: str, *, legacy_ssh: bool = False):
+def open_guest(vm_id: str):
     with ExitStack() as cleanup:
         vm = smolvm.facade.SmolVM.from_id(vm_id)
         cleanup.callback(vm.close)
         config = vm.info.config
-        channel = config.comm_channel
-        options = {"comm_channel": "ssh"} if legacy_ssh and channel is None else {}
-        injected_key = getattr(config, "ssh_public_key", None)
-        if (channel == "ssh" or options) and injected_key:
-            key_home = Path.home()
-            sudo_user = os.environ.get("SUDO_USER")
-            if sudo_user:
-                with suppress(KeyError):
-                    key_home = Path(pwd.getpwnam(sudo_user).pw_dir)
-            # shortcut: pinned key layout; use upstream read-only resolution when available.
-            key_dir = key_home / ".smolvm" / "keys"
-            public_key = key_dir / "id_ed25519.pub"
-            if (
-                public_key.is_file()
-                and public_key.read_text(encoding="utf-8").split()[:2] == injected_key.split()[:2]
-            ):
-                if not (key_dir / "id_ed25519").is_file():
-                    raise ConfigError("missing smolvm SSH key; restore the existing key pair")
-                private_key, _ = smolvm.utils.ensure_ssh_key()
-                options["ssh_key_path"] = str(private_key)
-        if options:
-            vm = smolvm.facade.SmolVM.from_id(vm_id, **options)
-            cleanup.callback(vm.close)
+        if config.comm_channel == "vsock":
+            yield vm
+            return
+        private_key = runtime.guest_ssh_key_path(vm_id, config)
+        vm = smolvm.facade.SmolVM.from_id(vm_id, ssh_key_path=str(private_key))
+        cleanup.callback(vm.close)
         yield vm
 
 
-def sync_forwarded_env(
-    vm_id: str, names: list[str], *, run_capture=None, ssh=None, guest=None
-) -> None:
+def sync_forwarded_env(vm_id: str, names: list[str], *, guest=None) -> None:
     if not names:
         return
     validate_env_names(names)
@@ -239,9 +166,6 @@ def sync_forwarded_env(
     missing = [name for name in names if name not in os.environ]
     context = nullcontext(guest.vm) if guest is not None else open_guest(vm_id)
     with context as vm:
-        if vm.info.config.comm_channel is None:
-            sync_forwarded_env_direct_ssh(vm_id, values, missing, run_capture=run_capture, ssh=ssh)
-            return
         if guest is None:
             result = vm.run(bootstrap.LEASE_CHECK, timeout=10)
             if result.exit_code:
@@ -258,7 +182,7 @@ def sync_forwarded_env(
 def bootstrap_session(vm_id: str, user: str, *, env_names=(), timeout: float = 30):
     validate_run_user(user)
     validate_vm_name(vm_id)
-    with open_guest(vm_id, legacy_ssh=True) as vm:
+    with open_guest(vm_id) as vm:
         vm.wait_for_ready(timeout=timeout)
         guest = bootstrap.GuestBootstrap(vm, user, vm_id, env_names)
         guest.phase("check")
@@ -266,7 +190,7 @@ def bootstrap_session(vm_id: str, user: str, *, env_names=(), timeout: float = 3
 
 
 def wait_for_control(vm_id: str, *, timeout: float) -> None:
-    with open_guest(vm_id, legacy_ssh=True) as vm:
+    with open_guest(vm_id) as vm:
         vm.wait_for_ready(timeout=timeout)
 
 
@@ -338,7 +262,7 @@ def stop_vm(vm_id: str, *, only_if_idle: bool = False) -> int:
                 if session_state.active_sessions(vm_id):
                     return 0
         try:
-            with open_guest(vm_id, legacy_ssh=True) as vm:
+            with open_guest(vm_id) as vm:
                 vm.wait_for_ready(timeout=10)
                 result = vm.run("sync", timeout=10)
                 if result.exit_code:
@@ -365,7 +289,7 @@ def _phase(vm_id, name, arguments=None, *, user="root", guest=None, timeout=30):
 
 def mount_workspaces(vm_id: str, user: str, *, guest=None) -> None:
     count = len(guest.mounts) if guest is not None else 0
-    _phase(vm_id, "mounts", user=user, guest=guest, timeout=270 + 15 * count)
+    _phase(vm_id, "mounts", user=user, guest=guest, timeout=30 + 30 * count)
 
 
 def host_timezone() -> str:

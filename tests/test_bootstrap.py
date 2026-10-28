@@ -522,15 +522,20 @@ def test_guest_failed_git_publication_cleans_private_temporary(
     assert not list(home.glob(".sbx-git-*"))
 
 
-def test_guest_missing_modules_fail_before_mount_targets(guest_script, account_home):
+@pytest.mark.parametrize("distribution", ["ubuntu", "debian"])
+@pytest.mark.parametrize("filesystems,writable", [("", True), ("nodev 9p\n", False)])
+def test_guest_missing_modules_fail_before_mount_targets(
+    guest_script, account_home, distribution, filesystems, writable
+):
     guest, home = account_home
-    guest_script.module.FILESYSTEMS.write_text("")
+    (guest_script.module.ETC / "os-release").write_text(f"ID={distribution}\n")
+    guest_script.module.FILESYSTEMS.write_text(filesystems)
     target = home / "project"
-    guest.mounts = [dict(target=target, tag="workspace0", writable=True)]
-    with pytest.raises(ValueError, match="kernel lacks"):
+    guest.mounts = [dict(target=target, tag="workspace0", writable=writable)]
+    with pytest.raises(ValueError, match="kernel lacks.*rebuild a supported image"):
         guest.mounts_phase()
     assert not target.exists()
-    assert not any(argv[0] == "mount" for argv, _ in guest_script.commands)
+    assert all(argv[0] == "modprobe" for argv, _ in guest_script.commands)
 
 
 def test_guest_mount_order_repeat_and_conflicts(guest_script, account_home, monkeypatch):
@@ -688,6 +693,19 @@ def test_preset_upload_is_private_before_credential_bytes(control, tmp_path, fai
             source.read_bytes(),
             {"make_dirs": False},
         )
+
+
+def test_mount_deadline_covers_overlay_pairs_without_package_install_budget(control):
+    guest = bootstrap.GuestBootstrap(control, "agent", "vm1")
+    guest.mounts = [
+        dict(target=f"/workspace{index}", tag=f"workspace{index}", writable=False)
+        for index in range(2)
+    ]
+    guest_setup.mount_workspaces("vm1", "agent", guest=guest)
+    assert any(
+        command.startswith("timeout --signal=TERM --kill-after=10s 90s ")
+        for command in control.commands
+    )
 
 
 def test_host_stages_script_and_nonsecret_data(control, monkeypatch):
