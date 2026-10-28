@@ -6,7 +6,7 @@ This document captures the intended user experience for `sbx` commands and confi
 
 `sbx` should be project-context first:
 
-- Use the current directory's `./.sbx.toml` as the project anchor.
+- Use the nearest `.sbx.toml` in the current directory or its ancestors as the project anchor.
 - Avoid requiring users to repeat the sandbox name after a project is configured.
 - Keep common workflows short: `sbx run`, `sbx shell`, `sbx doctor`.
 - Prefer safe, explicit behavior for destructive actions.
@@ -14,7 +14,7 @@ This document captures the intended user experience for `sbx` commands and confi
 
 ## Project context
 
-`./.sbx.toml` describes the sandbox associated with a project. When `[sbx].name` is configured, commands that operate on a single sandbox should default to that name.
+The nearest `.sbx.toml` describes the sandbox associated with a project. When `[sbx].name` is configured, all config-consuming commands, including stop/remove, default to it unless an explicit name is given. Nested configs select the nearest project; ancestor configs are not merged. Session-directory mapping uses the most-specific host mount; overlapping guest targets remain user-controlled and can intentionally expose different content. No guest-shadowing guard is applied. Relative paths belong to the config file that supplies them, while CLI-relative paths belong to invocation cwd.
 
 These commands should work without a positional `NAME` from the project directory:
 
@@ -116,9 +116,11 @@ SSH requires explicit VM metadata (`comm_channel="ssh"`, `ssh_capable=true`, and
 
 | Scope | Operations |
 | --- | --- |
-| Creation or requested reprovisioning | Prepare the runtime account, install requested tools, and apply initial-state/Git configuration safeguards. |
+| Creation or requested reprovisioning | Prepare the runtime account, apply optional initial-state copying, authorize the existing public key for user SSH, install requested tools, and apply Git configuration safeguards. |
 | A normal sbx-managed start or requested reprovisioning | Check/create the runtime account and home before workspace targets/mounts; restore hostname/clock and optional runtime-user KVM/Docker helpers. |
 | Each run/shell invocation | Forward selected environment variables, establish requested authentication tunnels, validate the command when applicable, and manage attachment/session cleanup. |
+
+Normal attachment authenticates directly as the recorded runtime user. Existing VMs without user authorization need `sbx run --reprovision --no-attach`; an ordinary restart does not install user keys. Key installation follows `ssh-copy-id`: append absent identities on a fresh line without rewriting existing entries. Key comments are not parsed as shell syntax, and existing restrictions are preserved. Public-key login policy belongs to the image/sshd, not an SBX key-options interpreter. SSH errors never retry as root. Interactive attachment uses the guest-selected login shell after an initial project `cd`; later user startup directory changes are respected. Agent attachment uses a non-interactive remote `cd ... && exec ...`. SBX leaves profile loading to the packaged shell.
 
 Reprovisioning is requested by `--reprovision` or CLI `--runtime-install`. A configured `runtime_install` list alone does not reprovision an existing VM. Starting and reprovisioning together performs boot setup once.
 
@@ -169,10 +171,11 @@ Completion should not need VM-name lookup. The project context should make VM na
 
 Behavior:
 
-- If `./.sbx.toml` does not exist and a new VM is created, write `.sbx.toml` by default.
+- If no project/explicit config was selected and a new VM is created, write local `.sbx.toml` by default. Never automatically create a child config that shadows a selected ancestor.
 - If `./.sbx.toml` does not exist and an existing VM is reused, write only when `--write-config` is passed.
 - If `./.sbx.toml` exists, never modify it by default.
 - If `./.sbx.toml` exists and `--write-config` is passed, add missing durable keys only.
+- Explicit `--write-config` creation establishes the local config's project identity before creating/claiming a VM. Choose a new VM name when creating a local project below an ancestor; selecting the ancestor-owned VM fails before file or VM changes, including recreate deletion. Generated local defaults retain inherited choices and CLI overrides without rebasing source-relative paths.
 - Never overwrite existing values.
 
 Example:

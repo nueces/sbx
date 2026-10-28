@@ -19,6 +19,7 @@ PHASES = {
     "account",
     "mounts",
     "credentials",
+    "ssh",
     "hostname",
     "clock",
     "git",

@@ -16,7 +16,7 @@ _ORIGINAL_HOST_GIT_CONFIG = guest_setup.host_git_config
 def isolated_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_guest_lifecycle) -> None:
     monkeypatch.setattr(cli.runtime, "DEBUG", False)
     monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATHS", (tmp_path / "home-config.toml",))
-    monkeypatch.setattr(cli, "LOCAL_CONFIG_PATHS", (tmp_path / ".sbx.toml",))
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(vm_metadata, "SBX_VMS_DIR", tmp_path / "state" / "vms")
     monkeypatch.setattr(guest_setup, "host_git_config", lambda project_root=None: None)
     monkeypatch.setattr(guest_setup, "set_hostname", lambda *args, **kwargs: None)
@@ -373,7 +373,7 @@ def test_shell_uses_configured_default_name(
     rc = cli.main(["--config", str(config), "shell", "--keep-running"])
 
     assert rc == 0
-    assert captured["attach"] == ("vm1", "bash", "hostuser")
+    assert captured["attach"] == ("vm1", None, "hostuser")
     assert capfd.readouterr().out == ""
 
 
@@ -400,7 +400,7 @@ def test_shell_uses_configured_run_user(
 
     assert rc == 0
     assert "prepare" not in captured
-    assert captured["attach"] == ("vm1", "agent", "bash", None)
+    assert captured["attach"] == ("vm1", "agent", None, None)
 
 
 def test_shell_uses_configured_project_path_as_cwd(
@@ -428,7 +428,7 @@ def test_shell_uses_configured_project_path_as_cwd(
     rc = cli.main(["--config", str(config), "shell", "--keep-running"])
 
     assert rc == 0
-    assert captured["attach"] == ("vm1", "agent", "bash", str(project))
+    assert captured["attach"] == ("vm1", "agent", None, str(project))
 
 
 def test_shell_root_ignores_configured_project_path_as_cwd(
@@ -454,7 +454,7 @@ def test_shell_root_ignores_configured_project_path_as_cwd(
     rc = cli.main(["--config", str(config), "shell", "--root", "--keep-running"])
 
     assert rc == 0
-    assert captured["attach"] == ("vm1", "bash", None)
+    assert captured["attach"] == ("vm1", None, None)
 
 
 def test_shell_root_ignores_configured_run_user(
@@ -477,7 +477,7 @@ def test_shell_root_ignores_configured_run_user(
     rc = cli.main(["--config", str(config), "shell", "--root", "--keep-running"])
 
     assert rc == 0
-    assert captured["attach"] == ("vm1", "bash", None)
+    assert captured["attach"] == ("vm1", None, None)
     assert capfd.readouterr().out == ""
 
 
@@ -559,7 +559,7 @@ mount = [".:/workspace"]
 """.strip(),
         encoding="utf-8",
     )
-    monkeypatch.setattr(cli, "LOCAL_CONFIG_PATHS", (local_config,))
+    monkeypatch.chdir(local_config.parent)
     monkeypatch.setattr(cli, "_post_start_actions", lambda **kwargs: 0)
     captured: dict[str, object] = {}
     capture_preset(monkeypatch, captured, vm_id="demo")
@@ -570,7 +570,7 @@ mount = [".:/workspace"]
     preset_name, preset_kwargs = captured["preset"]
     assert preset_name == "codex"
     assert preset_kwargs["vm_name"] == "demo"
-    assert preset_kwargs["mounts"] == [".:/workspace"]
+    assert preset_kwargs["mounts"] == [f"{tmp_path}:/workspace"]
     assert capfd.readouterr().out == ""  # Mocked setup must not announce success early.
 
 
@@ -624,13 +624,13 @@ port_forwards = ["8080:80"]
     assert preset_kwargs["mounts"] == [
         f"{project}:{project}",
         f"{extra_mount}:{extra_mount}",
-        ".:/workspace",
+        f"{tmp_path}:/workspace",
     ]
     assert preset_kwargs["writable_mounts"] is True
     assert preset_kwargs["port_forwards"] == [
         {"host_address": "127.0.0.1", "host_port": 8080, "guest_port": 80}
     ]
-    assert "Created sandbox 'configured'." in capfd.readouterr().out
+    assert "Started 'configured'." in capfd.readouterr().out
 
 
 @pytest.mark.parametrize(
@@ -700,7 +700,7 @@ mount = [".:/workspace"]
     assert rc == 0
     assert captured["image_dir"] == image_dir
     assert captured["agent"] == "pi"
-    assert captured["mounts"] == [".:/workspace"]
+    assert captured["mounts"] == [f"{tmp_path}:/workspace"]
     assert captured["attach"] is True
     assert captured["run_user"] == expected_run_user
     assert captured["args"].run_user == expected_run_user
@@ -738,7 +738,7 @@ def test_run_user_from_config_starts_then_attaches_as_user(
     assert captured["prepare"] == ("vm1", "agent")
     assert captured["attach"] == ("vm1", "agent", "/usr/bin/pi", None)
     out = capfd.readouterr().out
-    assert "Created sandbox 'vm1'." in out
+    assert "Started 'vm1'." in out
     assert "sandbox stop vm1" in out
 
 
@@ -1773,7 +1773,7 @@ project_path = "{config_project}"
     _, preset_kwargs = captured["preset"]
     assert preset_kwargs["mounts"] == [f"{cli_project}:{cli_project}"]
     assert preset_kwargs["writable_mounts"] is True
-    assert "Created sandbox 'pi-sbx'." in capfd.readouterr().out
+    assert "Started 'pi-sbx'." in capfd.readouterr().out
 
 
 def test_cli_flags_override_config(

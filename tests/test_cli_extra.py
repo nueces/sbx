@@ -19,7 +19,7 @@ _ORIGINAL_ATTACH = guest_setup.attach
 def isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_guest_lifecycle) -> None:
     monkeypatch.setattr(cli.runtime, "DEBUG", False)
     monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATHS", (tmp_path / "home-config.toml",))
-    monkeypatch.setattr(cli, "LOCAL_CONFIG_PATHS", (tmp_path / ".sbx.toml",))
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(vm_metadata, "SBX_VMS_DIR", tmp_path / "state" / "vms")
     monkeypatch.setattr(session_state, "SBX_STATE_DIR", tmp_path / "state")
     monkeypatch.setattr(session_state, "SESSIONS_FILE", tmp_path / "state" / "sessions.json")
@@ -134,11 +134,10 @@ def test_vm_metadata_load_save_and_project_identity(
     project.mkdir()
     config = project / ".sbx.toml"
     config.write_text('[sbx]\nproject_path = "."\n', encoding="utf-8")
-    monkeypatch.setattr(cli, "LOCAL_CONFIG_PATHS", (config,))
     monkeypatch.chdir(project)
 
     args = SimpleNamespace(config=None)
-    identity = cli._project_identity(args, {"sbx": {"project_path": "."}})
+    identity = cli._project_identity(args, cli.load_config())
     vm_metadata.claim_vm("vm1", identity, "agent", created=True)
 
     assert vm_metadata.load_vm_metadata() == {
@@ -853,7 +852,7 @@ def test_ensure_kvm_access_runs_optional_helper_each_time(fake_guest_lifecycle) 
 
 def test_attach_commands(monkeypatch: pytest.MonkeyPatch) -> None:
     commands: list[list[str]] = []
-    monkeypatch.setattr(guest_setup, "ssh_command", lambda vm_id: ["ssh", "root@host"])
+    monkeypatch.setattr(guest_setup, "ssh_command", lambda vm_id, *, user: ["ssh", f"{user}@host"])
 
     def run(argv: list[str]) -> int:
         commands.append(list(argv))
@@ -865,10 +864,11 @@ def test_attach_commands(monkeypatch: pytest.MonkeyPatch) -> None:
     assert guest_setup.attach("vm1", "pi", user="agent", cwd="/workspace", run=run) == 0
 
     assert "-t" in commands[0]
-    assert "cd /workspace" in commands[0][-1]
+    assert "cd -- /workspace &&" in commands[0][-1]
     assert "exec pi" in commands[0][-1]
     assert "$HOME/.nodejs/bin" not in commands[0][-1]
-    assert "sudo -iu agent" in commands[1][-1]
+    assert "agent@host" in commands[1]
+    assert "sudo" not in commands[1][-1]
 
 
 def test_sync_guest_clock_sets_host_time_and_timezone(monkeypatch, fake_guest_lifecycle) -> None:
@@ -2408,7 +2408,7 @@ def test_shell_working_directory_does_not_block_root_recovery(
                 kwargs
                 | {
                     "run": lambda argv: commands.append(argv) or 0,
-                    "ssh": lambda name: ["ssh", "synthetic-host"],
+                    "ssh": lambda name, **kwargs: ["ssh", "synthetic-host"],
                 }
             ),
         )
@@ -2692,3 +2692,30 @@ def test_boot_root_diagnostics_do_not_hide_programming_errors(
     with pytest.raises(RuntimeError, match="unexpected bug"):
         boot_flow.run("shell", "--root")
     assert "attach" not in boot_flow.names()
+
+
+def test_user_authorization_requires_explicit_provisioning(boot_flow, fake_guest_lifecycle):
+    boot_flow.status = "running"
+    assert boot_flow.run("run") == 0
+    assert not any(name == "ssh" for name, _, _ in fake_guest_lifecycle.phases)
+    assert boot_flow.run("run", "--reprovision", "--no-attach") == 0
+    phases = [name for name, _, _ in fake_guest_lifecycle.phases]
+    assert phases.index("ssh") < phases.index("check")
+    authorization = next(args for name, args, _ in fake_guest_lifecycle.phases if name == "ssh")
+    assert authorization == {"public_key": fake_guest_lifecycle.vm.info.config.ssh_public_key}
+
+
+def test_authorization_failure_prevents_agent_and_provision_mark(
+    boot_flow, fake_guest_lifecycle, monkeypatch, capsys
+):
+    original = fake_guest_lifecycle.phase
+
+    def fail(name, arguments=None, **kwargs):
+        if name == "ssh":
+            raise cli.ConfigError("authorization requires explicit repair")
+        return original(name, arguments, **kwargs)
+
+    monkeypatch.setattr(fake_guest_lifecycle, "phase", fail)
+    assert boot_flow.run("run", "--reprovision") == 1
+    assert not {"command", "attach", "mark"}.intersection(boot_flow.names())
+    assert "authorization requires explicit repair" in capsys.readouterr().err

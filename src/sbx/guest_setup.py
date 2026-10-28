@@ -11,7 +11,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import smolvm.facade
-from smolvm.env import ENV_FILE
 from smolvm.vm import SmolVMManager
 
 from sbx import bootstrap, runtime, session_state, vm_metadata
@@ -351,25 +350,24 @@ def command_path(
     user: str,
     command: str,
     *,
+    cwd: str | None = None,
     run_capture: Callable[[list[str]], subprocess.CompletedProcess[str] | None] | None = None,
-    ssh: Callable[[str], list[str]] | None = None,
+    ssh: Callable[..., list[str]] | None = None,
 ) -> str | None:
     run_capture = run_capture or runtime.run_capture
     ssh = ssh or ssh_command
-    quoted_user = shlex.quote(user)
-    check = (
-        'export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"; '
-        + f"command -v {shlex.quote(command)}"
+    validate_run_user(user)
+    cd_prefix = f"cd -- {shlex.quote(cwd)} && " if cwd is not None else ""
+    completed = run_capture(
+        [*ssh(vm_id, user=user), f"{cd_prefix}command -v {shlex.quote(command)}"]
     )
-    script = f"""
-set -eu
-home="$(getent passwd {quoted_user} | cut -d: -f6)"
-[ -n "$home" ] || {{ echo "user {quoted_user} has no home" >&2; exit 1; }}
-sudo -iu {quoted_user} env HOME="$home" sh -lc {shlex.quote(check)}
-"""
-    completed = run_capture([*ssh(vm_id), "bash -lc " + shlex.quote(script)])
     if completed is None:
         raise ConfigError(f"failed to resolve {command!r}: ssh command not found")
+    if completed.returncode == 255:
+        raise ConfigError(
+            f"user SSH failed for {vm_id!r}; check guest SSH policy or run "
+            f"`sbx run {vm_id} --reprovision --no-attach` to authorize its existing key"
+        )
     if completed.returncode == 0:
         lines = completed.stdout.strip().splitlines()
         return lines[-1] if lines else None
@@ -395,24 +393,26 @@ def install_runtime_tools(
 
 def attach(
     vm_id: str,
-    launch_command: str,
+    launch_command: str | None,
     user: str | None = None,
     cwd: str | None = None,
     *,
     run: Callable[[list[str]], int] | None = None,
-    ssh: Callable[[str], list[str]] | None = None,
+    ssh: Callable[..., list[str]] | None = None,
 ) -> int:
     run = run or runtime.run
     ssh = ssh or ssh_command
-    cmd = ssh(vm_id)
-    cd_prefix = f"cd {shlex.quote(cwd)} || exit; " if cwd is not None else ""
-    remote = (
-        f"{cd_prefix}[ -r {ENV_FILE} ] && . {ENV_FILE}; "
-        'export PATH="$HOME/.local/bin:$PATH"; '
-        f"exec {shlex.quote(launch_command)}"
-    )
-    if user is not None:
-        remote = f"sudo -iu {shlex.quote(user)} bash -lc " + shlex.quote(remote)
+    cmd = ssh(vm_id, user=validate_run_user(user or "root"))
+    cd_prefix = f"cd -- {shlex.quote(cwd)} && " if cwd is not None else ""
+    # sshd supplies SHELL from the guest account; login startup stays the shell's job.
+    command = shlex.quote(launch_command) if launch_command is not None else '"$SHELL" -il'
     cmd.insert(-1, "-t")
-    cmd.append(remote)
-    return run(cmd)
+    cmd.append(f"{cd_prefix}exec {command}")
+    rc = run(cmd)
+    if rc == 255:
+        print(
+            f"sbx: user SSH failed for {vm_id!r}; check the guest SSH policy and "
+            f"authorize its existing key with `sbx run {vm_id} --reprovision --no-attach`",
+            file=sys.stderr,
+        )
+    return rc

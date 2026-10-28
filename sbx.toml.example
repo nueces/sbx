@@ -10,7 +10,8 @@ cpus = 2
 # Defaults to the current host username when omitted.
 # run_user = "developer"
 
-# Mount this repo into the guest for testing.
+# Relative to this config file; nested invocations preserve their subdirectory.
+# The guest account's own shell is used, independently of the host shell.
 project_path = "."
 writable_mounts = true
 

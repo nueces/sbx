@@ -1,6 +1,6 @@
 # Project organization for sbx and Pi
 
-This workflow uses a host-side working directory as the orchestration root. `sbx` is started from that working directory, then Pi or optional project tooling can create feature worktrees under it.
+This workflow uses a host-side working directory as the orchestration root. Configure SBX there, then invoke it from that directory or any nested worktree. Nearest-ancestor `.sbx.toml` discovery keeps those invocations associated with the same project.
 
 ## Directory model
 
@@ -78,4 +78,4 @@ cd working-dir
 sbx run
 ```
 
-Pi starts in `working-dir`, discovers `working-dir/.pi`, and the optionally installed Specify CLI can create feature worktrees below that directory.
+Pi starts in `working-dir`, discovers `working-dir/.pi`, and the optionally installed Specify CLI can create feature worktrees below that directory. From `working-dir/feature/example`, `sbx run` or `sbx shell` reuses the root config/mount and starts in that corresponding guest subdirectory. `project_path = "."` is relative to the config file, not the invoking subdirectory. User shell startup may change directory afterward.
