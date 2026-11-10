@@ -25,7 +25,7 @@ sbx run my-vm
 
 export OPENAI_API_KEY=new
 sbx shell my-vm   # updated guest environment is available to native shell startup
-sbx run my-vm     # loading follows the guest shell's remote-command semantics
+sbx run my-vm     # the agent inherits exports from native login startup
 ```
 
 If a configured name is missing from the host environment, `sbx` unsets it in the guest so stale values do not linger.
@@ -33,7 +33,9 @@ If a configured name is missing from the host environment, `sbx` unsets it in th
 ## Limits
 
 - `sbx shell` reads only `[sbx].env`; it does not have a `--env` flag.
-- SSH remote agent commands are non-interactive and not necessarily login shells. Availability in a process follows native shell/image setup; SBX does not promise every invocation loads login profiles.
+- Agent launch uses the guest-selected non-interactive login shell. Managed exports load through native system-profile integration; custom images must provide that integration. Bash is the supported guest shell; Zsh checks were exploratory and do not establish support. SBX does not source files manually.
+- Bash selects the first readable `.bash_profile`, `.bash_login`, or `.profile` after `/etc/profile`. Only exported values from executed startup branches are inherited. Interactive-only branches are not guaranteed to run; user profiles may override managed exports.
+- Login startup runs on agent launch, not as a separate availability check. `--no-attach` does not validate the agent. Profiles can add output/startup time and must allow the launch payload to execute; an early `exit 0` or `exec` can bypass it. Arbitrary profile output is not redacted, so do not print secrets.
 - Updates apply to newly attached processes only. Already-running `pi`, `claude`, `codex`, shells, or child processes keep the environment they started with.
 - Values are stored in SmolVM's guest-managed environment. This is convenience forwarding, not a secret broker.
 - `copy_host_credentials = false` still prevents broad credential/config copying; `env` is the explicit allowlist for selected host variables.
