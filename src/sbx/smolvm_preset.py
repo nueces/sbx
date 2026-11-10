@@ -3,6 +3,7 @@
 import os
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
+from dataclasses import replace
 
 from smolvm import SmolVM
 from smolvm.facade import _build_auto_config
@@ -43,7 +44,7 @@ def create_preset(
     host_env: Mapping[str, str],
     before_provision: Callable[[str], None] | None = None,
     run_user: str = "root",
-    forward_env: Sequence[str] = (),
+    env_values: Mapping[str, str | None] | None = None,
     operation: vm_metadata.Lifecycle | None = None,
 ) -> SmolVM:
     """Create and provision a running preset VM; the caller must close the facade."""
@@ -83,13 +84,16 @@ def create_preset(
             guest_setup.start_vm(str(vm.vm_id), boot_timeout=boot_timeout, status="created")
             vm.refresh()
             with guest_setup.bootstrap_session(
-                str(vm.vm_id), run_user, env_names=forward_env, timeout=boot_timeout
+                str(vm.vm_id), run_user, env_values=env_values, timeout=boot_timeout
             ) as guest:
                 guest_setup.prepare_boot(
-                    str(vm.vm_id), run_user, list(forward_env), guest=guest, mounts=False
+                    str(vm.vm_id), run_user, env_values or {}, guest=guest, mounts=False
                 )
                 # Copy initial root configuration before shares can cover its destinations.
-                apply_preset(guest, preset, install_timeout=install_timeout)
+                # Boot sync owns env selection; upstream must not re-inject host values.
+                apply_preset(
+                    guest, replace(preset, host_env_vars=()), install_timeout=install_timeout
+                )
                 guest_setup.mount_workspaces(str(vm.vm_id), run_user, guest=guest)
         except BaseException:
             with suppress(Exception):

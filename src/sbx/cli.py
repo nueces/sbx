@@ -19,6 +19,7 @@ import sbx.image.ls
 import sbx.network as network
 from sbx import (
     __version__,
+    bootstrap,
     doctor,
     guest_setup,
     lifecycle_warnings,
@@ -110,6 +111,10 @@ def load_config(explicit_path: str | None = None) -> ProjectConfig:
         runtime.debug(f"loading config: {path}")
         layer = _read_toml(path)
         sbx = _section(layer, "sbx")
+        try:
+            guest_setup.validate_env_entries(_list_value(sbx.get("env"), key="[sbx].env"))
+        except ConfigError as exc:
+            raise ConfigError(f"{path}: {exc}") from None
         # Normalize each layer before merging so inherited paths keep their own base.
         for key in ("project_path", "image"):
             if sbx.get(key) is not None:
@@ -124,7 +129,6 @@ def load_config(explicit_path: str | None = None) -> ProjectConfig:
                     mounts.append(_config_path(mount, path.parent))
             sbx["mount"] = mounts
         config.update(_deep_merge(config, layer))
-    runtime.debug(f"merged config: {config}")
     return config
 
 
@@ -165,6 +169,17 @@ def _list_value(value: Any, *, key: str) -> list[str]:
     if isinstance(value, list) and all(isinstance(item, str) for item in value):
         return value
     raise ConfigError(f"{key} must be a string or an array of strings")
+
+
+def _resolve_env_selection(
+    sbx_cfg: Mapping[str, Any], cli_names: list[str] | None = None
+) -> dict[str, str | None]:
+    entries = (
+        list(dict.fromkeys(guest_setup.validate_env_names(cli_names)))
+        if cli_names is not None
+        else _list_value(sbx_cfg.get("env"), key="[sbx].env")
+    )
+    return guest_setup.resolve_env_entries(entries)
 
 
 def _runtime_install(args: argparse.Namespace, config: Mapping[str, Any]) -> list[str]:
@@ -351,11 +366,14 @@ def _mounted_guest_cwd(vm_name: str, requested: str | None) -> str | None:
     return None
 
 
-def _sync_forwarded_env_or_error(vm_id: str, names: list[str], *, guest=None) -> bool:
+def _sync_forwarded_env_or_error(
+    vm_id: str, env_values: Mapping[str, str | None], *, guest=None
+) -> bool:
     try:
-        guest_setup.sync_forwarded_env(vm_id, names, guest=guest)
+        guest_setup.sync_forwarded_env(vm_id, env_values, guest=guest)
     except Exception as exc:  # noqa: BLE001 - keep CLI errors user-friendly.
-        print(f"sbx: failed to sync environment for VM {vm_id!r}: {exc}", file=sys.stderr)
+        details = bootstrap.redact(str(exc), env_values.values())
+        print(f"sbx: failed to sync environment for VM {vm_id!r}: {details}", file=sys.stderr)
         return False
     return True
 
@@ -530,7 +548,7 @@ def _warn_initial_state_copy(vm_name: str) -> None:
     )
 
 
-def _print_provisioning_failure(vm_name: str, error: Exception, *, was_provisioned: bool) -> None:
+def _print_provisioning_failure(vm_name: str, error: str, *, was_provisioned: bool) -> None:
     print(f"sbx: provisioning VM {vm_name!r} failed: {error}", file=sys.stderr)
     print(f"sbx: VM {vm_name!r} is still running.", file=sys.stderr)
     if was_provisioned:
@@ -554,7 +572,7 @@ def _post_start_actions(
     cwd: str | None = None,
     git_config_text: str | None = None,
     session_kind: str = "run",
-    forward_env: list[str] | None = None,
+    env_values: Mapping[str, str | None] | None = None,
     provision: bool = False,
     was_provisioned: bool = False,
     runtime_install: list[str] | None = None,
@@ -568,6 +586,7 @@ def _post_start_actions(
     created_config: bool | None = None,
     boot_timeout: float = DEFAULT_BOOT_TIMEOUT,
 ) -> int:
+    env_values = env_values or {}
     metadata = vm_metadata.load_vm(vm_name)
     runtime_user = metadata.get("run_user") if metadata else None
     if not isinstance(runtime_user, str):
@@ -591,17 +610,15 @@ def _post_start_actions(
                 if needs_boot_setup and not diagnostic_root:
                     guest = scope.enter_context(
                         guest_setup.bootstrap_session(
-                            vm_name, runtime_user, env_names=forward_env or [], timeout=boot_timeout
+                            vm_name, runtime_user, env_values=env_values, timeout=boot_timeout
                         )
                     )
                     if not boot_prepared:
-                        guest_setup.prepare_boot(
-                            vm_name, runtime_user, forward_env or [], guest=guest
-                        )
-                    elif not _sync_forwarded_env_or_error(vm_name, forward_env or [], guest=guest):
+                        guest_setup.prepare_boot(vm_name, runtime_user, env_values, guest=guest)
+                    elif not _sync_forwarded_env_or_error(vm_name, env_values, guest=guest):
                         return 1
                 elif not diagnostic_root and not _sync_forwarded_env_or_error(
-                    vm_name, forward_env or []
+                    vm_name, env_values
                 ):
                     return 1
                 if auth_port:
@@ -652,11 +669,13 @@ def _post_start_actions(
                         session_state.register_session(vm_name, session_kind)
                         registered = True
         except Exception as exc:  # noqa: BLE001 - preserve provisioning diagnostics.
+            details = bootstrap.redact(str(exc), env_values.values())
             if provision:
-                _print_provisioning_failure(vm_name, exc, was_provisioned=was_provisioned)
-            elif isinstance(exc, ConfigError):
+                _print_provisioning_failure(vm_name, details, was_provisioned=was_provisioned)
+            elif isinstance(exc, ConfigError) or env_values:
                 print(
-                    f"sbx: runtime startup check failed for VM {vm_name!r}: {exc}", file=sys.stderr
+                    f"sbx: runtime startup check failed for VM {vm_name!r}: {details}",
+                    file=sys.stderr,
                 )
                 print(f"sbx: VM {vm_name!r} is still running.", file=sys.stderr)
                 print(f"sbx: Inspect: sbx shell {vm_name} --root", file=sys.stderr)
@@ -753,8 +772,7 @@ def _toml_value(value: Any) -> str:
         return str(value)
     if isinstance(value, list):
         return "[" + ", ".join(_toml_value(item) for item in value) + "]"
-    text = str(value).replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{text}"'
+    return json.dumps(str(value), ensure_ascii=False).replace("\x7f", "\\u007f")
 
 
 def _project_config_values(
@@ -933,7 +951,7 @@ def _start_local_image(
     runtime_install: list[str] | None = None,
     install_timeout: int = 600,
     copy_initial_state: bool = False,
-    forward_env: list[str] | None = None,
+    env_values: Mapping[str, str | None] | None = None,
     port_forwards: Sequence[str] = (),
     operation: vm_metadata.Lifecycle | None = None,
 ) -> int:
@@ -1027,7 +1045,7 @@ def _start_local_image(
             stop_on_exit=stop_on_exit,
             cwd=cwd,
             git_config_text=git_config_text,
-            forward_env=forward_env,
+            env_values=env_values,
             provision=True,
             runtime_install=runtime_install,
             install_timeout=install_timeout,
@@ -1134,14 +1152,12 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
     copy_host_credentials = bool(
         _arg_or_config(args, "copy_host_credentials", config, "sbx", default=False)
     )
-    forward_env = guest_setup.validate_env_names(
-        args.env if args.env is not None else _list_value(sbx_cfg.get("env"), key="[sbx].env")
-    )
+    env_values = _resolve_env_selection(sbx_cfg, args.env)
     runtime.debug(
         "run options: "
         f"agent={agent!r}, name={getattr(args, 'name', None)!r}, attach={attach!r}, "
         f"run_user={run_user!r}, copy_host_credentials={copy_host_credentials!r}, "
-        f"forward_env={forward_env!r}"
+        f"env_names={list(env_values)!r}"
     )
 
     auth_port = attach and bool(_arg_or_config(args, "auth_port", config, "sbx", default=True))
@@ -1169,7 +1185,7 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
             saved_identity.get(key) != project_identity[key]
             for key in ("project_root", "config_path")
         )
-        if existing_status != "running" or reprovision or forward_env or claim_changes:
+        if existing_status != "running" or reprovision or env_values or claim_changes:
             operation.lock(str(requested_name))
             existing_status = _get_existing_vm_status(str(requested_name))
         runtime.debug(f"existing VM lookup: name={requested_name!r}, status={existing_status!r}")
@@ -1231,7 +1247,7 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
                 stop_on_exit=stop_on_exit,
                 cwd=project_guest_cwd,
                 git_config_text=git_config_text,
-                forward_env=forward_env,
+                env_values=env_values,
                 provision=reprovision,
                 was_provisioned=was_provisioned,
                 runtime_install=runtime_install,
@@ -1276,12 +1292,12 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
                 runtime_install=runtime_install,
                 install_timeout=install_timeout,
                 copy_initial_state=copy_host_credentials,
-                forward_env=forward_env,
+                env_values=env_values,
                 port_forwards=port_forwards,
                 operation=operation,
             )
         except ConfigError as exc:
-            print(f"sbx: {exc}", file=sys.stderr)
+            print(f"sbx: {bootstrap.redact(str(exc), env_values.values())}", file=sys.stderr)
             return 2
         except Exception as exc:  # noqa: BLE001 - keep CLI errors user-friendly.
             if isinstance(
@@ -1290,7 +1306,8 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
                 str(requested_name) if requested_name else None, boot_timeout
             ):
                 return 1
-            print(f"sbx: failed to start image: {exc}", file=sys.stderr)
+            details = bootstrap.redact(str(exc), env_values.values())
+            print(f"sbx: failed to start image: {details}", file=sys.stderr)
             return 1
 
     if run_user is None:
@@ -1298,13 +1315,13 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
     args.run_user = run_user
 
     temp_home_ctx = None
-    host_env = guest_setup.sanitize_forwarded_env(dict(os.environ), forward_env)
+    host_env = guest_setup.sanitize_forwarded_env(dict(os.environ), list(env_values))
     if copy_host_credentials:
         _warn_initial_state_copy(str(requested_name or "new VM"))
     else:
         temp_home_ctx = tempfile.TemporaryDirectory(prefix="sbx-no-credentials-")
         host_env = guest_setup.credential_free_env(
-            Path(temp_home_ctx.name), forward_env=forward_env
+            Path(temp_home_ctx.name), forward_env=list(env_values)
         )
         runtime.debug(f"credential-free HOME: {temp_home_ctx.name}")
 
@@ -1327,7 +1344,7 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
                 new_vm_name, project_identity, str(run_user or "root"), created=True
             ),
             run_user=str(run_user),
-            forward_env=forward_env,
+            env_values=env_values,
             operation=operation,
         )
         vm_name = str(vm.vm_id)
@@ -1338,7 +1355,8 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
             str(requested_name) if requested_name else None, boot_timeout
         ):
             return 1
-        print(f"sbx: failed to create preset {str(agent)!r}: {exc}", file=sys.stderr)
+        details = bootstrap.redact(str(exc), env_values.values())
+        print(f"sbx: failed to create preset {str(agent)!r}: {details}", file=sys.stderr)
         return 1
     finally:
         if vm is not None:
@@ -1364,7 +1382,7 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
         stop_on_exit=stop_on_exit,
         cwd=project_guest_cwd,
         git_config_text=git_config_text,
-        forward_env=forward_env,
+        env_values=env_values,
         provision=True,
         runtime_install=runtime_install,
         install_timeout=install_timeout,
@@ -1402,9 +1420,7 @@ def _cmd_shell(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
     if name is None:
         return 2
     try:
-        forward_env = guest_setup.validate_env_names(
-            _list_value(_sbx_config(config).get("env"), key="[sbx].env")
-        )
+        env_values = _resolve_env_selection(_sbx_config(config))
     except ConfigError as exc:
         print(f"sbx: {exc}", file=sys.stderr)
         return 2
@@ -1439,7 +1455,7 @@ def _cmd_shell(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
     claim_changes = saved_identity is not None and any(
         saved_identity.get(key) != project_identity[key] for key in ("project_root", "config_path")
     )
-    if existing_status != "running" or (forward_env and not args.root) or claim_changes:
+    if existing_status != "running" or (env_values and not args.root) or claim_changes:
         operation.lock(name)
     vm_metadata.claim_vm(
         name, project_identity, str(run_user) if run_user is not None else None, created=False
@@ -1484,7 +1500,7 @@ def _cmd_shell(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
         stop_on_exit=stop_on_exit,
         cwd=None if args.root else project_guest_cwd,
         session_kind="shell",
-        forward_env=forward_env,
+        env_values=env_values,
         require_provisioned=False,
         operation=operation,
     )
@@ -1821,7 +1837,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(raw_argv)
     runtime.DEBUG = bool(args.debug)
-    runtime.debug(f"argv: {raw_argv}")
+    runtime.debug(f"action: {args.action}")
     if args.action in {"completion", "image"}:
         args.config_data = {}
     else:

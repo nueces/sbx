@@ -5,7 +5,7 @@ import re
 import shlex
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from datetime import UTC, datetime
 from pathlib import Path
@@ -71,10 +71,48 @@ def host_username() -> str:
 
 
 def validate_env_names(names: list[str]) -> list[str]:
-    invalid = [name for name in names if not ENV_NAME_RE.fullmatch(name)]
-    if invalid:
-        raise ConfigError(f"invalid env var name(s): {', '.join(invalid)}")
+    for index, name in enumerate(names, 1):
+        if not ENV_NAME_RE.fullmatch(name):
+            raise ConfigError(f"--env entry {index}: invalid env var name; expected a host name")
     return names
+
+
+def _env_entries(entries: list[str]) -> Iterator[tuple[str, str, str | None]]:
+    destinations: set[str] = set()
+    for index, entry in enumerate(entries, 1):
+        name, assignment, value = entry.partition("=")
+        prefix = f"[sbx].env entry {index}: "
+        if not ENV_NAME_RE.fullmatch(name):
+            raise ConfigError(prefix + "invalid env var destination name")
+        if name in destinations:
+            raise ConfigError(prefix + "duplicate destination; select each name only once")
+        destinations.add(name)
+        source = name if not assignment else None
+        if assignment and "${" in value:
+            source = value[2:-1] if value.startswith("${") and value.endswith("}") else ""
+            if not ENV_NAME_RE.fullmatch(source):
+                raise ConfigError(
+                    prefix + "expected an exact ${SOURCE} reference; "
+                    "partial or malformed references are unsupported"
+                )
+        if "\0" in value:
+            raise ConfigError(prefix + "NUL is not allowed in environment values")
+        yield name, value, source
+
+
+def validate_env_entries(entries: list[str]) -> None:
+    for _ in _env_entries(entries):
+        pass
+
+
+def resolve_env_entries(entries: list[str]) -> dict[str, str | None]:
+    values: dict[str, str | None] = {}
+    for index, (name, literal, source) in enumerate(_env_entries(entries), 1):
+        value = os.environ.get(source) if source is not None else literal
+        if value is not None and "\0" in value:
+            raise ConfigError(f"[sbx].env entry {index}: NUL is not allowed in environment values")
+        values[name] = value
+    return values
 
 
 def sanitize_forwarded_env(env: dict[str, str], allowed: list[str]) -> dict[str, str]:
@@ -157,12 +195,11 @@ def open_guest(vm_id: str):
         yield vm
 
 
-def sync_forwarded_env(vm_id: str, names: list[str], *, guest=None) -> None:
-    if not names:
+def sync_forwarded_env(vm_id: str, env_values: Mapping[str, str | None], *, guest=None) -> None:
+    if not env_values:
         return
-    validate_env_names(names)
-    values = {name: os.environ[name] for name in names if name in os.environ}
-    missing = [name for name in names if name not in os.environ]
+    values = {name: value for name, value in env_values.items() if value is not None}
+    missing = [name for name, value in env_values.items() if value is None]
     context = nullcontext(guest.vm) if guest is not None else open_guest(vm_id)
     with context as vm:
         if guest is None:
@@ -178,12 +215,19 @@ def sync_forwarded_env(vm_id: str, names: list[str], *, guest=None) -> None:
 
 
 @contextmanager
-def bootstrap_session(vm_id: str, user: str, *, env_names=(), timeout: float = 30):
+def bootstrap_session(
+    vm_id: str,
+    user: str,
+    *,
+    env_values: Mapping[str, str | None] | None = None,
+    timeout: float = 30,
+):
     validate_run_user(user)
     validate_vm_name(vm_id)
     with open_guest(vm_id) as vm:
         vm.wait_for_ready(timeout=timeout)
-        guest = bootstrap.GuestBootstrap(vm, user, vm_id, env_names)
+        guest = bootstrap.GuestBootstrap(vm, user, vm_id, env_values or {})
+        guest.sensitive_values.update(filter(None, (env_values or {}).values()))
         guest.phase("check")
         yield guest
 
@@ -193,14 +237,16 @@ def wait_for_control(vm_id: str, *, timeout: float) -> None:
         vm.wait_for_ready(timeout=timeout)
 
 
-def prepare_boot(vm_id: str, user: str, names: list[str], *, guest, mounts: bool = True) -> None:
+def prepare_boot(
+    vm_id: str, user: str, env_values: Mapping[str, str | None], *, guest, mounts: bool = True
+) -> None:
     prepare_run_user(vm_id, user, guest=guest)
     set_hostname(vm_id, guest=guest)
     sync_guest_clock(vm_id, guest=guest)
     configured = getattr(guest.vm.info.config, "env_vars", {})
     if configured:
         guest.vm.set_env_vars(configured)
-    sync_forwarded_env(vm_id, names, guest=guest)
+    sync_forwarded_env(vm_id, env_values, guest=guest)
     if mounts:
         mount_workspaces(vm_id, user, guest=guest)
 

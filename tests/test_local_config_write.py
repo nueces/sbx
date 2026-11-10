@@ -160,3 +160,21 @@ def test_existing_local_config_still_adds_only_missing_values(local_project):
     assert cli.load_config()["sbx"]["memory"] == 1024
     assert cli.load_config()["sbx"]["cpus"] == 2
     assert vm_metadata.load_vm("local-vm")["config_path"] == str(local)
+
+
+@pytest.mark.parametrize("action", ["run", "create", "recreate"])
+@pytest.mark.parametrize("entries", ["TOKEN=${SOURCE}", ["TOKEN=${SOURCE}", "X=a\nb\rc", "EMPTY="]])
+def test_inherited_env_entries_are_saved_without_resolving_references(
+    local_project, monkeypatch, action, entries,
+):
+    project = local_project
+    monkeypatch.setenv("SOURCE", "RESOLVED_SECRET_SENTINEL")
+    original = project.source.read_text() + "env=" + cli._toml_value(entries) + "\n"
+    project.source.write_text(original)
+    flags = ["--force"] if action == "recreate" else []
+    assert cli.main([action, "local-vm", "--write-config", "--no-attach", *flags]) == 0
+    local = project.child / ".sbx.toml"
+    assert cli.load_config()["sbx"]["env"] == entries
+    assert "RESOLVED_SECRET_SENTINEL" not in local.read_text()
+    assert project.source.read_text() == original
+    assert project.creations[0]["env_values"]["TOKEN"] == "RESOLVED_SECRET_SENTINEL"

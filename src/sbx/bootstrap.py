@@ -7,6 +7,7 @@ import shlex
 import sys
 import tempfile
 import uuid
+from collections.abc import Iterable
 from contextlib import suppress
 from importlib.resources import files
 from pathlib import PurePosixPath
@@ -76,6 +77,12 @@ except (OSError, ValueError):
 LEASE_CHECK = f"if [ -e {STAGE}/execution.lock ]; then python3 -c {shlex.quote(LEASE_PROBE)}; fi"
 
 
+def redact(text: str, values: Iterable[str | None]) -> str:
+    for value in sorted(set(filter(None, values)), key=len, reverse=True):
+        text = text.replace(value, "[redacted]")
+    return text
+
+
 class GuestBootstrap:
     def __init__(self, vm, user: str, vm_name: str, env_names=()):
         self.vm = vm
@@ -103,9 +110,7 @@ class GuestBootstrap:
         configured = getattr(self.vm.info.config, "env_vars", {})
         for name in self.env_names:
             values.update((os.environ.get(name), configured.get(name)))
-        for value in sorted(filter(None, values), key=len, reverse=True):
-            text = text.replace(value, "[redacted]")
-        return text
+        return redact(text, values)
 
     def checked(self, command: str, *, timeout: int = 30):
         result = self.vm.run(command, timeout=timeout)
