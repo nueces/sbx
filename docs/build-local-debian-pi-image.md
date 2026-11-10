@@ -320,7 +320,7 @@ or set it in `.sbx.toml`:
 boot_timeout = 90
 ```
 
-### `agent 'pi' was not found`
+### Pi fails to launch because it is not found
 
 The image intentionally contains no Pi package. Add `runtime_install = ["pi"]` and run:
 
@@ -329,6 +329,8 @@ sbx run --reprovision --no-attach
 ```
 
 Alternatively use `--runtime-install pi`, which implies reprovisioning for an existing VM. Installation requires npm registry access and writes directly to `/home/<run-user>/.local` without creating or changing `.npmrc`.
+
+Then run `sbx run` to check that Pi launches. Successful provisioning with `--no-attach` does not check agent availability.
 
 ### `specify` was not found
 
