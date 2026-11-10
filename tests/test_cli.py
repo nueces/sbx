@@ -48,7 +48,7 @@ def isolated_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_guest_
         guest_setup.prepare_boot(
             vm_id,
             str(kwargs.get("run_user", "root")),
-            list(kwargs.get("forward_env", [])),
+            kwargs.get("env_values", {}),
             guest=fake_guest_lifecycle,
         )
         return SimpleNamespace(vm_id=vm_id, close=lambda: None)
@@ -88,7 +88,7 @@ def capture_preset(
             guest_setup.prepare_boot(
                 vm_id,
                 str(kwargs.get("run_user", "root")),
-                list(kwargs.get("forward_env", [])),
+                kwargs.get("env_values", {}),
                 guest=guest,
             )
         return SimpleNamespace(
@@ -261,7 +261,7 @@ def test_run_rejects_non_qemu_backend(
     assert "other backends are not supported yet" in capsys.readouterr().err
 
 
-def test_debug_prints_commands_to_stderr(
+def test_debug_prints_action_without_raw_arguments(
     monkeypatch: pytest.MonkeyPatch,
     capfd: pytest.CaptureFixture[str],
 ) -> None:
@@ -271,7 +271,8 @@ def test_debug_prints_commands_to_stderr(
 
     captured = capfd.readouterr()
     assert rc == 0
-    assert "sbx debug: argv: ['--debug', 'ls']" in captured.err
+    assert "sbx debug: action: ls" in captured.err
+    assert "argv:" not in captured.err
 
 
 def test_list_does_not_require_name(

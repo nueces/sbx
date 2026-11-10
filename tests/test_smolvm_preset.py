@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
+from smolvm.presets import Preset
 from smolvm.types import PortForwardConfig
 
 from sbx import guest_setup, smolvm_preset, vm_metadata
@@ -34,6 +35,7 @@ def preset_sdk(monkeypatch, tmp_path):
             events.append("close")
 
     vm = VM()
+    vm.env_state = {"UNRELATED": "keep", "OPENAI_API_KEY": "stale"}
     captured.vm = vm
     captured.guest = SimpleNamespace(
         vm=vm, mounts=[], phase=lambda name, *args, **kwargs: events.append(name)
@@ -59,6 +61,8 @@ def preset_sdk(monkeypatch, tmp_path):
 
     def apply(channel, preset, **kwargs):
         assert channel is captured.guest
+        captured.applied_preset = preset
+        captured.install_env = dict(vm.env_state)
         captured.apply_env = dict(os.environ)
         captured.apply_options = kwargs
         events.append("apply")
@@ -66,11 +70,11 @@ def preset_sdk(monkeypatch, tmp_path):
             raise captured.failure
 
     monkeypatch.setattr(vm_metadata, "SBX_VMS_DIR", tmp_path / "metadata")
-    monkeypatch.setattr(
-        smolvm_preset,
-        "get_preset",
-        lambda name: SimpleNamespace(name=name, default_mem_mib=2048, default_disk_mib=8192),
+    captured.preset = Preset(
+        name="pi", summary="test preset", install_script="install",
+        host_env_vars=("OPENAI_API_KEY",),
     )
+    monkeypatch.setattr(smolvm_preset, "get_preset", lambda name: captured.preset)
     monkeypatch.setattr(smolvm_preset, "_build_auto_config", build)
     monkeypatch.setattr(smolvm_preset, "SmolVM", construct)
     monkeypatch.setattr(smolvm_preset, "apply_preset", apply)
@@ -78,9 +82,16 @@ def preset_sdk(monkeypatch, tmp_path):
     monkeypatch.setattr(
         guest_setup, "start_vm", lambda *args, **kwargs: events.append("manager-start")
     )
-    monkeypatch.setattr(
-        guest_setup, "sync_forwarded_env", lambda *args, **kwargs: events.append("env")
-    )
+    def sync(vm_id, values, **kwargs):
+        events.append("env")
+        captured.synced = dict(values)
+        for name, value in values.items():
+            if value is None:
+                vm.env_state.pop(name, None)
+            else:
+                vm.env_state[name] = value
+
+    monkeypatch.setattr(guest_setup, "sync_forwarded_env", sync)
     monkeypatch.setattr(guest_setup, "host_timezone", lambda: "UTC")
     return captured
 
@@ -100,7 +111,7 @@ def create_preset(**overrides):
         install_timeout=600,
         host_env={"HOME": "/isolated"},
         run_user="agent",
-        forward_env=[],
+        env_values={},
     )
     return smolvm_preset.create_preset(**(options | overrides))
 
@@ -196,3 +207,29 @@ def test_create_preset_restores_environment_on_config_failure(preset_sdk, monkey
         create_preset()
     assert os.environ["ORIGINAL"] == "kept"
     assert "close" not in preset_sdk.events
+
+
+@pytest.mark.parametrize("entry", [
+    "OPENAI_API_KEY=literal", "OPENAI_API_KEY=${SOURCE}",
+    "OPENAI_API_KEY=${MISSING}", "OPENAI_API_KEY=",
+])
+def test_selected_values_are_installed_before_preset_without_host_reinjection(
+    preset_sdk, monkeypatch, entry,
+):
+    monkeypatch.setenv("SOURCE", "alias-secret")
+    monkeypatch.delenv("MISSING", raising=False)
+    values = guest_setup.resolve_env_entries([
+        entry, "HOME=/guest/home", "PATH=/guest/bin", "SMOLVM_DATA_DIR=/guest/state",
+    ])
+    original_host = dict(os.environ)
+    host_env = {"HOME": "/isolated", "PATH": "/host/bin", "OPENAI_API_KEY": "wrong-host-key"}
+    create_preset(host_env=host_env, env_values=values)
+    assert preset_sdk.synced == values
+    assert preset_sdk.applied_preset.host_env_vars == ()
+    assert preset_sdk.preset.host_env_vars == ("OPENAI_API_KEY",)
+    assert preset_sdk.applied_preset.install_script == preset_sdk.preset.install_script
+    expected = {"UNRELATED": "keep", **{k: v for k, v in values.items() if v is not None}}
+    assert preset_sdk.install_env == expected
+    assert preset_sdk.build_env == preset_sdk.apply_env == host_env
+    assert dict(os.environ) == original_host
+    assert preset_sdk.session[1]["env_values"] == values

@@ -21,6 +21,9 @@ stop_on_exit = false
 # Pi is installed directly as the runtime user during initial provisioning.
 # Host agent state is not copied by default.
 copy_host_credentials = false
+# NAME copies a host value; NAME=literal sets a value; NAME=${SOURCE} renames a host value.
+# Do not commit literal secrets. Destinations must be unique; partial interpolation is unsupported.
+# env = ["OPENAI_API_KEY", "APP_MODE=development", "SERVICE_TOKEN=${HOST_TOKEN}"]
 env = []
 git_config = true
 

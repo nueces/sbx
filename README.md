@@ -242,11 +242,13 @@ copy_host_credentials = false
 # Copies safe Git identity/workflow settings, never credentials or keys.
 git_config = true
 
-# Forward only named host environment variables.
-env = ["OPENAI_API_KEY"]
+# Forward host values or set harmless literals. Do not commit literal secrets.
+env = ["OPENAI_API_KEY", "APP_MODE=development", "SERVICE_TOKEN=${HOST_TOKEN}"]
 ```
 
-See [`sbx.toml.example`](sbx.toml.example) for available settings.
+See [`sbx.toml.example`](sbx.toml.example) for available settings and
+[environment forwarding](docs/environment-forwarding.md) for value syntax,
+validation, CLI replacement, and persistence limits.
 
 ## Shell completion
 

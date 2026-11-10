@@ -37,7 +37,7 @@ def isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_guest_l
         guest_setup.prepare_boot(
             vm_id,
             str(kwargs.get("run_user", "root")),
-            list(kwargs.get("forward_env", [])),
+            kwargs.get("env_values", {}),
             guest=fake_guest_lifecycle,
         )
         return SimpleNamespace(vm_id=vm_id, close=lambda: None)
@@ -440,7 +440,7 @@ def test_start_local_image_happy_path(
         stop_on_exit=False,
         cwd="/workspace",
         git_config_text="[user]\n",
-        forward_env=["SBX_TOKEN"],
+        env_values={"SBX_TOKEN": "token"},
         port_forwards=["8080:3000"],
     )
 
@@ -1237,7 +1237,7 @@ def forwarded_env_vm(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleN
 def test_sync_forwarded_env_sets_present_and_unsets_missing(
     forwarded_env_vm: SimpleNamespace, names: list[str]
 ) -> None:
-    guest_setup.sync_forwarded_env("vm1", names)
+    guest_setup.sync_forwarded_env("vm1", guest_setup.resolve_env_entries(names))
 
     expected: list[tuple[str, object]] = [
         ("from_id", {}),
@@ -1257,7 +1257,9 @@ def test_sync_forwarded_env_closes_on_failure(
 ) -> None:
     forwarded_env_vm.failure = failure
     with pytest.raises((OSError, RuntimeError), match="failed"):
-        guest_setup.sync_forwarded_env("vm1", ["SBX_PRESENT", "SBX_MISSING"])
+        guest_setup.sync_forwarded_env(
+            "vm1", guest_setup.resolve_env_entries(["SBX_PRESENT", "SBX_MISSING"])
+        )
 
     assert forwarded_env_vm.calls[-1] == ("close", None)
     closed_keys = [value for action, value in forwarded_env_vm.calls if action == "close"]
@@ -1270,7 +1272,7 @@ def test_sync_forwarded_env_does_not_generate_missing_known_key(
 ) -> None:
     getattr(forwarded_env_vm, missing).unlink()
     with pytest.raises(cli.ConfigError, match="SSH key"):
-        guest_setup.sync_forwarded_env("vm1", ["SBX_PRESENT"])
+        guest_setup.sync_forwarded_env("vm1", guest_setup.resolve_env_entries(["SBX_PRESENT"]))
 
     assert forwarded_env_vm.calls == [("from_id", {}), ("close", None)]
     assert not getattr(forwarded_env_vm, missing).exists()
@@ -1282,7 +1284,7 @@ def test_guest_control_rejects_unproven_ssh_identity(forwarded_env_vm, injected,
     forwarded_env_vm.config.ssh_public_key = injected
     with pytest.raises(cli.ConfigError, match="SSH"):
         if operation == "control":
-            guest_setup.sync_forwarded_env("vm1", ["SBX_PRESENT"])
+            guest_setup.sync_forwarded_env("vm1", guest_setup.resolve_env_entries(["SBX_PRESENT"]))
         else:
             guest_setup.ssh_command("vm1")
     assert forwarded_env_vm.calls == [("from_id", {}), ("close", None)]
@@ -1292,7 +1294,7 @@ def test_guest_control_rejects_unproven_ssh_identity(forwarded_env_vm, injected,
 def test_guest_control_rejects_invalid_public_key_file(forwarded_env_vm, content):
     forwarded_env_vm.public.write_bytes(content)
     with pytest.raises(cli.ConfigError, match="SSH"):
-        guest_setup.sync_forwarded_env("vm1", ["SBX_PRESENT"])
+        guest_setup.sync_forwarded_env("vm1", guest_setup.resolve_env_entries(["SBX_PRESENT"]))
     assert forwarded_env_vm.calls == [("from_id", {}), ("close", None)]
 
 
@@ -1310,7 +1312,7 @@ def test_sync_forwarded_env_resolves_sudo_identity(
     monkeypatch.setenv("SUDO_USER", "developer")
     monkeypatch.setattr(guest_setup.pwd, "getpwnam", user_info)
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "root-home")
-    guest_setup.sync_forwarded_env("vm1", ["SBX_PRESENT"])
+    guest_setup.sync_forwarded_env("vm1", guest_setup.resolve_env_entries(["SBX_PRESENT"]))
 
     assert looked_up == ["developer"]
     assert ("from_id", {"ssh_key_path": str(forwarded_env_vm.private)}) in forwarded_env_vm.calls
@@ -1346,7 +1348,7 @@ def test_sync_forwarded_env_failure_prevents_cli_attach(
             run_user="root",
             auth_port=False,
             stop_on_exit=False,
-            forward_env=["SBX_PRESENT", "SBX_MISSING"],
+            env_values=guest_setup.resolve_env_entries(["SBX_PRESENT", "SBX_MISSING"]),
             validate_agent=False,
         )
         == 1
@@ -1359,7 +1361,9 @@ def test_sync_forwarded_env_failure_prevents_cli_attach(
 
 def test_sync_forwarded_env_preserves_explicit_vsock_transport(forwarded_env_vm) -> None:
     forwarded_env_vm.config.comm_channel = "vsock"
-    guest_setup.sync_forwarded_env("vm1", ["SBX_PRESENT", "SBX_MISSING"])
+    guest_setup.sync_forwarded_env(
+        "vm1", guest_setup.resolve_env_entries(["SBX_PRESENT", "SBX_MISSING"])
+    )
 
     assert forwarded_env_vm.calls == [
         ("from_id", {}),
@@ -1376,7 +1380,7 @@ def test_sync_forwarded_env_does_not_log_secrets(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     monkeypatch.setattr(runtime, "DEBUG", True)
-    guest_setup.sync_forwarded_env("vm1", ["SBX_PRESENT"])
+    guest_setup.sync_forwarded_env("vm1", guest_setup.resolve_env_entries(["SBX_PRESENT"]))
     captured = capsys.readouterr()
     for secret in ("ENV_SECRET_SENTINEL", "PRIVATE_KEY_SENTINEL"):
         assert secret not in captured.out + captured.err + caplog.text
@@ -1413,7 +1417,7 @@ def test_sync_forwarded_env_empty_allowlist_skips_smolvm(
 
     monkeypatch.setattr(smolvm.facade, "SmolVM", FakeSmolVM, raising=False)
 
-    guest_setup.sync_forwarded_env("vm1", [])
+    guest_setup.sync_forwarded_env("vm1", {})
 
 
 def test_config_and_validation_error_branches(tmp_path: Path) -> None:
@@ -2320,6 +2324,10 @@ def test_boot_creation_paths_share_setup(
 ) -> None:
     boot_flow.status = None
     vm_metadata.remove_vm("vm1")
+    boot_flow.config.write_text(
+        boot_flow.config.read_text() + 'env=["X=literal", "TOKEN=${SOURCE}", "EMPTY="]\n'
+    )
+    monkeypatch.setenv("SOURCE", "alias-secret")
     monkeypatch.setattr(guest_setup, "host_username", lambda: "agent")
     if creation == "image":
         # The SDK fixture uses a generated ID, independently of the requested name.
@@ -2358,6 +2366,11 @@ def test_boot_creation_paths_share_setup(
         "mark",
     ]
     assert vm_metadata.load_vm(expected_name)["provisioned"] is True
+    for name, arguments, _ in boot_flow.events:
+        if name == "env":
+            assert arguments == (
+                expected_name, {"X": "literal", "TOKEN": "alias-secret", "EMPTY": ""}
+            )
     assert json.loads(capsys.readouterr().out)["vm"]["name"] == expected_name
 
 
@@ -2626,10 +2639,11 @@ def test_boot_running_session_keeps_environment_tunnel_and_cleanup(
         lambda *args: boot_flow.events.append(("port", args, {})) or 0,
     )
     stopped = []
+    monkeypatch.setenv("OLLAMA_HOST", "http://localhost:11434")
     monkeypatch.setattr(runtime, "run_smolvm", lambda argv: stopped.append(argv) or 0)
     assert boot_flow.run("run", *(["--keep-running"] if keep_running else [])) == 0
     assert boot_flow.names() == ["env", "port", "command", "attach"]
-    assert boot_flow.events[0][1] == ("vm1", ["OLLAMA_HOST"])
+    assert boot_flow.events[0][1] == ("vm1", {"OLLAMA_HOST": "http://localhost:11434"})
     assert session_state.active_sessions("vm1") == []
     assert stopped == ([] if keep_running else [["sandbox", "stop", "vm1"]])
 
@@ -2676,7 +2690,7 @@ def test_read_only_running_attachment_does_not_wait_for_mutation_lock(boot_flow)
 def test_environment_sync_rejects_surviving_remote_phase(forwarded_env_vm):
     forwarded_env_vm.failure = "busy"
     with pytest.raises(cli.ConfigError, match="provisioning is active"):
-        guest_setup.sync_forwarded_env("vm1", ["SBX_PRESENT"])
+        guest_setup.sync_forwarded_env("vm1", guest_setup.resolve_env_entries(["SBX_PRESENT"]))
     assert not any(name in ("set", "unset") for name, _ in forwarded_env_vm.calls)
     assert forwarded_env_vm.calls[-1] == ("close", None)
 
@@ -2719,3 +2733,39 @@ def test_authorization_failure_prevents_agent_and_provision_mark(
     assert boot_flow.run("run", "--reprovision") == 1
     assert not {"command", "attach", "mark"}.intersection(boot_flow.names())
     assert "authorization requires explicit repair" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("status", ["running", "stopped", "paused"])
+@pytest.mark.parametrize("options", [
+    ["run"], ["run", "--no-attach"], ["run", "--reprovision", "--no-attach"],
+    ["shell"], ["shell", "--root"],
+])
+def test_resolved_env_reaches_every_existing_vm_path(boot_flow, monkeypatch, status, options):
+    boot_flow.status = status
+    boot_flow.config.write_text(
+        boot_flow.config.read_text()
+        + 'env=["X=literal", "TOKEN=${SOURCE}", "EMPTY=", "MISSING"]\n'
+    )
+    monkeypatch.setenv("SOURCE", "alias-secret")
+    monkeypatch.delenv("MISSING", raising=False)
+    assert boot_flow.run(*options) == 0
+    env_calls = [arguments for name, arguments, _ in boot_flow.events if name == "env"]
+    if "--root" in options:
+        assert env_calls == []
+    else:
+        assert env_calls == [("vm1", {
+            "X": "literal", "TOKEN": "alias-secret", "EMPTY": "", "MISSING": None,
+        })]
+
+
+@pytest.mark.parametrize("entries", [["EMPTY="], ["MISSING"]])
+def test_running_empty_or_unset_selection_still_takes_lifecycle_lock(
+    boot_flow, monkeypatch, entries,
+):
+    boot_flow.status = "running"
+    boot_flow.config.write_text(boot_flow.config.read_text() + "env=" + json.dumps(entries) + "\n")
+    monkeypatch.delenv("MISSING", raising=False)
+    locks = []
+    monkeypatch.setattr(vm_metadata.Lifecycle, "lock", lambda self, name: locks.append(name))
+    assert boot_flow.run("run", "--no-attach") == 0
+    assert locks == ["vm1"]
