@@ -926,11 +926,6 @@ def test_post_start_actions_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.setattr(
         guest_setup,
-        "command_path",
-        lambda *args, **kwargs: calls.append(("command", args)) or "/home/agent/.local/bin/pi",
-    )
-    monkeypatch.setattr(
-        guest_setup,
         "attach",
         lambda *args, **kwargs: calls.append(("user", args)) or 0,
     )
@@ -962,7 +957,6 @@ def test_post_start_actions_paths(monkeypatch: pytest.MonkeyPatch) -> None:
         "install",
         "git",
         "docker",
-        "command",
         "register",
         "user",
         "unregister",
@@ -980,7 +974,7 @@ def test_post_start_actions_paths(monkeypatch: pytest.MonkeyPatch) -> None:
             run_user="agent",
             auth_port=False,
             stop_on_exit=True,
-            validate_agent=False,
+            require_provisioned=False,
         )
         == 0
     )
@@ -1349,7 +1343,7 @@ def test_sync_forwarded_env_failure_prevents_cli_attach(
             auth_port=False,
             stop_on_exit=False,
             env_values=guest_setup.resolve_env_entries(["SBX_PRESENT", "SBX_MISSING"]),
-            validate_agent=False,
+            require_provisioned=False,
         )
         == 1
     )
@@ -2214,8 +2208,6 @@ def boot_flow(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespac
                 flow.kvm = True
             elif name == "docker":
                 flow.docker = True
-            elif name == "command":
-                return "/usr/bin/pi"
             elif name == "attach":
                 return flow.attach_rc
 
@@ -2231,7 +2223,6 @@ def boot_flow(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespac
         ("git", "install_git_config"),
         ("docker", "ensure_rootless_docker"),
         ("env", "sync_forwarded_env"),
-        ("command", "command_path"),
         ("attach", "attach"),
     ):
         monkeypatch.setattr(guest_setup, attribute, record(name))
@@ -2306,7 +2297,6 @@ def test_boot_reprovision_runs_once_and_marks_last(
         "kvm",
         "tools",
         "docker",
-        "command",
         "mark",
     ]
     prepare = next(kwargs for name, _, kwargs in boot_flow.events if name == "prepare")
@@ -2362,7 +2352,6 @@ def test_boot_creation_paths_share_setup(
         "tools",
         "git",
         "docker",
-        "command",
         "mark",
     ]
     assert vm_metadata.load_vm(expected_name)["provisioned"] is True
@@ -2475,7 +2464,7 @@ def test_rejected_ssh_identity_unregisters_without_stopping_vm(boot_flow, monkey
             run_user=None,
             auth_port=False,
             stop_on_exit=True,
-            validate_agent=False,
+            require_provisioned=False,
             diagnostic_root=True,
         )
         == 2
@@ -2488,11 +2477,10 @@ def test_rejected_ssh_identity_unregisters_without_stopping_vm(boot_flow, monkey
 def test_running_attachment_rechecks_vm_before_registering(boot_flow, monkeypatch, capsys):
     boot_flow.status = "running"
 
-    def command(*args, **kwargs):
+    def sync(*args, **kwargs):
         boot_flow.status = "stopped"
-        return "/usr/bin/pi"
 
-    monkeypatch.setattr(guest_setup, "command_path", command)
+    monkeypatch.setattr(guest_setup, "sync_forwarded_env", sync)
     assert boot_flow.run("run") == 1
     assert "attach" not in boot_flow.names()
     assert session_state.active_sessions("vm1") == []
@@ -2519,7 +2507,7 @@ def test_boot_root_shell_prepares_recorded_user_and_allows_diagnosis(
     boot_flow.events.clear()
     boot_flow.attach_rc = 0
     assert boot_flow.run("run") == 0
-    assert boot_flow.names() == ["env", "command", "attach"]
+    assert boot_flow.names() == ["env", "attach"]
 
 
 @pytest.mark.parametrize("command", ["run", "shell"])
@@ -2642,10 +2630,42 @@ def test_boot_running_session_keeps_environment_tunnel_and_cleanup(
     monkeypatch.setenv("OLLAMA_HOST", "http://localhost:11434")
     monkeypatch.setattr(runtime, "run_smolvm", lambda argv: stopped.append(argv) or 0)
     assert boot_flow.run("run", *(["--keep-running"] if keep_running else [])) == 0
-    assert boot_flow.names() == ["env", "port", "command", "attach"]
+    assert boot_flow.names() == ["env", "port", "attach"]
     assert boot_flow.events[0][1] == ("vm1", {"OLLAMA_HOST": "http://localhost:11434"})
     assert session_state.active_sessions("vm1") == []
     assert stopped == ([] if keep_running else [["sandbox", "stop", "vm1"]])
+
+
+@pytest.mark.parametrize("keep_running", [False, True])
+def test_missing_agent_launch_preserves_setup_and_cleans_session(
+    boot_flow, monkeypatch, keep_running, capsys
+):
+    boot_flow.config.write_text(
+        '[sbx]\nname = "vm1"\nrun_user = "agent"\nauth_port = false\nstop_on_exit = true\n'
+    )
+    metadata = vm_metadata.load_vm("vm1")
+    metadata["provisioned"] = False
+    vm_metadata.metadata_path("vm1").write_text(json.dumps(metadata))
+    stopped = []
+    monkeypatch.setattr(runtime, "run_smolvm", lambda argv: stopped.append(argv) or 0)
+
+    def attach(vm_name, command, **kwargs):
+        assert command == "pi"
+        assert kwargs["user"] == "agent"
+        assert vm_metadata.load_vm(vm_name)["provisioned"] is True
+        assert session_state.active_sessions(vm_name)
+        boot_flow.events.append(("attach", (vm_name, command), kwargs))
+        return 127
+
+    monkeypatch.setattr(guest_setup, "attach", attach)
+    assert boot_flow.run(
+        "run", "--reprovision", *(["--keep-running"] if keep_running else [])
+    ) == 127
+    assert boot_flow.names().index("mark") < boot_flow.names().index("attach")
+    assert vm_metadata.load_vm("vm1")["provisioned"] is True
+    assert session_state.active_sessions("vm1") == []
+    assert stopped == ([] if keep_running else [["sandbox", "stop", "vm1"]])
+    assert "agent 'pi' exited with status 127" in capsys.readouterr().err
 
 
 def test_guest_clock_errors_are_not_best_effort(fake_guest_lifecycle) -> None:
@@ -2656,14 +2676,20 @@ def test_guest_clock_errors_are_not_best_effort(fake_guest_lifecycle) -> None:
         guest_setup.sync_guest_clock("vm1")
 
 
-def test_missing_agent_does_not_mark_initial_setup_successful(boot_flow, monkeypatch):
+def test_no_attach_marks_setup_without_running_agent(boot_flow, monkeypatch):
     metadata = vm_metadata.load_vm("vm1")
     metadata["provisioned"] = False
     vm_metadata.metadata_path("vm1").write_text(json.dumps(metadata))
-    monkeypatch.setattr(guest_setup, "command_path", lambda *a, **kw: None)
-    assert boot_flow.run("run", "--reprovision", "--no-attach") == 1
-    assert vm_metadata.load_vm("vm1")["provisioned"] is False
-    assert "mark" not in boot_flow.names()
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("no-attach must not execute an agent or probe")
+
+    monkeypatch.setattr(runtime, "run_capture", unexpected)
+    monkeypatch.setattr(guest_setup, "attach", unexpected)
+    assert boot_flow.run("run", "--reprovision", "--no-attach") == 0
+    assert vm_metadata.load_vm("vm1")["provisioned"] is True
+    assert boot_flow.names()[-1] == "mark"
+    assert session_state.active_sessions("vm1") == []
 
 
 @pytest.mark.parametrize("mode", ["stopped", "reprovision", "environment"])
@@ -2684,7 +2710,7 @@ def test_read_only_running_attachment_does_not_wait_for_mutation_lock(boot_flow)
     with vm_metadata.Lifecycle() as active:
         active.lock("vm1")
         assert boot_flow.run("run") == 0
-    assert boot_flow.names() == ["env", "command", "attach"]
+    assert boot_flow.names() == ["env", "attach"]
 
 
 def test_environment_sync_rejects_surviving_remote_phase(forwarded_env_vm):

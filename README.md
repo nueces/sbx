@@ -72,7 +72,7 @@ On first creation, `sbx`:
 2. writes the project settings to `./.sbx.toml`;
 3. creates the guest account and skeleton-initialized home matching your host username, before creating workspace targets;
 4. mounts the project at the same absolute path inside the VM; and
-5. completes boot setup, installs the explicitly requested Pi runtime as that user, validates it is available, then launches it.
+5. completes boot setup, installs the explicitly requested Pi runtime as that user, then launches it directly through the guest login shell.
 
 ### 3. Use the sandbox day to day
 
@@ -181,7 +181,7 @@ These commands use the sandbox named in `.sbx.toml`. Use `--name OTHER_VM` only 
 ## Other operations
 
 ```bash
-# Create or start without launching an agent.
+# Create or start without launching or checking agent availability.
 sbx run --no-attach
 
 # Explicitly rerun user/tool provisioning after changing its config.
@@ -228,7 +228,13 @@ All config-consuming commands use the same ancestor discovery, including `stop` 
 
 User sessions connect directly over SSH as the runtime user. Provisioning authorizes the existing SBX public key in that user's home, independently of `copy_host_credentials`; administrative control and `shell --root` retain root SSH. Existing VMs need `sbx run --reprovision --no-attach` once to authorize user access. Key installation follows `ssh-copy-id`'s append-only approach, preserving existing entries and adding a missing newline before a new key when necessary. Comments are opaque text; quotes in a comment never justify an unrestricted duplicate of an existing key. SSH failures never fall back to root or generate replacement keys.
 
-`sbx shell` changes to the mapped project directory, then starts the guest account's interactive login shell (verified with Bash and Zsh). User startup files may change directory afterward; SBX does not override them. `sbx run` uses a quoted `cd ... && exec <agent>` remote command; failed `cd` prevents launch. Remote commands are non-interactive and not necessarily login shells, so they do not promise login-profile or interactive rc-file loading.
+Bash is the supported guest shell. Zsh checks were exploratory; Zsh is not supported yet.
+
+`sbx shell` changes to the mapped project directory, then starts the guest account's interactive login shell. User startup files may change directory afterward; SBX does not override them. `sbx run` launches the agent through the guest-selected non-interactive login shell (`exec "$SHELL" -lc ...`). Login startup runs before the quoted project `cd` and agent `exec`; failed `cd` prevents launch. Exported login-profile variables reach the agent and its children; unexported values and interactive-only branches do not.
+
+Bash reads `/etc/profile`, then the first readable `~/.bash_profile`, `~/.bash_login`, or `~/.profile`; an existing `.bash_profile` can therefore bypass `.profile`. Profiles may override managed exports, print output, or add startup time; avoid prompts and printing secrets. Profile output is not parsed or redacted. Startup files must allow the agent command to run: an `exit 0` or `exec` in a profile can prevent launch without reporting failure.
+
+There is no separate agent-availability lookup or SSH connection for validation. Provisioning success means setup/check phases completed; `--no-attach` does not check whether the agent exists. An unavailable agent fails when launch is attempted. Existing VMs need no recreation, agent reinstall, image/sshd change, or `.bashrc` edit to gain login-shell launch behavior; independently required SSH authorization repair is separate.
 
 SBX publishes managed environment in `/etc/profile.d/` and assumes the guest's packaged shell handles system-profile integration. It does not manually source profiles, adapt individual shells, mirror the host shell or import the host home. New accounts keep the provisioning default; existing users' shells are preserved. Normal-user public-key login is an image responsibility (SSH defaults or the image Containerfile), not runtime policy repair.
 

@@ -144,43 +144,132 @@ def user_ssh():
     return SimpleNamespace(command=ssh, selected=selected)
 
 
-def test_interactive_shell_is_selected_in_guest(user_ssh):
+@pytest.mark.parametrize("user", ["developer", "root"])
+def test_interactive_shell_is_selected_in_guest(user_ssh, user):
     commands = []
     assert (
         guest_setup.attach(
             "vm",
             None,
-            user="developer",
+            user=user,
             cwd="/workspace/it's here",
             ssh=user_ssh.command,
             run=lambda argv: commands.append(argv) or 0,
         )
         == 0
     )
-    assert user_ssh.selected == [("vm", "developer")]
+    assert user_ssh.selected == [("vm", user)]
     assert commands[0][-1] == "cd -- '/workspace/it'\"'\"'s here' && exec \"$SHELL\" -il"
     assert "-t" in commands[0]
     assert "sudo" not in commands[0][-1]
 
 
-def test_cd_failure_prevents_agent_and_quotes_are_data(tmp_path, user_ssh):
-    target = tmp_path / "directory 'quoted' ; not code"
+@pytest.fixture
+def guest_login(tmp_path):
+    home = tmp_path / "guest-home"
+    home.mkdir()
+    bin_dir = home / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+    startup = home / "startup"
+    startup.mkdir()
+    profile = home / "profile"
+    profile.write_text(
+        f"export PATH={shlex.quote(str(bin_dir))}:/usr/bin:/bin\n"
+        "export SBX_PROBE=fixture-value\n"
+        f"cd {shlex.quote(str(startup))}\n"
+        "printf 'profile banner without newline'\n"
+    )
+    shell = home / "shell"
+    shell.write_text(
+        "#!/bin/sh\n"
+        '[ "$1" = "-lc" ] || exit 90\n'
+        '. "$HOME/profile"\n'
+        'exec /bin/sh -c "$2"\n'
+    )
+    shell.chmod(0o700)
+    env = {"HOME": str(home), "SHELL": str(shell), "PATH": "/usr/bin:/bin"}
+
+    def execute(argv):
+        return subprocess.run(
+            ["/bin/sh", "-c", argv[-1]], env=env, capture_output=True, text=True, check=False
+        )
+
+    return SimpleNamespace(home=home, bin=bin_dir, profile=profile, env=env, execute=execute)
+
+
+def test_login_launch_inherits_profile_and_child_environment(guest_login, tmp_path, user_ssh):
+    project = tmp_path / "project"
+    project.mkdir()
+    marker = guest_login.home / "result"
+    agent = guest_login.bin / "fixture-pi"
+    agent.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$SBX_PROBE\" \"$PWD\" \"$-\" > {shlex.quote(str(marker))}\n"
+        f"/bin/sh -c 'printf \"%s\\n\" \"$SBX_PROBE\"' >> {shlex.quote(str(marker))}\n"
+    )
+    agent.chmod(0o700)
+    commands = []
+
+    def run(argv):
+        commands.append(argv)
+        return guest_login.execute(argv).returncode
+
+    assert guest_setup.attach(
+        "vm", "fixture-pi", user="developer", cwd=str(project), ssh=user_ssh.command, run=run
+    ) == 0
+    value, cwd, flags, child = marker.read_text().splitlines()
+    assert value == child == "fixture-value"
+    assert cwd == str(project)
+    assert "i" not in flags
+    assert user_ssh.selected == [("vm", "developer")]
+    assert len(commands) == 1
+    assert "-t" in commands[0]
+    assert "fixture-value" not in commands[0][-1]
+    assert commands[0][-1].startswith('exec "$SHELL" -lc ')
+
+
+@pytest.mark.parametrize(
+    "suffix", ["with spaces", "'quoted'", "$dollar", "; touch injected", "$(touch injected)"]
+)
+def test_cd_failure_prevents_agent_and_quotes_are_data(tmp_path, user_ssh, guest_login, suffix):
+    target = tmp_path / f"directory {suffix}"
     marker = tmp_path / "launched"
-    agent = tmp_path / "fake pi"
+    agent = tmp_path / f"fake pi {suffix}"
     agent.write_text(f"#!/bin/sh\nprintf '%s' \"$PWD\" > {shlex.quote(str(marker))}\nexit 7\n")
     agent.chmod(0o700)
 
     def run(argv):
-        return subprocess.run(["/bin/sh", "-c", argv[-1]], check=False).returncode
+        return guest_login.execute(argv).returncode
 
     assert guest_setup.attach("vm", str(agent), cwd=str(target), ssh=user_ssh.command, run=run) != 0
     assert not marker.exists()
     target.mkdir()
     assert guest_setup.attach("vm", str(agent), cwd=str(target), ssh=user_ssh.command, run=run) == 7
     assert marker.read_text() == str(target)
+    assert not list(tmp_path.rglob("injected"))
 
 
-def test_agent_exec_preserves_signal_result(tmp_path, user_ssh):
+@pytest.mark.parametrize("failure,status", [("agent", 127), ("shell", 127), ("startup", 23)])
+def test_launch_failures_do_not_retry(guest_login, user_ssh, failure, status):
+    if failure == "shell":
+        guest_login.env["SHELL"] = str(guest_login.home / "missing-shell")
+    elif failure == "startup":
+        guest_login.profile.write_text("exit 23\n")
+    commands = []
+
+    def run(argv):
+        commands.append(argv)
+        return guest_login.execute(argv).returncode
+
+    assert guest_setup.attach(
+        "vm", "missing-fixture-agent", user="developer", ssh=user_ssh.command, run=run
+    ) == status
+    assert user_ssh.selected == [("vm", "developer")]
+    assert len(commands) == 1
+    assert commands[0][-1] == 'exec "$SHELL" -lc \'exec missing-fixture-agent\''
+
+
+def test_agent_exec_preserves_signal_result(tmp_path, user_ssh, guest_login):
     agent = tmp_path / "terminated-agent"
     agent.write_text("#!/bin/sh\nkill -TERM $$\n")
     agent.chmod(0o700)
@@ -190,7 +279,7 @@ def test_agent_exec_preserves_signal_result(tmp_path, user_ssh):
             str(agent),
             user="developer",
             ssh=user_ssh.command,
-            run=lambda argv: subprocess.run(["/bin/sh", "-c", argv[-1]], check=False).returncode,
+            run=lambda argv: guest_login.execute(argv).returncode,
         )
         == -signal.SIGTERM
     )
@@ -203,37 +292,6 @@ def test_auth_failure_has_no_root_retry(user_ssh, capsys):
     )
     assert user_ssh.selected == [("vm", "developer")]
     assert "--reprovision --no-attach" in capsys.readouterr().err
-
-
-def test_agent_validation_uses_same_user_context(user_ssh):
-    commands = []
-
-    def capture(argv):
-        commands.append(argv)
-        return subprocess.CompletedProcess(
-            argv, 0, stdout="/home/developer/.local/bin/pi\n", stderr=""
-        )
-
-    assert (
-        guest_setup.command_path("vm", "developer", "pi", ssh=user_ssh.command, run_capture=capture)
-        == "/home/developer/.local/bin/pi"
-    )
-    assert user_ssh.selected == [("vm", "developer")]
-    assert commands[0][-1] == "command -v pi"
-
-
-def test_agent_validation_auth_failure_explains_explicit_repair(user_ssh):
-    with pytest.raises(runtime.ConfigError, match="--reprovision --no-attach"):
-        guest_setup.command_path(
-            "vm",
-            "developer",
-            "pi",
-            ssh=user_ssh.command,
-            run_capture=lambda argv: subprocess.CompletedProcess(
-                argv, 255, stdout="", stderr="denied"
-            ),
-        )
-    assert user_ssh.selected == [("vm", "developer")]
 
 
 def test_ssh_username_uses_supported_smolvm_api(tmp_path, monkeypatch):

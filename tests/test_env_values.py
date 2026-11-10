@@ -292,7 +292,7 @@ def test_failure_boundaries_redact_resolved_values(
             run_user="root",
             auth_port=False,
             stop_on_exit=False,
-            validate_agent=False,
+            require_provisioned=False,
             provision=failure == "provision",
             env_values={"X": "LITERAL_SECRET", "TOKEN": "ALIAS_SECRET"},
         )

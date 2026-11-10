@@ -391,38 +391,6 @@ def ensure_rootless_docker(vm_id: str, user: str, *, guest=None) -> None:
         _phase(vm_id, "docker", user=user, guest=guest, timeout=75)
 
 
-def command_path(
-    vm_id: str,
-    user: str,
-    command: str,
-    *,
-    cwd: str | None = None,
-    run_capture: Callable[[list[str]], subprocess.CompletedProcess[str] | None] | None = None,
-    ssh: Callable[..., list[str]] | None = None,
-) -> str | None:
-    run_capture = run_capture or runtime.run_capture
-    ssh = ssh or ssh_command
-    validate_run_user(user)
-    cd_prefix = f"cd -- {shlex.quote(cwd)} && " if cwd is not None else ""
-    completed = run_capture(
-        [*ssh(vm_id, user=user), f"{cd_prefix}command -v {shlex.quote(command)}"]
-    )
-    if completed is None:
-        raise ConfigError(f"failed to resolve {command!r}: ssh command not found")
-    if completed.returncode == 255:
-        raise ConfigError(
-            f"user SSH failed for {vm_id!r}; check guest SSH policy or run "
-            f"`sbx run {vm_id} --reprovision --no-attach` to authorize its existing key"
-        )
-    if completed.returncode == 0:
-        lines = completed.stdout.strip().splitlines()
-        return lines[-1] if lines else None
-    details = completed.stderr.strip() or completed.stdout.strip()
-    if not details:
-        return None
-    raise ConfigError(f"failed to resolve {command!r} for {user!r}: {details}")
-
-
 def install_runtime_tools(
     vm_id: str, user: str, tools: list[str], install_timeout: int, *, guest=None
 ) -> None:
@@ -451,9 +419,13 @@ def attach(
     cmd = ssh(vm_id, user=validate_run_user(user or "root"))
     cd_prefix = f"cd -- {shlex.quote(cwd)} && " if cwd is not None else ""
     # sshd supplies SHELL from the guest account; login startup stays the shell's job.
-    command = shlex.quote(launch_command) if launch_command is not None else '"$SHELL" -il'
+    if launch_command is None:
+        command = f'{cd_prefix}exec "$SHELL" -il'
+    else:
+        payload = f"{cd_prefix}exec {shlex.quote(launch_command)}"
+        command = f'exec "$SHELL" -lc {shlex.quote(payload)}'
     cmd.insert(-1, "-t")
-    cmd.append(f"{cd_prefix}exec {command}")
+    cmd.append(command)
     rc = run(cmd)
     if rc == 255:
         print(

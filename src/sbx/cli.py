@@ -578,7 +578,7 @@ def _post_start_actions(
     runtime_install: list[str] | None = None,
     install_timeout: int = 600,
     copy_initial_state: bool = False,
-    validate_agent: bool = True,
+    require_provisioned: bool = True,
     agent_name: str | None = None,
     diagnostic_root: bool = False,
     operation: vm_metadata.Lifecycle | None = None,
@@ -625,7 +625,7 @@ def _post_start_actions(
                     port_rc = network.expose_auth_port(vm_name, auth_host_port, auth_guest_port)
                     if port_rc != 0:
                         return port_rc
-                if validate_agent and not provision and not metadata.get("provisioned"):
+                if require_provisioned and not provision and not metadata.get("provisioned"):
                     print(
                         f"sbx: VM {vm_name!r} has not completed provisioning; "
                         f"run `sbx run {vm_name} --reprovision --no-attach`",
@@ -653,32 +653,6 @@ def _post_start_actions(
                 session_cwd = (
                     _mounted_guest_cwd(vm_name, cwd) if attach and not diagnostic_root else None
                 )
-                resolved_command = command
-                if validate_agent:
-                    try:
-                        resolved = guest_setup.command_path(
-                            vm_name,
-                            run_user or "root",
-                            command,
-                            cwd=session_cwd,
-                            run_capture=runtime.run_capture,
-                        )
-                    except ConfigError as exc:
-                        details = bootstrap.redact(str(exc), env_values.values())
-                        print(
-                            f"sbx: failed to check agent {agent_name or command!r}: {details}",
-                            file=sys.stderr,
-                        )
-                        return 1
-                    if resolved is None:
-                        print(
-                            f"sbx: agent {agent_name or command!r} was not found for user "
-                            f"{run_user or 'root'!r}; "
-                            "request its runtime installer or install it manually",
-                            file=sys.stderr,
-                        )
-                        return 1
-                    resolved_command = resolved
                 if provision:
                     guest.phase("check")
                     vm_metadata.mark_provisioned(vm_name)
@@ -725,16 +699,15 @@ def _post_start_actions(
         try:
             attempted_attach = True
             rc = guest_setup.attach(
-                vm_name, resolved_command, user=run_user, cwd=session_cwd, run=runtime.run
+                vm_name, command, user=run_user, cwd=session_cwd, run=runtime.run
             )
         except ConfigError as exc:
             attempted_attach = False
             print(f"sbx: {exc}", file=sys.stderr)
             return 2
-        if rc != 0 and validate_agent:
+        if rc != 0 and command is not None:
             print(
-                f"sbx: agent {agent_name or command!r} at {resolved_command!r} "
-                f"exited with status {rc}",
+                f"sbx: agent {agent_name or command!r} exited with status {rc}",
                 file=sys.stderr,
             )
         return rc
@@ -1528,7 +1501,7 @@ def _cmd_shell(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
         cwd=None if args.root else project_guest_cwd,
         session_kind="shell",
         env_values=env_values,
-        validate_agent=False,
+        require_provisioned=False,
         operation=operation,
     )
 

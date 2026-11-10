@@ -28,7 +28,6 @@ def isolated_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_guest_
     monkeypatch.setattr(guest_setup, "ensure_rootless_docker", lambda *args, **kwargs: None)
     monkeypatch.setattr(guest_setup, "install_git_config", lambda *args, **kwargs: None)
     monkeypatch.setattr(guest_setup, "sync_forwarded_env", lambda *args, **kwargs: None)
-    monkeypatch.setattr(guest_setup, "command_path", lambda *args, **kwargs: "/usr/bin/pi")
     monkeypatch.setattr(guest_setup, "attach", lambda *args, **kwargs: 0)
     real_claim_vm = vm_metadata.claim_vm
 
@@ -737,7 +736,7 @@ def test_run_user_from_config_starts_then_attaches_as_user(
     assert rc == 0
     assert captured["preset_closed"] is True
     assert captured["prepare"] == ("vm1", "agent")
-    assert captured["attach"] == ("vm1", "agent", "/usr/bin/pi", None)
+    assert captured["attach"] == ("vm1", "agent", "pi", None)
     out = capfd.readouterr().out
     assert "Started 'vm1'." in out
     assert "sandbox stop vm1" in out
@@ -1136,7 +1135,7 @@ def test_run_with_project_path_attaches_from_mounted_project_cwd(
     _, preset_kwargs = captured["preset"]
     assert preset_kwargs["mounts"] == [f"{project}:{project}"]
     assert preset_kwargs["writable_mounts"] is True
-    assert captured["attach"] == ("vm1", "/usr/bin/pi", str(project))
+    assert captured["attach"] == ("vm1", "pi", str(project))
 
 
 def test_run_uses_configured_auth_ports_before_attach(
@@ -1165,7 +1164,7 @@ def test_run_uses_configured_auth_ports_before_attach(
     assert cli.main(["run"]) == 0
     assert captured["preset_closed"] is True
     assert captured["expose"] == ("vm1", 1555, 1666)
-    assert captured["attach"] == ("vm1", "/usr/bin/pi", None)
+    assert captured["attach"] == ("vm1", "pi", None)
 
 
 def test_run_existing_vm_starts_without_creating(

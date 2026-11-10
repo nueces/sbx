@@ -187,7 +187,7 @@ def test_attachment_waits_for_committed_stop_and_does_not_launch(stopping, monke
                 run_user="agent",
                 auth_port=False,
                 stop_on_exit=False,
-                validate_agent=False,
+                require_provisioned=False,
             ),
         ),
     )
