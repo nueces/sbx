@@ -214,7 +214,8 @@ with pytest.MonkeyPatch.context() as patch:
     def command(argv, **kwargs):
         result = original(argv, **kwargs)
         if argv[0] == "mount":
-            mounted[argv[-1]] = dict(source=argv[-2], fstype=argv[2], options=argv[4])
+            mounted[argv[-1]] = dict(target=argv[-1], source=argv[-2],
+                                     fstype=argv[2], options=argv[4])
         elif argv[:2] == ["bash", "-lc"]:
             result.returncode = 0 if "pi" in installed else 1
         elif argv[0] == "timeout":
@@ -536,6 +537,377 @@ def test_guest_missing_modules_fail_before_mount_targets(
         guest.mounts_phase()
     assert not target.exists()
     assert all(argv[0] == "modprobe" for argv, _ in guest_script.commands)
+
+
+@pytest.fixture
+def mount_ownership(guest_script, account_home, monkeypatch):
+    account = guest_script.accounts["agent"]
+    account.pw_uid, account.pw_gid = 34567, 34568
+    changes = []
+    guest_script.owners = {}
+    original_fstat = os.fstat
+
+    def fstat(fd):
+        info = original_fstat(fd)
+        owner = guest_script.owners.get((info.st_dev, info.st_ino))
+        if owner is None:
+            return info
+        values = list(info)
+        values[4:6] = owner
+        return os.stat_result(values)
+
+    def chown(fd, uid, gid):
+        info = original_fstat(fd)
+        changes.append((info.st_dev, info.st_ino, uid, gid))
+        guest_script.owners[info.st_dev, info.st_ino] = (uid, gid)
+
+    monkeypatch.setattr(guest_script.module.os, "fstat", fstat)
+    monkeypatch.setattr(guest_script.module.os, "fchown", chown)
+    return changes
+
+
+def test_guest_nested_mount_parents_get_account_ownership(
+    guest_script, account_home, mount_ownership
+):
+    guest, home = account_home
+    target = home / ".local/share/uv/credentials"
+    guest.mount_one("workspace0", target, "9p", "rw")
+    expected = [home / ".local", home / ".local/share", target.parent, target]
+    assert mount_ownership == [
+        (path.stat().st_dev, path.stat().st_ino, 34567, 34568) for path in expected
+    ]
+    assert not list(home.rglob(".sbx-mkdir-*"))
+    guest.mount_one("workspace0", target, "9p", "rw")
+    assert len(mount_ownership) == 4
+
+
+def test_guest_runtime_user_can_write_local_prefix_after_mount(guest_script, account_home):
+    guest, home = account_home
+    guest.mount_one("workspace0", home / ".local/share/uv/credentials", "9p", "rw")
+    # The fixture account is the unprivileged test runner; fchown is real in this test.
+    assert guest_script.accounts["agent"].pw_uid == os.getuid()
+    library = home / ".local/lib"
+    library.mkdir()
+    (library / "write-check").write_text("ok")
+    assert (library / "write-check").read_text() == "ok"
+
+
+def test_guest_existing_root_owned_parents_are_repaired(
+    guest_script, account_home, mount_ownership
+):
+    guest, home = account_home
+    target = home / ".local/share/uv/credentials"
+    target.mkdir(parents=True)
+    paths = [home / ".local", home / ".local/share", target.parent, target]
+    modes = [stat.S_IMODE(path.stat().st_mode) for path in paths]
+    guest.mount_one("workspace0", target, "9p", "rw")
+    assert mount_ownership == [
+        (path.stat().st_dev, path.stat().st_ino, 34567, 34568) for path in paths
+    ]
+    assert [stat.S_IMODE(path.stat().st_mode) for path in paths] == modes
+    assert (home.stat().st_dev, home.stat().st_ino) not in guest_script.owners
+    guest.mount_one("workspace0", target, "9p", "rw")
+    assert len(mount_ownership) == 4
+
+
+@pytest.mark.parametrize("uid,gid", [(34567, 9876), (9876, 9876)])
+def test_guest_runtime_owned_parents_are_preserved_and_other_owners_fail(
+    guest_script, account_home, mount_ownership, uid, gid
+):
+    guest, home = account_home
+    target = home / "project"
+    target.mkdir(mode=0o711)
+    info = target.stat()
+    guest_script.owners[info.st_dev, info.st_ino] = (uid, gid)
+    if uid == 34567:
+        guest.mount_one("workspace0", target, "9p", "rw")
+    else:
+        with pytest.raises(ValueError, match=rf"{target}.*UID 9876.*UID 34567.*explicit"):
+            guest.mount_one("workspace0", target, "9p", "rw")
+        assert not guest_script.commands
+    assert guest_script.owners[info.st_dev, info.st_ino] == (uid, gid)
+    assert stat.S_IMODE(target.stat().st_mode) == 0o711
+    assert mount_ownership == []
+
+
+@pytest.mark.parametrize("kind", ["9p", "overlay"])
+@pytest.mark.parametrize("conflict", [False, True])
+def test_guest_existing_mount_repairs_only_local_ancestors(
+    guest_script, account_home, mount_ownership, monkeypatch, kind, conflict
+):
+    guest, home = account_home
+    target = home / ".local/share/uv/credentials"
+    target.mkdir(parents=True)
+    info = target.stat()
+    guest_script.owners[info.st_dev, info.st_ino] = (9876, 9876)
+    source = "workspace0" if kind == "9p" else "overlay"
+    monkeypatch.setattr(
+        guest_script.module.Runtime,
+        "current_mounts",
+        lambda self: {
+            str(target): dict(
+                target=str(target),
+                source="wrong" if conflict else source,
+                fstype=kind,
+                options="rw",
+            )
+        },
+    )
+    if conflict:
+        with pytest.raises(ValueError, match="conflicting workspace"):
+            guest.mount_one(source, target, kind, "rw")
+        assert mount_ownership == []
+    else:
+        guest.mount_one(source, target, kind, "rw")
+        paths = [home / ".local", home / ".local/share", target.parent]
+        assert mount_ownership == [
+            (path.stat().st_dev, path.stat().st_ino, 34567, 34568) for path in paths
+        ]
+        guest.mount_one(source, target, kind, "rw")
+        assert len(mount_ownership) == 3
+    assert guest_script.owners[info.st_dev, info.st_ino] == (9876, 9876)
+    assert not guest_script.commands
+
+
+def test_guest_existing_directory_repair_uses_pinned_descriptor(
+    guest_script, account_home, mount_ownership, monkeypatch
+):
+    guest, home = account_home
+    target, moved = home / "project", home / "moved"
+    target.mkdir()
+    protected = guest_script.root / "protected"
+    protected.mkdir(mode=0o711)
+    original = guest_script.module.os.fchown
+
+    def replace_path(fd, uid, gid):
+        target.rename(moved)
+        target.symlink_to(protected, target_is_directory=True)
+        original(fd, uid, gid)
+
+    monkeypatch.setattr(guest_script.module.os, "fchown", replace_path)
+    guest.prepare_mount_target(target, {})
+    assert mount_ownership == [(moved.stat().st_dev, moved.stat().st_ino, 34567, 34568)]
+    assert (protected.stat().st_dev, protected.stat().st_ino) not in guest_script.owners
+    assert stat.S_IMODE(protected.stat().st_mode) == 0o711
+    with pytest.raises(ValueError, match="symlinked"):
+        guest.mount_one("workspace0", target, "9p", "rw")
+    assert not guest_script.commands
+
+
+def test_guest_outside_home_and_root_mounts(guest_script, account_home, mount_ownership):
+    guest, _ = account_home
+    target = guest_script.root / "outside/nested"
+    guest.mount_one("workspace0", target, "9p", "rw")
+    assert target.stat().st_uid == guest_script.module.ROOT_UID
+    assert mount_ownership == []
+    guest_script.accounts["root"] = SimpleNamespace(
+        pw_dir=str(guest_script.module.ROOT_HOME), pw_uid=os.getuid(), pw_gid=os.getgid()
+    )
+    root = guest_script.module.Runtime(data(user="root"))
+    root.mount_one("workspace1", guest_script.module.ROOT_HOME / "project", "9p", "rw")
+    assert mount_ownership[-1][2:] == (os.getuid(), os.getgid())
+
+
+def test_guest_overlay_only_reowns_new_home_destinations(
+    guest_script, account_home, mount_ownership
+):
+    guest, home = account_home
+    target = home / "nested/project"
+    guest.mounts = [dict(target=target, tag="workspace0", writable=False)]
+    guest.mounts_phase()
+    assert {change[1] for change in mount_ownership} == {
+        (home / "nested").stat().st_ino,
+        target.stat().st_ino,
+    }
+    for suffix in ("upper", "work"):
+        backing = guest_script.module.UPPER_ROOT / f".smolvm-ws-workspace0-{suffix}"
+        assert backing.stat().st_uid == guest_script.module.ROOT_UID
+        assert stat.S_IMODE(backing.stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize("fstype", ["9p", "virtiofs", "overlay"])
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("owner", ["root", "other"])
+def test_guest_shared_mount_content_is_not_created_or_reowned(
+    guest_script, account_home, mount_ownership, monkeypatch, fstype, existing, owner
+):
+    guest, home = account_home
+    shared = home / "shared"
+    target = shared / "nested"
+    shared.mkdir()
+    if existing:
+        target.mkdir(mode=0o711)
+    for path in (shared, target) if existing else (shared,):
+        info = path.stat()
+        uid = guest_script.module.ROOT_UID if owner == "root" else 9876
+        guest_script.owners[info.st_dev, info.st_ino] = (uid, 9876)
+    before = guest_script.owners.copy()
+    monkeypatch.setattr(
+        guest_script.module.Runtime,
+        "current_mounts",
+        lambda self: {str(shared): dict(target=str(shared), fstype=fstype)},
+    )
+    if existing:
+        guest.mount_one("workspace1", target, "9p", "rw")
+        assert stat.S_IMODE(target.stat().st_mode) == 0o711
+    else:
+        with pytest.raises(ValueError, match="inside shared storage.*prepare it explicitly"):
+            guest.mount_one("workspace1", target, "9p", "rw")
+        assert not target.exists()
+        assert not guest_script.commands
+    assert mount_ownership == []
+    assert guest_script.owners == before
+
+
+@pytest.mark.parametrize("symlink", [False, True])
+def test_guest_invalid_mount_component_blocks_mounting(
+    guest_script, account_home, mount_ownership, symlink
+):
+    guest, home = account_home
+    component = home / "invalid"
+    if symlink:
+        component.symlink_to(guest_script.root, target_is_directory=True)
+    else:
+        component.write_text("keep")
+    with pytest.raises((ValueError, OSError)):
+        guest.mount_one("workspace0", component / "project", "9p", "rw")
+    assert mount_ownership == []
+    assert not guest_script.commands
+
+
+@pytest.mark.parametrize("symlink", [False, True])
+def test_guest_publication_race_repairs_root_owned_component(
+    guest_script, account_home, mount_ownership, monkeypatch, symlink
+):
+    guest, home = account_home
+    target = home / "project"
+    protected = guest_script.root / "protected"
+    protected.mkdir(mode=0o711)
+    original = guest_script.module.publish_noreplace
+
+    def race(source, destination, **kwargs):
+        if symlink:
+            target.symlink_to(protected, target_is_directory=True)
+        else:
+            target.mkdir(mode=0o711)
+        return original(source, destination, **kwargs)
+
+    monkeypatch.setattr(guest_script.module, "publish_noreplace", race)
+    if symlink:
+        with pytest.raises(OSError):
+            guest.mount_one("workspace0", target, "9p", "rw")
+        assert not guest_script.commands
+    else:
+        guest.mount_one("workspace0", target, "9p", "rw")
+        assert stat.S_IMODE(target.stat().st_mode) == 0o711
+        assert mount_ownership[-1] == (target.stat().st_dev, target.stat().st_ino, 34567, 34568)
+    assert stat.S_IMODE(protected.stat().st_mode) == 0o711
+    assert all(change[1] != protected.stat().st_ino for change in mount_ownership)
+    assert not list(home.glob(".sbx-mkdir-*"))
+
+
+def test_guest_staging_replacement_cannot_redirect_chown(
+    guest_script, account_home, mount_ownership, monkeypatch
+):
+    guest, home = account_home
+    protected = guest_script.root / "protected"
+    protected.mkdir(mode=0o700)
+    original = os.open
+    moved = []
+
+    def replace_stage(path, *args, **kwargs):
+        if isinstance(path, str) and path.startswith(".sbx-mkdir-"):
+            stage = home / path
+            displaced = home / "displaced-stage"
+            stage.rename(displaced)
+            moved.append(displaced)
+            stage.symlink_to(protected, target_is_directory=True)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(guest_script.module.os, "open", replace_stage)
+    with pytest.raises(OSError):
+        guest.mount_one("workspace0", home / "project", "9p", "rw")
+    assert moved and not list(moved[0].iterdir())
+    assert not list(protected.iterdir())
+    assert mount_ownership == []
+    assert not guest_script.commands
+
+
+@pytest.mark.parametrize("unsafe", ["owner", "mode"])
+def test_guest_untrusted_staging_is_not_modified(
+    guest_script, account_home, mount_ownership, monkeypatch, unsafe
+):
+    guest, home = account_home
+    original = os.open
+    stages = []
+
+    def untrusted_stage(path, *args, **kwargs):
+        if isinstance(path, str) and path.startswith(".sbx-mkdir-"):
+            stage = home / path
+            stages.append(stage)
+            if unsafe == "mode":
+                stage.chmod(0o755)
+        return original(path, *args, **kwargs)
+
+    if unsafe == "owner":
+        monkeypatch.setattr(guest_script.module, "ROOT_UID", os.getuid() + 1)
+    monkeypatch.setattr(guest_script.module.os, "open", untrusted_stage)
+    with pytest.raises(ValueError, match="unsafe mount staging"):
+        guest.mount_one("workspace0", home / "project", "9p", "rw")
+    assert stages[0].is_dir()
+    assert not list(stages[0].iterdir())
+    assert not (home / "project").exists()
+    assert mount_ownership == []
+    assert not guest_script.commands
+
+
+@pytest.mark.parametrize(
+    "existing,failure",
+    [
+        (False, "mkdir"),
+        (False, "open"),
+        (False, "fchown"),
+        (False, "publish_noreplace"),
+        (True, "fchown"),
+    ],
+)
+def test_guest_directory_failure_cleans_staging_and_descriptors(
+    guest_script, account_home, mount_ownership, monkeypatch, existing, failure
+):
+    guest, home = account_home
+    target = home / "project"
+    if existing:
+        target.mkdir()
+    opened = set()
+    original_open, original_close = os.open, os.close
+
+    def track_open(*args, **kwargs):
+        fd = original_open(*args, **kwargs)
+        opened.add(fd)
+        return fd
+
+    def track_close(fd):
+        opened.discard(fd)
+        original_close(fd)
+
+    monkeypatch.setattr(guest_script.module.os, "open", track_open)
+    monkeypatch.setattr(guest_script.module.os, "close", track_close)
+    owner = guest_script.module if failure == "publish_noreplace" else guest_script.module.os
+    original_operation = getattr(owner, failure)
+
+    def fail(*args, **kwargs):
+        if failure in ("mkdir", "open") and args[0] != "directory":
+            return original_operation(*args, **kwargs)
+        raise OSError("injected preparation failure")
+
+    monkeypatch.setattr(owner, failure, fail)
+    with pytest.raises(OSError, match="injected preparation failure"):
+        guest.mount_one("workspace0", target, "9p", "rw")
+    assert target.exists() == existing
+    assert not list(home.glob(".sbx-mkdir-*"))
+    assert not guest_script.commands
+    assert not opened
+    assert len(mount_ownership) == (1 if failure == "publish_noreplace" else 0)
 
 
 def test_guest_mount_order_repeat_and_conflicts(guest_script, account_home, monkeypatch):

@@ -152,6 +152,45 @@ Important: `copy_host_credentials = false` prevents host credential/config copyi
 sbx run
 ```
 
+### Recovering from root-owned mount parents
+
+Mount preparation gives newly created guest-local directories beneath the runtime user's home to that user. It also automatically transfers existing root-owned components on the mount path to the runtime UID/GID. For `/home/nueces/.local/share/uv/credentials`, this repairs root-owned `.local`, `share`, and `uv`. `/home`, the runtime home itself, directories outside that home, and mounted content remain unchanged. An unmounted destination directory follows the same ownership policy as its parents.
+
+Directories already owned by the runtime UID keep their group and modes. Directories owned by another non-root UID require explicit ownership repair; sbx reports the path and UIDs rather than taking them over. Existing modes are not explicitly changed, although the operating system may clear special permission bits during ownership transfer. Missing directories inside an already active shared mount must be prepared explicitly; sbx will not create or re-own host-backed directories there.
+
+Older versions could leave root-owned parents that block Pi installation with `EACCES` while creating `$HOME/.local/lib`. After upgrading, provisioning (including `--reprovision`) repairs those parents even when the credentials mount already exists, without remounting it. Configuring a mount beneath the runtime home authorizes this root-owned-parent transfer; sbx cannot distinguish old provisioning artifacts from intentionally root-protected directories on that path.
+
+```bash
+sbx run dt --reprovision --no-attach
+sbx run dt --agent pi
+```
+
+Inspect the affected VM before changing ownership:
+
+```bash
+# On the host:
+sbx shell dt --root
+
+# Inside the guest:
+id nueces
+namei -l /home/nueces/.local/share/uv/credentials
+findmnt -T /home/nueces/.local
+```
+
+If automatic repair does not apply (for example, the directory has another non-root owner), investigate that ownership before explicitly authorizing any change. Only repair a directory after confirming it is guest-local and its current ownership is incorrect. For an installation where that owner should be `nueces:nueces`, a narrowly scoped repair would be:
+
+```bash
+# Inside the guest:
+chown nueces:nueces /home/nueces/.local
+exit
+
+# Back on the host:
+sbx run dt --reprovision --no-attach
+sbx run dt --agent pi
+```
+
+Use the actual account, group and VM name for other installations. Do not use recursive `chown`: descendants can be host mounts. Deleting the VM is unnecessary, risks losing guest-local data, and can reproduce the original problem on an older sbx version.
+
 ## Nested KVM images
 
 Nested KVM is an optional Linux x86_64 image capability. It is not present in the default curated image. The physical host must have virtualization enabled in firmware, a working `/dev/kvm`, and nested virtualization enabled in the active vendor module.
