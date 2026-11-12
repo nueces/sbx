@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import uuid
 from contextlib import suppress
 from pathlib import Path
 
@@ -95,13 +96,13 @@ def secure_directory(path):
     path.chmod(0o700)
 
 
-def publish_noreplace(source, destination):
+def publish_noreplace(source, destination, *, source_fd=-100, destination_fd=-100):
     rename = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
     if rename is None:
-        raise ValueError("guest libc needs renameat2 for safe initial credential copying")
+        raise ValueError("guest libc needs renameat2 for safe bootstrap publication")
     rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
     rename.restype = ctypes.c_int
-    if rename(-100, os.fsencode(source), -100, os.fsencode(destination), 1) == 0:
+    if rename(source_fd, os.fsencode(source), destination_fd, os.fsencode(destination), 1) == 0:
         return
     error = ctypes.get_errno()
     if error != errno.EEXIST:
@@ -317,9 +318,89 @@ class Runtime:
             file=sys.stderr,
         )
 
+    def create_owned_directory(self, parent_fd, name, account):
+        # Stage privately on the same filesystem: mkdir/open in a user-owned parent can race.
+        temporary = f".sbx-mkdir-{uuid.uuid4().hex}"
+        os.mkdir(temporary, mode=0o700, dir_fd=parent_fd)
+        stage_fd = os.open(
+            temporary, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd
+        )
+        created = False
+        trusted = False
+        try:
+            info = os.fstat(stage_fd)
+            if info.st_uid != ROOT_UID or info.st_mode & 0o077:
+                raise ValueError("unsafe mount staging directory; explicit repair required")
+            trusted = True
+            os.mkdir("directory", dir_fd=stage_fd)
+            created = True
+            fd = os.open("directory", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=stage_fd)
+            try:
+                os.fchown(fd, account.pw_uid, account.pw_gid)
+            finally:
+                os.close(fd)
+            publish_noreplace("directory", name, source_fd=stage_fd, destination_fd=parent_fd)
+        finally:
+            try:
+                if created:
+                    with suppress(FileNotFoundError):
+                        os.rmdir("directory", dir_fd=stage_fd)
+                # Do not clean up an entry substituted for the pinned staging directory.
+                with suppress(FileNotFoundError):
+                    info = os.stat(temporary, dir_fd=parent_fd, follow_symlinks=False)
+                    if trusted and os.path.samestat(info, os.fstat(stage_fd)):
+                        os.rmdir(temporary, dir_fd=parent_fd)
+            finally:
+                os.close(stage_fd)
+
+    def prepare_mount_target(self, target, mounts):
+        account = self.existing_account()
+        home = Path(account.pw_dir)
+        shared = [
+            Path(item["target"])
+            for item in mounts.values()
+            if item["fstype"] in ("9p", "virtiofs", "overlay") and item["target"] != "/"
+        ]
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        fd = os.open("/", flags)
+        path = Path("/")
+        try:
+            for name in target.parts[1:]:
+                path /= name
+                try:
+                    child_fd = os.open(name, flags, dir_fd=fd)
+                except FileNotFoundError:
+                    if any(under(path, mount) for mount in shared):
+                        raise ValueError(
+                            f"missing mount directory {path} is inside shared storage; "
+                            "prepare it explicitly before provisioning"
+                        ) from None
+                    if home in path.parents:
+                        self.create_owned_directory(fd, name, account)
+                    else:
+                        with suppress(FileExistsError):
+                            os.mkdir(name, dir_fd=fd)
+                    child_fd = os.open(name, flags, dir_fd=fd)
+                os.close(fd)
+                fd = child_fd
+                if home in path.parents and not any(under(path, mount) for mount in shared):
+                    info = os.fstat(fd)
+                    if info.st_uid == account.pw_uid:
+                        continue
+                    if info.st_uid != ROOT_UID:
+                        raise ValueError(
+                            f"mount directory {path} is owned by UID {info.st_uid}, "
+                            f"expected runtime UID {account.pw_uid} or root; "
+                            "explicit ownership repair required"
+                        )
+                    os.fchown(fd, account.pw_uid, account.pw_gid)
+        finally:
+            os.close(fd)
+
     def mount_one(self, source, target, kind, options):
         no_symlinks(target)
-        current = self.current_mounts().get(str(target))
+        mounts = self.current_mounts()
+        current = mounts.get(str(target))
         expected = set(options.split(","))
         if current:
             actual = set(current["options"].split(","))
@@ -328,8 +409,9 @@ class Runtime:
                 expected.discard("version=9p2000.L")
             if current["source"] != source or current["fstype"] != kind or not expected <= actual:
                 raise ValueError(f"conflicting workspace at {target}; explicit repair required")
+            self.prepare_mount_target(target, mounts)
             return
-        target.mkdir(parents=True, exist_ok=True)
+        self.prepare_mount_target(target, mounts)
         self.run(["mount", "-t", kind, "-o", options, "--", source, str(target)], timeout=15)
 
     def mounts_phase(self):
