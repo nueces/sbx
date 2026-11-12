@@ -55,13 +55,27 @@ func (s *Stream) ReadFrame() ([]byte, error) {
 	if s.closed.Load() {
 		return nil, ErrClosed
 	}
-	if d, ok := s.rw.(deadlineReader); ok && s.timeout > 0 {
-		if err := d.SetReadDeadline(time.Now().Add(s.timeout)); err != nil {
-			return nil, fmt.Errorf("set read deadline: %w", err)
+	d, hasDeadline := s.rw.(deadlineReader)
+	if hasDeadline && s.timeout > 0 {
+		if err := d.SetReadDeadline(time.Time{}); err != nil {
+			return nil, fmt.Errorf("clear idle read deadline: %w", err)
 		}
 	}
 	var header [4]byte
-	if _, err := io.ReadFull(s.rw, header[:]); err != nil {
+	if _, err := io.ReadFull(s.rw, header[:1]); err != nil {
+		return nil, fmt.Errorf("read frame start: %w", err)
+	}
+	// Ordinary silence is healthy; only an in-progress frame has a deadline.
+	if hasDeadline && s.timeout > 0 {
+		if err := d.SetReadDeadline(time.Now().Add(s.timeout)); err != nil {
+			return nil, fmt.Errorf("set frame read deadline: %w", err)
+		}
+	}
+	if _, err := io.ReadFull(s.rw, header[1:]); err != nil {
+		s.rejected.Add(1)
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+		}
 		return nil, fmt.Errorf("read frame length: %w", err)
 	}
 	n := binary.BigEndian.Uint32(header[:])
@@ -72,6 +86,9 @@ func (s *Stream) ReadFrame() ([]byte, error) {
 	frame := make([]byte, n)
 	if _, err := io.ReadFull(s.rw, frame); err != nil {
 		s.rejected.Add(1)
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+		}
 		return nil, fmt.Errorf("read frame payload: %w", err)
 	}
 	s.read.Add(1)

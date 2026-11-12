@@ -229,7 +229,7 @@ def _landlock(paths: tuple[tuple[Path, bool], ...]) -> bool:
     return True
 
 
-def apply(confdir: Path, open_files: int) -> Status:
+def apply(confdir: Path, open_files: int, executable: Path) -> Status:
     """Apply controls that require no privilege; unsupported Linux Landlock is explicit."""
     _resource_limits(open_files)
     if sys.platform != "linux":
@@ -238,6 +238,7 @@ def apply(confdir: Path, open_files: int) -> Status:
     _prctl(_PR_SET_NO_NEW_PRIVS, 1)
     roots = (
         (confdir.parent, True),
+        (executable.parent, False),
         (Path(sys.executable).parent.parent, False),
         (Path(sys.prefix), False),
         (Path(sys.base_prefix), False),

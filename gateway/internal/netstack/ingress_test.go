@@ -2,6 +2,7 @@ package netstack
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -9,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -122,21 +124,159 @@ func TestIngressDevServerOAuthAndNotReady(t *testing.T) {
 
 func TestReplacementDiscardsQueuedIngressBeforeReadiness(t *testing.T) {
 	listener := tcpListener(t)
-	defer listener.Close()
-	client, err := net.Dial("tcp", listener.Addr().String())
+	forwarder := NewIngressForwarder(nil, []RegisteredIngress{{
+		Rule: ingressRule("dev", 3000), Listener: listener,
+	}}, NewFlowQuota(1), 1)
+	defer forwarder.Close()
+	clients := []net.Conn{}
+	for range 3 {
+		client, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+		clients = append(clients, client)
+	}
+	if err := forwarder.DiscardPending(); err != nil {
+		t.Fatal(err)
+	}
+	for _, client := range clients {
+		_ = client.SetReadDeadline(time.Now().Add(time.Second))
+		var data [1]byte
+		if n, err := client.Read(data[:]); n != 0 || (!errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET)) {
+			t.Fatalf("stale connection was not closed (timeouts are not closure): %v", err)
+		}
+	}
+	forwarder.dial = func(context.Context, config.Ingress) (net.Conn, error) {
+		host, guest := net.Pipe()
+		go func() { defer guest.Close(); _, _ = io.Copy(guest, guest) }()
+		return host, nil
+	}
+	forwarder.Start()
+	fresh, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	_ = fresh.SetDeadline(time.Now().Add(time.Second))
+	if _, err := fresh.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	var echoed [3]byte
+	if _, err := io.ReadFull(fresh, echoed[:]); err != nil || string(echoed[:]) != "new" {
+		t.Fatalf("fresh ingress failed after draining backlog: %q %v", echoed, err)
+	}
+}
+
+func TestDiscardPendingReportsClosedListener(t *testing.T) {
+	listener := tcpListener(t)
+	forwarder := NewIngressForwarder(nil, []RegisteredIngress{{Listener: listener}}, NewFlowQuota(1), 1)
+	defer forwarder.Close()
+	listener.Close()
+	if err := forwarder.DiscardPending(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("closed-listener drain failure was masked: %v", err)
+	}
+}
+
+func TestDiscardPendingEmptyBacklogDoesNotWait(t *testing.T) {
+	listener := tcpListener(t)
+	forwarder := NewIngressForwarder(nil, []RegisteredIngress{{Listener: listener}}, NewFlowQuota(1), 1)
+	defer forwarder.Close()
+	done := make(chan error, 1)
+	go func() { done <- forwarder.DiscardPending() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("empty ingress backlog blocked readiness")
+	}
+}
+
+type observedListener struct {
+	net.Listener
+	accepting chan struct{}
+}
+
+func (l *observedListener) Accept() (net.Conn, error) {
+	select {
+	case l.accepting <- struct{}{}:
+	default:
+	}
+	return l.Listener.Accept()
+}
+
+func TestIdleIngressDoesNotConsumeOutboundCapacity(t *testing.T) {
+	quota := NewFlowQuota(1)
+	listeners := []RegisteredIngress{}
+	for _, name := range []string{"ssh", "dev"} {
+		listener := &observedListener{tcpListener(t), make(chan struct{}, 1)}
+		listeners = append(listeners, RegisteredIngress{Rule: ingressRule(name, 22), Listener: listener})
+	}
+	forwarder := NewIngressForwarder(nil, listeners, quota, 2)
+	defer forwarder.Close()
+	forwarder.Start()
+	for _, item := range listeners {
+		select {
+		case <-item.Listener.(*observedListener).accepting:
+		case <-time.After(time.Second):
+			t.Fatal("idle listener never reached Accept")
+		}
+	}
+	outbound := &TCPForwarder{config: config.Config{Quotas: config.DefaultQuotas()}, total: quota, perDest: make(map[string]int)}
+	if !outbound.acquire("example.com") {
+		t.Fatal("idle ingress exhausted tcp_flows=1 outbound capacity")
+	}
+	outbound.release("example.com")
+	if quota.Active() != 0 || forwarder.Active() != 0 || len(forwarder.concurrent) != 0 {
+		t.Fatal("idle ingress consumed active flow capacity")
+	}
+}
+
+func TestIngressRejectsWhenOutboundOwnsTotalCapacity(t *testing.T) {
+	quota := NewFlowQuota(1)
+	if !quota.acquire() {
+		t.Fatal("could not reserve outbound flow")
+	}
+	defer quota.release()
+	listener := tcpListener(t)
+	forwarder := NewIngressForwarder(nil, []RegisteredIngress{{Rule: ingressRule("ssh", 22), Listener: listener}}, quota, 2)
+	forwarder.dial = func(context.Context, config.Ingress) (net.Conn, error) {
+		t.Error("exhausted ingress reached guest dial")
+		return nil, context.Canceled
+	}
+	defer forwarder.Close()
+	forwarder.Start()
+	client, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	forwarder := NewIngressForwarder(nil, []RegisteredIngress{{
-		Rule: ingressRule("dev", 3000), Listener: listener,
-	}}, NewFlowQuota(1), 1)
-
-	forwarder.DiscardPending()
-	_ = client.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	_ = client.SetReadDeadline(time.Now().Add(time.Second))
 	var data [1]byte
-	if n, err := client.Read(data[:]); n != 0 || err == nil {
-		t.Fatal("queued stale ingress survived replacement readiness")
+	_, err = client.Read(data[:])
+	if err != io.EOF {
+		t.Fatalf("exhausted ingress was not rejected: %v", err)
+	}
+	if quota.Active() != 1 || len(forwarder.concurrent) != 0 {
+		t.Fatal("rejected ingress leaked quota")
+	}
+}
+
+func TestIngressClosesConnectionThatCompletesAfterShutdown(t *testing.T) {
+	forwarder := NewIngressForwarder(nil, nil, NewFlowQuota(1), 1)
+	forwarder.Close()
+	host, peer := net.Pipe()
+	defer peer.Close()
+	forwarder.track(host, true)
+	_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+	var data [1]byte
+	if _, err := peer.Read(data[:]); err != io.EOF {
+		t.Fatalf("late connection survived shutdown: %v", err)
+	}
+	if len(forwarder.connections) != 0 {
+		t.Fatal("closed forwarder retained a late connection")
 	}
 }
 
@@ -166,6 +306,11 @@ func TestIngressQuotaAndWorkerLossAreBounded(t *testing.T) {
 	case <-started:
 		t.Fatal("ingress quota admitted a second flow")
 	case <-time.After(50 * time.Millisecond):
+	}
+	_ = second.SetReadDeadline(time.Now().Add(time.Second))
+	var data [1]byte
+	if _, err := second.Read(data[:]); err != io.EOF {
+		t.Fatalf("exhausted ingress was queued instead of rejected: %v", err)
 	}
 
 	done := make(chan struct{})

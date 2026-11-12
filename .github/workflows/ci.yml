@@ -28,22 +28,43 @@ jobs:
           go-version: "1.26.5"
           cache-dependency-path: gateway/go.sum
 
-      - name: Verify gateway artifacts and mediator lock
+      - name: Verify gateway artifacts and installed mediator
         run: |
           set -euo pipefail
           GO=go gateway/scripts/build_release_artifacts.sh
           git diff --exit-code -- src/sbx/gateway_runtime
-          uv sync --directory gateway/mediator --locked --no-build --no-dev --managed-python --python 3.12.13
-          uv audit --directory gateway/mediator --locked
+          UV_TOOL_DIR="$RUNNER_TEMP/sbx-tool" UV_TOOL_BIN_DIR="$RUNNER_TEMP/sbx-bin" \
+            uv tool install --from . sbx --python 3.12
+          "$RUNNER_TEMP/sbx-bin/sbx" --version
+          test -x "$RUNNER_TEMP/sbx-bin/mitmdump"
+          test -x "$RUNNER_TEMP/sbx-bin/mitmweb"
+          worker=$("$RUNNER_TEMP/sbx-tool/sbx/bin/python" -c \
+            'from sbx.gateway import GATEWAY_WORKER; print(GATEWAY_WORKER)')
+          test -x "$worker"
+          test "$("$worker" 2>&1 || true)" = "sbx-gateway: --config must be an absolute path"
+          uv sync --locked --no-build --no-dev --python 3.12
+          uv audit --locked
+          uv run --extra dev pytest --no-cov gateway/mediator
 
       - name: Run Go tests
         run: GOTOOLCHAIN=local go -C gateway test ./...
 
-      - name: Run explicit-TCG gateway checks
-        run: python gateway/scripts/test_tcg.py --help >/dev/null
-
       - name: Run tests
-        run: uv run --python 3.12 --extra dev pytest --no-cov
+        run: uv run --python 3.12 --extra dev pytest
+
+      - name: Install integration-test prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes qemu-system-x86
+
+      - name: Build integration-test guest
+        run: gateway/scripts/build_test_guest.sh
+
+      - name: Run integration tests
+        timeout-minutes: 10
+        env:
+          SBX_GATEWAY_BIN: ${{ github.workspace }}/src/sbx/gateway_runtime/bin/sbx-gateway-linux-amd64
+        run: uv run --python 3.12 --extra dev pytest --no-cov -s tests/integration
 
       - name: Run ruff
         run: uv run --python 3.12 --extra dev ruff check .

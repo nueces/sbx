@@ -18,7 +18,7 @@ import ctypes, os, resource, sys
 from pathlib import Path
 from hardening import apply
 confdir = Path(sys.argv[1]); confdir.mkdir(mode=0o700)
-status = apply(confdir, 128)
+status = apply(confdir, 128, Path(sys.executable))
 assert status.no_new_privs and status.seccomp and status.limits, status
 assert resource.getrlimit(resource.RLIMIT_CORE) == (0, 0)
 assert 'NoNewPrivs:\\t1' in Path('/proc/self/status').read_text()

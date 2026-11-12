@@ -5,7 +5,7 @@ import re
 import shlex
 import subprocess
 import sys
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, MutableMapping
 from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from datetime import UTC, datetime
 from pathlib import Path
@@ -115,11 +115,18 @@ def resolve_env_entries(entries: list[str]) -> dict[str, str | None]:
     return values
 
 
+def drop_stale_sudo_environment(env: MutableMapping[str, str]) -> None:
+    if os.geteuid() != 0:
+        for key in ("SUDO_USER", "SUDO_UID", "SUDO_GID", "SUDO_HOME", "SUDO_COMMAND"):
+            env.pop(key, None)
+
+
 def sanitize_forwarded_env(env: dict[str, str], allowed: list[str]) -> dict[str, str]:
     allowed_set = set(allowed)
     for key in FORWARDABLE_ENV_VARS:
         if key not in allowed_set:
             env.pop(key, None)
+    drop_stale_sudo_environment(env)
     return env
 
 
@@ -193,6 +200,18 @@ def open_guest(vm_id: str):
         vm = smolvm.facade.SmolVM.from_id(vm_id, ssh_key_path=str(private_key))
         cleanup.callback(vm.close)
         yield vm
+
+
+def sync_network_credentials(vm_id: str, values: dict[str, str]) -> None:
+    with open_guest(vm_id) as vm:
+        current = vm.info.config.env_vars
+        old_names = current.get("SBX_NETWORK_CREDENTIAL_NAMES", "").split(",")
+        if not values and not any(old_names):
+            return
+        vm.set_env_vars({**values, "SBX_NETWORK_CREDENTIAL_NAMES": ",".join(sorted(values))})
+        missing = [name for name in old_names if name and name not in values]
+        if missing:
+            vm.unset_env_vars(missing)
 
 
 def sync_forwarded_env(vm_id: str, env_values: Mapping[str, str | None], *, guest=None) -> None:

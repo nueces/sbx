@@ -13,7 +13,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ripgrep \
     sudo \
     htop \
+    isc-dhcp-client \
     && rm -rf /var/lib/apt/lists/*
+
+COPY scripts/sbx-gateway-network /etc/smolvm/network.sh
+RUN chmod 0755 /etc/smolvm/network.sh
 
 # Configure the NodeSource Node.js 22.x apt repository directly instead of
 # piping https://deb.nodesource.com/setup_22.x into bash.

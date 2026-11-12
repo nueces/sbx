@@ -92,6 +92,28 @@ func inheritedQEMUListener(fd int, path string) (net.Listener, error) {
 	return listener, nil
 }
 
+func prepareDNS(network *gatewaynet.Network, cfg config.Config, journal *os.File) (*syntheticdns.Resolver, error) {
+	resolver, err := syntheticdns.NewWithJournal(cfg, cfg.Quotas.DNSMappings, journal, cfg.VMID, cfg.Generation, cfg.Digest)
+	if err != nil {
+		return nil, err
+	}
+	for _, rule := range cfg.Rules {
+		if strings.Contains(rule.Host, "*") || net.ParseIP(rule.Host) != nil {
+			continue
+		}
+		if _, err := resolver.Resolve(rule.Host); err != nil {
+			return nil, fmt.Errorf("prime synthetic DNS: %w", err)
+		}
+	}
+	// Register every restored wildcard address before cached guest traffic can arrive.
+	for _, mapping := range resolver.Snapshot() {
+		if err := network.AddLocalAddress(net.ParseIP(mapping.IP)); err != nil {
+			return nil, fmt.Errorf("restore synthetic DNS address: %w", err)
+		}
+	}
+	return resolver, nil
+}
+
 func run() error {
 	socket := flag.String("socket", "", "controller-owned QEMU Unix socket path")
 	configPath := flag.String("config", "", "immutable worker JSON config")
@@ -104,6 +126,8 @@ func run() error {
 	mediatorAddress := flag.String("mediator-address", "", "per-VM mediator loopback endpoint")
 	capabilityKeyFD := flag.Int("capability-key-fd", -1, "inherited mediator capability key descriptor")
 	workerIncarnation := flag.String("worker-incarnation", "", "worker incarnation bound to mediator capabilities")
+	supervisorLifetimeFD := flag.Int("supervisor-lifetime-fd", -1, "inherited supervisor lifetime descriptor")
+	dnsStateFD := flag.Int("dns-state-fd", -1, "inherited per-generation synthetic DNS journal")
 	var ingressFDs stringFlags
 	flag.Var(&ingressFDs, "ingress-fd", "controller-owned VM/generation/rule=descriptor listener")
 	flag.Parse()
@@ -134,6 +158,9 @@ func run() error {
 	if *workerIncarnation == "" || *incarnationTokenFD < 3 {
 		return errors.New("worker incarnation authentication is required")
 	}
+	if *supervisorLifetimeFD < 3 {
+		return errors.New("supervisor lifetime descriptor is required")
+	}
 	tokenFile := os.NewFile(uintptr(*incarnationTokenFD), "worker-incarnation-token")
 	if tokenFile == nil {
 		return errors.New("invalid worker incarnation token descriptor")
@@ -149,6 +176,17 @@ func run() error {
 		return err
 	}
 	defer listener.Close()
+	lifetime := os.NewFile(uintptr(*supervisorLifetimeFD), "supervisor-lifetime")
+	if lifetime == nil {
+		return errors.New("invalid supervisor lifetime descriptor")
+	}
+	defer lifetime.Close()
+	lifetimeLost := make(chan struct{})
+	go func() {
+		io.Copy(io.Discard, lifetime)
+		close(lifetimeLost)
+		listener.Close()
+	}()
 	network, err := gatewaynet.New()
 	if err != nil {
 		return fmt.Errorf("netstack: %w", err)
@@ -161,20 +199,17 @@ func run() error {
 	totalFlows := gatewaynet.NewFlowQuota(cfg.Quotas.TCPFlows)
 	ingress := gatewaynet.NewIngressForwarder(network, registeredIngress, totalFlows, cfg.Quotas.IngressFlows)
 	defer ingress.Close()
-	resolver := syntheticdns.NewWithLimit(cfg, cfg.Quotas.DNSMappings)
-	primed := make(map[string]bool)
-	for _, rule := range cfg.Rules {
-		if primed[rule.Host] || strings.Contains(rule.Host, "*") || net.ParseIP(rule.Host) != nil {
-			continue
-		}
-		ip, resolveErr := resolver.Resolve(rule.Host)
-		if resolveErr != nil {
-			return fmt.Errorf("prime synthetic DNS: %w", resolveErr)
-		}
-		if err := network.AddLocalAddress(net.ParseIP(ip.String())); err != nil {
-			return fmt.Errorf("prime synthetic DNS address: %w", err)
-		}
-		primed[rule.Host] = true
+	if *dnsStateFD < 3 {
+		return errors.New("synthetic DNS journal descriptor is required")
+	}
+	journal := os.NewFile(uintptr(*dnsStateFD), "synthetic-dns-state")
+	if journal == nil {
+		return errors.New("invalid synthetic DNS journal descriptor")
+	}
+	defer journal.Close()
+	resolver, err := prepareDNS(network, cfg, journal)
+	if err != nil {
+		return fmt.Errorf("synthetic DNS state: %w", err)
 	}
 	var mediator *gatewaynet.Mediator
 	allowedPorts := make([]uint16, 0, len(cfg.Rules)+1)
@@ -254,13 +289,22 @@ func run() error {
 				return
 			}
 			network.Inject(frame)
+			var readinessErr error
 			networkReady.Do(func() {
-				ingress.DiscardPending()
+				if readinessErr = ingress.DiscardPending(); readinessErr != nil {
+					return
+				}
 				outputMu.Lock()
-				fmt.Fprintf(os.Stdout, "{\"status\":\"network-ready\",\"qemu_pid\":%d}\n", qemuPID)
+				_, readinessErr = fmt.Fprintf(os.Stdout, "{\"status\":\"network-ready\",\"qemu_pid\":%d}\n", qemuPID)
 				outputMu.Unlock()
-				ingress.Start()
+				if readinessErr == nil {
+					ingress.Start()
+				}
 			})
+			if readinessErr != nil {
+				errs <- fmt.Errorf("network readiness: %w", readinessErr)
+				return
+			}
 		}
 	}()
 	go func() {
@@ -280,6 +324,11 @@ func run() error {
 	defer ticker.Stop()
 	for {
 		select {
+		case <-lifetimeLost:
+			cancel()
+			return nil
+		case err = <-resolver.Errors():
+			return fmt.Errorf("synthetic DNS state failed: %w", err)
 		case err = <-errs:
 			cancel()
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {

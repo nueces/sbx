@@ -149,7 +149,7 @@ def main() -> int:
         "test_http1_streaming_redirect_reuse_and_absolute_uri",
         "test_http2_stream_authority_is_revalidated",
         "test_tls_sni_and_websocket_are_revalidated",
-        "test_package_auth_workload_and_negative_cases",
+        "test_request_and_response_header_limits_fail_closed",
     ]
     workload_counts = dict.fromkeys(workloads, 0)
     tm.MediatorIntegrationTests.setUpClass()

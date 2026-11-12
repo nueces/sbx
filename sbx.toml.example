@@ -45,10 +45,12 @@ git_config = true
 # Linux amd64 is tested. macOS artifacts exist but runtime is unverified.
 # [network]
 # default = "deny"
+# mitmweb = false  # Opt-in authenticated, read-only host-loopback metadata UI.
 #
-# [[network.http]]
+# [[network.policy]]
 # id = "pypi"
-# host = "pypi.org"
+# mode = "http-mediated"
+# hosts = ["pypi.org"]
 # ports = [443]
 # methods = ["GET", "HEAD"]
 #

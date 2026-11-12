@@ -11,6 +11,8 @@ import (
 
 const MaxMappings = 1024
 
+var ErrCapacity = errors.New("synthetic DNS capacity exhausted")
+
 type Policy interface {
 	AllowsHost(string) bool
 }
@@ -28,13 +30,14 @@ type Mapping struct {
 }
 
 type Resolver struct {
-	policy Policy
-	limit  int
-	mu     sync.Mutex
-	byName map[string]*entry
-	byIP   map[netip.Addr]*entry
-	next   uint32
-	clock  uint64
+	policy  Policy
+	limit   int
+	mu      sync.Mutex
+	byName  map[string]*entry
+	byIP    map[netip.Addr]*entry
+	next    uint32
+	clock   uint64
+	journal *journalState
 }
 
 func New(policy Policy) *Resolver { return NewWithLimit(policy, MaxMappings) }
@@ -66,7 +69,7 @@ func (r *Resolver) Restore(mappings []Mapping) error {
 	pool := netip.MustParsePrefix("198.18.0.0/15")
 	for index, mapping := range mappings {
 		ip, err := netip.ParseAddr(mapping.IP)
-		if err != nil || !pool.Contains(ip) || !r.policy.AllowsHost(mapping.Host) || byName[mapping.Host] != nil || byIP[ip] != nil {
+		if err != nil || !pool.Contains(ip) || mapping.Host != strings.ToLower(strings.TrimSuffix(mapping.Host, ".")) || !r.policy.AllowsHost(mapping.Host) || byName[mapping.Host] != nil || byIP[ip] != nil {
 			return errors.New("invalid synthetic DNS mapping")
 		}
 		item := &entry{host: mapping.Host, ip: ip, used: uint64(index + 1)}
@@ -109,31 +112,32 @@ func (r *Resolver) Resolve(host string) (netip.Addr, error) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.journal != nil && r.journal.failed != nil {
+		return netip.Addr{}, r.journal.failed
+	}
 	r.clock++
 	if item := r.byName[host]; item != nil {
 		item.used = r.clock
 		return item.ip, nil
 	}
-	var ip netip.Addr
+	// Guest/application caches may outlive the advertised TTL: never rebind an issued IP.
 	if len(r.byName) >= r.limit {
-		var oldest *entry
-		for _, item := range r.byName {
-			if item.active == 0 && (oldest == nil || item.used < oldest.used) {
-				oldest = item
-			}
-		}
-		if oldest == nil {
-			return netip.Addr{}, errors.New("synthetic DNS capacity exhausted")
-		}
-		delete(r.byName, oldest.host)
-		delete(r.byIP, oldest.ip)
-		ip = oldest.ip
+		return netip.Addr{}, ErrCapacity
 	}
-	if !ip.IsValid() {
-		r.next++
-		value := uint32(198)<<24 | uint32(18+(r.next>>16))<<16 | r.next&0xffff
+	var ip netip.Addr
+	next := r.next
+	for {
+		next++
+		value := uint32(198)<<24 | uint32(18+(next>>16))<<16 | next&0xffff
 		ip = netip.AddrFrom4([4]byte{byte(value >> 24), byte(value >> 16), byte(value >> 8), byte(value)})
+		if r.byIP[ip] == nil {
+			break
+		}
 	}
+	if err := r.persist(Mapping{Host: host, IP: ip.String()}); err != nil {
+		return netip.Addr{}, err
+	}
+	r.next = next
 	item := &entry{host: host, ip: ip, used: r.clock}
 	r.byName[host], r.byIP[ip] = item, item
 	return ip, nil
@@ -161,6 +165,9 @@ func (r *Resolver) Reply(query []byte) []byte {
 	ip, err := r.Resolve(name)
 	if err != nil {
 		response[3] = 0x85 // authoritative refusal
+		if errors.Is(err, ErrPersistence) {
+			response[3] = 0x82 // SERVFAIL; the worker also receives the fatal persistence error.
+		}
 		return response
 	}
 	binary.BigEndian.PutUint16(response[6:8], 1)

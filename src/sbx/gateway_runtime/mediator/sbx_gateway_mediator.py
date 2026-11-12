@@ -2,28 +2,38 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
+import posixpath
 import queue
 import re
-import selectors
-import subprocess
+import select
+import socket
+import struct
+import sys
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, NamedTuple
 from urllib.parse import unquote, urljoin, urlsplit
 
+from hardening import apply
 from mitmproxy import ctx, http, tls
 from mitmproxy.net.http import url
 from mitmproxy.proxy import server_hooks
 from mitmproxy.proxy.layers.modes import Socks5AuthData
+from mitmproxy.script import concurrent
 
 MAX_HEADER_BYTES = 64 * 1024
 MAX_HEADER_FIELDS = 100
@@ -33,13 +43,13 @@ MAX_RETAINED_TOTAL = 64 * 1024 * 1024
 MAX_WEBSOCKET_MESSAGE = 16 * 1024 * 1024
 MAX_HOOK_OUTPUT = 1024 * 1024
 MAX_HOOK_WORKERS = 8
-MAX_PROVIDER_OUTPUT = 64 * 1024
-MAX_PROVIDER_WORKERS = 8
 MAX_TLS_HANDSHAKES = 32
 MAX_TLS_CONTEXTS = 256
 TLS_CONTEXT_TTL = 10 * 60
-PROVIDER_TIMEOUT = 10
 HOOK_TIMEOUT = 1.0
+# Bound memory and backpressure, not URL fields; overflow terminates mediation visibly.
+MAX_AUDIT_EVENT_BYTES = 1 << 20
+AUDIT_WRITE_TIMEOUT = 1.0
 _IMMUTABLE_HEADERS = frozenset(
     {
         "connection",
@@ -75,6 +85,13 @@ def _normalize_host(value: str) -> str | None:
     if not _valid_field(host):
         return None
     return host
+
+
+def _destination_allowed(address: str) -> bool:
+    ip = ipaddress.ip_address(address)
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip.is_global and not ip.is_multicast and "%" not in address
 
 
 class CapabilityVerifier:
@@ -130,15 +147,6 @@ class CapabilityVerifier:
         return Admission(fields[1], fields[2], fields[3], fields[4], host, port, issued, expires)
 
 
-class PackageAuth(NamedTuple):
-    rule_id: str
-    host: str
-    port: int
-    path_prefix: str
-    username: str
-    placeholder: str
-
-
 class HookContext(NamedTuple):
     vm_id: str
     incarnation: str
@@ -167,18 +175,102 @@ class RequestPolicy(NamedTuple):
     methods: tuple[str, ...] = ()
     paths: tuple[str, ...] = ()
     hooks: tuple[str, ...] = ()
+    policy_id: str = ""
 
 
-class HeaderSecret(NamedTuple):
-    name: str
-    hosts: tuple[str, ...]
-    ports: tuple[int, ...]
+class HeaderCredential(NamedTuple):
+    credential: str
+    rule_id: str
     methods: tuple[str, ...]
-    path_prefix: str | None
+    paths: tuple[str, ...]
     header_name: str
-    header_template: str
+    header_format: str
+    header_value: str
     placeholder: str
-    value: str
+
+
+class BrokerClient:
+    def __init__(self, fd: int, incarnation: str) -> None:
+        self.socket = socket.socket(fileno=fd)
+        self.incarnation = incarnation
+        self.pending: dict[str, queue.Queue[dict[str, Any]]] = {}
+        self.lock = threading.Lock()
+        self.send_lock = threading.Lock()
+        self._closed = False
+        threading.Thread(target=self._read, daemon=True, name="sbx-broker-reader").start()
+
+    @staticmethod
+    def _exact(sock: socket.socket, size: int) -> bytes:
+        data = bytearray()
+        while len(data) < size:
+            chunk = sock.recv(size - len(data))
+            if not chunk:
+                raise EOFError
+            data.extend(chunk)
+        return bytes(data)
+
+    def _read(self) -> None:
+        try:
+            while True:
+                size = struct.unpack("!I", self._exact(self.socket, 4))[0]
+                if not 0 < size <= 64 * 1024:
+                    raise ValueError
+                response = json.loads(self._exact(self.socket, size))
+                request_id = response.get("request_id") if isinstance(response, dict) else None
+                with self.lock:
+                    result = self.pending.get(request_id)
+                if (
+                    result is None
+                    or response.get("version") != 1
+                    or response.get("incarnation") != self.incarnation
+                ):
+                    raise ValueError
+                result.put(response)
+        except Exception:
+            # Broken framing/transport is fatal; fail waiters and let supervision replace us.
+            with self.lock:
+                self._closed = True
+                pending = tuple(self.pending.values())
+                self.pending.clear()
+            self.socket.close()
+            for result in pending:
+                # This reader is the sole producer; do not block on an already delivered reply.
+                if not result.full():
+                    result.put_nowait({"error": "broker closed"})
+            print("sbx: credential broker channel failed; mediation stopped", file=sys.stderr)
+            ctx.master.shutdown()
+
+    def fetch(self, credential: str) -> str:
+        request_id = uuid.uuid4().hex
+        result: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
+        with self.lock:
+            if self._closed:
+                raise CredentialProviderError("credential broker unavailable")
+            self.pending[request_id] = result
+        request = json.dumps(
+            {
+                "version": 1,
+                "request_id": request_id,
+                "incarnation": self.incarnation,
+                "credential": credential,
+            },
+            separators=(",", ":"),
+        ).encode()
+        try:
+            with self.send_lock:
+                self.socket.sendall(struct.pack("!I", len(request)) + request)
+            response = result.get(timeout=10)
+        except (OSError, queue.Empty) as exc:
+            raise CredentialProviderError("credential broker unavailable") from exc
+        finally:
+            with self.lock:
+                self.pending.pop(request_id, None)
+        value = response.get("value")
+        if set(response) != {"version", "request_id", "incarnation", "value"} or not isinstance(
+            value, str
+        ):
+            raise CredentialProviderError("credential broker unavailable")
+        return value
 
 
 class HookFailure(RuntimeError):
@@ -199,166 +291,6 @@ BUILTIN_HOOKS = {
 
 class CredentialProviderError(RuntimeError):
     pass
-
-
-_PROVIDER_SLOTS = threading.BoundedSemaphore(MAX_PROVIDER_WORKERS)
-
-
-def _bounded_provider_run(
-    argv: list[str] | tuple[str, ...],
-    *,
-    text: bool,
-    capture_output: bool,
-    check: bool,
-    timeout: float,
-    env: Mapping[str, str],
-) -> subprocess.CompletedProcess[str]:
-    if not text or not capture_output or check:
-        raise ValueError("invalid bounded provider invocation")
-    process = subprocess.Popen(
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-        close_fds=True,
-    )
-    streams = {process.stdout: bytearray(), process.stderr: bytearray()}
-    selector = selectors.DefaultSelector()
-    for stream in streams:
-        assert stream is not None
-        os.set_blocking(stream.fileno(), False)
-        selector.register(stream, selectors.EVENT_READ)
-    deadline = time.monotonic() + timeout
-    try:
-        while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise subprocess.TimeoutExpired(argv, timeout)
-            for key, _ in selector.select(remaining):
-                chunk = os.read(key.fd, 8192)
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    continue
-                streams[key.fileobj].extend(chunk)
-                if sum(map(len, streams.values())) > MAX_PROVIDER_OUTPUT:
-                    raise CredentialProviderError("credential command returned oversized output")
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise subprocess.TimeoutExpired(argv, timeout)
-        return subprocess.CompletedProcess(
-            argv,
-            process.wait(timeout=remaining),
-            bytes(streams[process.stdout]).decode(errors="replace"),
-            bytes(streams[process.stderr]).decode(errors="replace"),
-        )
-    except BaseException:
-        process.kill()
-        process.wait()
-        raise
-    finally:
-        selector.close()
-        for stream in streams:
-            stream.close()
-
-
-def _provider_result(
-    runner: Callable[..., subprocess.CompletedProcess[str]], argv: list[str] | tuple[str, ...]
-) -> subprocess.CompletedProcess[str]:
-    if not _PROVIDER_SLOTS.acquire(blocking=False):
-        raise CredentialProviderError("credential provider capacity exhausted")
-    try:
-        result = runner(
-            argv,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=PROVIDER_TIMEOUT,
-            env={"HOME": os.environ.get("HOME", ""), "PATH": os.defpath, "TZ": "UTC"},
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise CredentialProviderError("credential command could not be started") from exc
-    finally:
-        _PROVIDER_SLOTS.release()
-    if len(result.stdout.encode()) + len(result.stderr.encode()) > MAX_PROVIDER_OUTPUT:
-        raise CredentialProviderError("credential command returned oversized output")
-    return result
-
-
-class CommandTokenProvider:
-    def __init__(
-        self,
-        argv: tuple[str, ...],
-        runner: Callable[..., subprocess.CompletedProcess[str]] = _bounded_provider_run,
-    ) -> None:
-        self._argv = argv
-        self._runner = runner
-
-    def get_token(self) -> str:
-        result = _provider_result(self._runner, self._argv)
-        if result.returncode != 0:
-            raise CredentialProviderError(
-                f"credential command failed{_diagnostic_suffix(result.stderr)}"
-            )
-        token = result.stdout.strip()
-        if not token:
-            raise CredentialProviderError("credential command returned an empty token")
-        return token
-
-
-class AwsCodeArtifactTokenProvider:
-    def __init__(
-        self,
-        *,
-        domain: str,
-        domain_owner: str,
-        region: str,
-        profile: str | None = None,
-        runner: Callable[..., subprocess.CompletedProcess[str]] = _bounded_provider_run,
-        clock: Callable[[], float] = time.time,
-    ) -> None:
-        self._argv = ["aws"]
-        if profile:
-            self._argv.extend(("--profile", profile))
-        self._argv.extend(
-            (
-                "codeartifact",
-                "get-authorization-token",
-                "--domain",
-                domain,
-                "--domain-owner",
-                domain_owner,
-                "--region",
-                region,
-                "--output",
-                "json",
-            )
-        )
-        self._runner = runner
-        self._clock = clock
-        self._cached: tuple[str, float] | None = None
-        self._lock = threading.Lock()
-
-    def get_token(self) -> str:
-        with self._lock:
-            if self._cached is not None and self._cached[1] - self._clock() > 60:
-                return self._cached[0]
-            result = _provider_result(self._runner, self._argv)
-            if result.returncode != 0:
-                raise CredentialProviderError(
-                    f"aws CodeArtifact token refresh failed{_diagnostic_suffix(result.stderr)}"
-                )
-            try:
-                payload = json.loads(result.stdout)
-                token = payload["authorizationToken"].strip()
-                expires = _expiration(payload["expiration"])
-            except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-                raise CredentialProviderError(
-                    "aws CodeArtifact returned an invalid response"
-                ) from exc
-            if not token or expires is None:
-                raise CredentialProviderError("aws CodeArtifact returned an invalid response")
-            self._cached = token, expires
-            return token
 
 
 class RetainedBufferBudget:
@@ -387,13 +319,15 @@ class GatewayAddon:
         self,
         verifier: CapabilityVerifier,
         ready_fd: int | None = None,
-        package_auth: PackageAuth | None = None,
-        get_real_token: Callable[[], str] | None = None,
         *,
         policies: tuple[RequestPolicy, ...] = (),
-        secrets: tuple[HeaderSecret, ...] = (),
+        credentials: tuple[HeaderCredential, ...] = (),
+        broker: BrokerClient | None = None,
         hooks: Mapping[str, Hook] = BUILTIN_HOOKS,
         hook_timeout: float = HOOK_TIMEOUT,
+        audit_fd: int | None = None,
+        audit_ack_fd: int | None = None,
+        generation: str = "unknown",
     ) -> None:
         if not 0 < hook_timeout <= HOOK_TIMEOUT:
             raise ValueError("hook timeout must be positive and at most one second")
@@ -410,16 +344,25 @@ class GatewayAddon:
             raise ValueError("mediator policy names an unavailable hook")
         self._verifier = verifier
         self._ready_fd = ready_fd
-        self._package_auth = package_auth
-        self._get_real_token = get_real_token
+        self._audit_fd = audit_fd
+        self._audit_ack_fd = audit_ack_fd
+        self._audit_failed = False
+        self._audit_lock = threading.Lock()
+        self._generation = generation
+        if audit_fd is not None:
+            os.set_blocking(audit_fd, False)
+        if audit_ack_fd is not None:
+            os.set_blocking(audit_ack_fd, False)
         self._policies = {policy.rule_id: policy for policy in policies}
-        self._secrets = secrets
+        self._credentials = credentials
+        self._broker = broker
         self._hooks = dict(hooks)
         self._hook_timeout = hook_timeout
         self._hook_slots = threading.BoundedSemaphore(MAX_HOOK_WORKERS)
         self._admissions: dict[str, Admission] = {}
         self._invalid_tls: set[str] = set()
         self._active: set[str] = set()
+        self._active_lock = threading.Lock()
         self._handshakes: set[str] = set()
         self._tls_contexts: OrderedDict[str, float] = OrderedDict()
         self._certstore: Any | None = None
@@ -446,6 +389,11 @@ class GatewayAddon:
                     "vm_id": vm_id,
                     "incarnation": incarnation,
                     "hardening": os.environ.get("SBX_GATEWAY_HARDENING", "unavailable"),
+                    **(
+                        {"web_port": ctx.options.web_port}
+                        if hasattr(ctx.master, "gateway_snapshot")
+                        else {}
+                    ),
                 }
             ).encode()
             + b"\n"
@@ -467,16 +415,39 @@ class GatewayAddon:
             self._admissions[data.client_conn.id] = admission
             data.client_conn.sbx_admission = admission
 
-    def server_connect(self, data: server_hooks.ServerConnectionHookData) -> None:
+    async def server_connect(self, data: server_hooks.ServerConnectionHookData) -> None:
+        if data.server.error is not None:
+            return
         admission = self._admissions.get(data.client.id)
         address = data.server.address
+        # Addon exceptions alone do not stop mitmproxy from connecting.
+        data.server.error = "destination_denied"
         if (
             admission is None
             or address is None
             or _normalize_host(address[0]) != admission.host
             or address[1] != admission.port
         ):
-            data.server.error = "sbx gateway denied destination"
+            return
+        try:
+            answers = await asyncio.wait_for(
+                asyncio.get_running_loop().getaddrinfo(
+                    admission.host, admission.port, type=socket.SOCK_STREAM
+                ),
+                timeout=HOOK_TIMEOUT,
+            )
+        except (OSError, TimeoutError):
+            # DNS failures are translated only at this fail-closed connection boundary.
+            data.server.error = "destination_dns_failed"
+            return
+        data.server.error = "destination_ip_denied"
+        if not answers or not all(_destination_allowed(answer[4][0]) for answer in answers):
+            return
+        # Keep TLS identity logical while the connector receives only a validated numeric IP.
+        data.server.sni = data.server.sni or admission.host
+        selected = min(answers, key=lambda answer: answer[0] != socket.AF_INET)
+        data.server.address = (selected[4][0], admission.port)
+        data.server.error = None
 
     def tls_clienthello(self, data: tls.ClientHelloData) -> None:
         client_id = data.context.client.id
@@ -494,8 +465,7 @@ class GatewayAddon:
         now = time.monotonic()
         expired = False
         while (
-            self._tls_contexts
-            and next(iter(self._tls_contexts.values())) <= now - TLS_CONTEXT_TTL
+            self._tls_contexts and next(iter(self._tls_contexts.values())) <= now - TLS_CONTEXT_TTL
         ):
             self._tls_contexts.popitem(last=False)
             expired = True
@@ -514,55 +484,61 @@ class GatewayAddon:
         self._handshakes.discard(data.context.client.id)
 
     def requestheaders(self, flow: http.HTTPFlow) -> None:
+        flow.metadata["sbx_request"] = self._request_details(flow)
+        if flow.is_replay:
+            self._deny(flow, 403, b"sbx gateway denied replay")
+            return
         admission = self._admissions.get(flow.client_conn.id)
         policy = self._authorize(flow, admission)
         if admission is None or policy is None or flow.client_conn.id in self._invalid_tls:
             self._deny(flow, 403, b"sbx gateway denied destination")
             return
+        flow.metadata["sbx_policy"] = policy.policy_id or policy.rule_id
         if not self._headers_valid(flow.request):
             self._deny(flow, 431, b"sbx gateway rejected request headers")
             return
-        if len(self._active) >= MAX_ACTIVE_REQUESTS and flow.id not in self._active:
+        with self._active_lock:
+            full = flow.id not in self._active and len(self._active) >= MAX_ACTIVE_REQUESTS
+            if not full:
+                self._active.add(flow.id)
+        if full:
             self._deny(flow, 503, b"sbx gateway request capacity exhausted")
             return
-        if not self._run_header_hooks(flow, admission, policy, request=True):
-            return
-        if self._authorize(flow, admission) is None:
-            self._deny(flow, 403, b"sbx gateway denied destination")
-            return
-        if self._package_auth is not None and admission.rule_id == self._package_auth.rule_id:
-            if not self._package_request_matches(flow.request, admission):
-                self._deny(flow, 403, b"sbx gateway denied package authorization")
+        prepared = False
+        try:
+            if not self._run_header_hooks(flow, admission, policy, request=True):
                 return
-            parsed = _parse_basic_authorization(flow.request.headers.get("Authorization"))
-            if parsed != (self._package_auth.username, self._package_auth.placeholder):
-                self._deny(flow, 403, b"sbx gateway denied package authorization")
+            if self._authorize(flow, admission) is None:
+                self._deny(flow, 403, b"sbx gateway denied destination")
                 return
-            if self._get_real_token is None or self._authorize(flow, admission) is None:
-                self._deny(flow, 503, b"sbx gateway credential provider unavailable")
+            if not self._substitute_credentials(flow, admission):
                 return
-            try:
-                token = self._get_real_token()
-            except CredentialProviderError:
-                self._deny(flow, 503, b"sbx gateway credential provider failed")
+            if self._authorize(flow, admission) is None or not self._headers_valid(flow.request):
+                self._deny(flow, 403, b"sbx gateway denied destination")
                 return
-            flow.request.headers["Authorization"] = _basic_authorization(
-                self._package_auth.username, token
-            )
-        if not self._substitute_secrets(flow, admission):
-            return
-        if self._authorize(flow, admission) is None or not self._headers_valid(flow.request):
-            self._deny(flow, 403, b"sbx gateway denied destination")
-            return
-        self._active.add(flow.id)
-        flow.request.stream = self._body_stream(flow, admission, policy, request=True)
+            if not flow.metadata.get("sbx_admitted"):
+                self._audit(flow, admitted=True)
+                flow.metadata["sbx_admitted"] = True
+            flow.request.stream = self._body_stream(flow, admission, policy, request=True)
+            prepared = True
+        except Exception:
+            # Addon exceptions are otherwise logged and ignored: kill before propagating.
+            if flow.killable:
+                flow.kill()
+            raise
+        finally:
+            if not prepared:
+                self._release_request(flow)
 
     def responseheaders(self, flow: http.HTTPFlow) -> None:
-        if flow.id not in self._active:
+        with self._active_lock:
+            active = flow.id in self._active
+        if not active:
             return
         admission = self._admissions.get(flow.client_conn.id)
         policy = self._authorize(flow, admission)
         if flow.response is None or admission is None or policy is None:
+            self._release_request(flow)
             if flow.response is not None:
                 self._deny(flow, 502, b"sbx gateway denied destination")
             return
@@ -586,6 +562,9 @@ class GatewayAddon:
         message = (
             flow.websocket.messages[-1] if flow.websocket and flow.websocket.messages else None
         )
+        if flow.websocket is not None:
+            # The relay holds the current message independently; retain no forwarded history.
+            flow.websocket.messages.clear()
         if (
             admission is None
             or not self._request_matches(flow.request, admission)
@@ -794,34 +773,60 @@ class GatewayAddon:
                 return None
         return output
 
-    def _substitute_secrets(self, flow: http.HTTPFlow, admission: Admission) -> bool:
+    def _substitute_credentials(self, flow: http.HTTPFlow, admission: Admission) -> bool:
         matches = [
-            secret
-            for secret in self._secrets
-            if flow.request.scheme == "https"
-            and admission.host in secret.hosts
-            and admission.port in secret.ports
-            and (not secret.methods or flow.request.method.upper() in secret.methods)
+            binding
+            for binding in self._credentials
+            if binding.rule_id == admission.rule_id
+            and flow.request.scheme == "https"
+            and (not binding.methods or flow.request.method.upper() in binding.methods)
             and (
-                secret.path_prefix is None or _path_is_scoped(flow.request.path, secret.path_prefix)
+                not binding.paths
+                or any(_path_is_scoped(flow.request.path, path) for path in binding.paths)
             )
         ]
-        if len({secret.header_name.lower() for secret in matches}) != len(matches):
-            self._deny(flow, 403, b"sbx gateway denied ambiguous secret binding")
+        known = {binding.placeholder for binding in self._credentials}
+        authorized = {(binding.header_name.lower(), binding.placeholder) for binding in matches}
+        inspected = {
+            binding.header_name.lower()
+            for binding in self._credentials
+            if binding.header_name.lower() in flow.request.headers
+        }
+        if any(
+            placeholder in value and (name, placeholder) not in authorized
+            for name in inspected
+            for value in flow.request.headers.get_all(name)
+            for placeholder in known
+        ):
+            self._deny(flow, 403, b"sbx gateway denied credential use")
             return False
-        for secret in matches:
-            if self._authorize(flow, admission) is None:
-                self._deny(flow, 403, b"sbx gateway denied destination")
+        for binding in matches:
+            values = flow.request.headers.get_all(binding.header_name)
+            if binding.header_format == "template":
+                expected = binding.header_value.replace("{placeholder}", binding.placeholder)
+                valid = values == [expected]
+            else:
+                valid = len(values) == 1 and _parse_basic_authorization(values[0]) == (
+                    binding.header_value,
+                    binding.placeholder,
+                )
+            if not valid or self._broker is None or self._authorize(flow, admission) is None:
+                self._deny(flow, 403, b"sbx gateway denied credential substitution")
                 return False
-            expected = secret.header_template.replace("{placeholder}", secret.placeholder)
-            if flow.request.headers.get(secret.header_name) != expected:
-                self._deny(flow, 403, b"sbx gateway denied secret substitution")
-                return False
-            replacement = secret.header_template.replace("{placeholder}", secret.value)
-            if not _valid_header_value(replacement):
+            try:
+                value = self._broker.fetch(binding.credential)
+            except CredentialProviderError:
                 self._deny(flow, 503, b"sbx gateway credential provider failed")
                 return False
-            flow.request.headers[secret.header_name] = replacement
+            rendered = (
+                binding.header_value.replace("{placeholder}", value)
+                if binding.header_format == "template"
+                else _basic_authorization(binding.header_value, value)
+            )
+            if not _valid_header_value(rendered):
+                self._deny(flow, 503, b"sbx gateway credential provider failed")
+                return False
+            flow.request.headers[binding.header_name] = rendered
         return True
 
     def _response_destination_allowed(self, flow: http.HTTPFlow, admission: Admission) -> bool:
@@ -831,13 +836,7 @@ class GatewayAddon:
             or "location" not in flow.response.headers
         ):
             return True
-        if not self._redirect_matches(flow, admission):
-            return False
-        return not (
-            self._package_auth is not None
-            and admission.rule_id == self._package_auth.rule_id
-            and not self._package_redirect_matches(flow)
-        )
+        return self._redirect_matches(flow, admission)
 
     @staticmethod
     def _immutable_headers(headers: http.Headers) -> tuple[tuple[str, tuple[str, ...]], ...]:
@@ -853,20 +852,153 @@ class GatewayAddon:
             )
         )
 
-    def _finish(self, flow: http.HTTPFlow) -> None:
-        self._active.discard(flow.id)
-        self.retained.release(f"{flow.id}:request")
-        self.retained.release(f"{flow.id}:response")
-
     @staticmethod
-    def _deny(flow: http.HTTPFlow, status: int, body: bytes) -> None:
+    def _request_details(flow: http.HTTPFlow) -> dict[str, Any]:
+        target = flow.request.path
+        return {
+            "url": flow.request.url,
+            "request_target": target,
+            "path": target.split("?", 1)[0].split("#", 1)[0],
+            "method": flow.request.method,
+            "host": flow.request.host,
+            "port": flow.request.port,
+            "scheme": flow.request.scheme,
+            "authority": flow.request.authority or flow.request.host_header or "",
+        }
+
+    def _write_audit(self, encoded: bytes, acknowledgement: dict | None = None) -> None:
+        if self._audit_fd is None:
+            return
+        try:
+            if self._audit_failed:
+                raise OSError("audit transport failed")
+            if len(encoded) > MAX_AUDIT_EVENT_BYTES:
+                raise OSError("audit event exceeds transport memory limit")
+            deadline = time.monotonic() + AUDIT_WRITE_TIMEOUT
+            if not self._audit_lock.acquire(timeout=AUDIT_WRITE_TIMEOUT):
+                raise OSError("audit transport busy")
+            try:
+                if self._audit_failed:
+                    raise OSError("audit transport failed")
+                if acknowledgement is not None and self._audit_ack_fd is None:
+                    raise OSError("audit acknowledgement unavailable")
+                remaining = memoryview(encoded)
+                while remaining:
+                    timeout = deadline - time.monotonic()
+                    if timeout <= 0 or not select.select([], [self._audit_fd], [], timeout)[1]:
+                        raise OSError("audit transport timed out")
+                    try:
+                        written = os.write(self._audit_fd, remaining)
+                    except BlockingIOError:
+                        continue
+                    if written <= 0:
+                        raise OSError("audit transport closed")
+                    remaining = remaining[written:]
+                if acknowledgement is not None:
+                    reply = bytearray()
+                    while b"\n" not in reply:
+                        timeout = deadline - time.monotonic()
+                        if (
+                            timeout <= 0
+                            or not select.select([self._audit_ack_fd], [], [], timeout)[0]
+                        ):
+                            raise OSError("audit acknowledgement timed out")
+                        try:
+                            chunk = os.read(self._audit_ack_fd, 4097 - len(reply))
+                        except BlockingIOError:
+                            continue
+                        if not chunk:
+                            raise OSError("audit acknowledgement closed")
+                        reply.extend(chunk)
+                        if len(reply) > 4096:
+                            raise OSError("audit acknowledgement oversized")
+                    if reply.count(b"\n") != 1 or not reply.endswith(b"\n"):
+                        raise OSError("audit acknowledgement malformed")
+                    if json.loads(reply) != acknowledgement:
+                        raise OSError("audit acknowledgement mismatch")
+            except (OSError, ValueError):
+                self._audit_failed = True
+                raise
+            finally:
+                self._audit_lock.release()
+        except (OSError, ValueError) as exc:
+            self._audit_failed = True
+            with suppress(OSError):
+                os.write(self._audit_fd, b'{"version":1,"audit_error":"delivery_failed"}\n')
+            master = getattr(ctx, "master", None)
+            if master is not None:
+                master.shutdown()
+            raise RuntimeError("gateway audit delivery failed; mediation stopped") from exc
+
+    def _audit(self, flow: http.HTTPFlow, *, admitted: bool = False) -> None:
+        if not admitted:
+            if flow.metadata.get("sbx_audited"):
+                return
+            flow.metadata["sbx_audited"] = True
+        reason = flow.metadata.get("sbx_reason", "upstream_error" if flow.error else "allowed")
+        details = flow.metadata.get("sbx_request") or self._request_details(flow)
+        event = {
+            "version": 2,
+            "event": "admitted" if admitted else "outcome",
+            "request_id": flow.id,
+            "timestamp": datetime.now(UTC).isoformat(),
+            "generation": self._generation,
+            "incarnation": self._verifier.identity[1],
+            **details,
+            "canonical_path": _normalized_path(details["request_target"]),
+            "policy": flow.metadata.get("sbx_policy"),
+            "status": flow.response.status_code if flow.response else 0,
+            "outcome": "admitted"
+            if admitted
+            else (
+                "error"
+                if flow.error or str(reason).endswith("failed")
+                else ("forwarded" if reason == "allowed" else "denied")
+            ),
+            "reason": reason,
+        }
+        for key, text in event.items():
+            if isinstance(text, str):
+                for credential in self._credentials:
+                    text = text.replace(credential.placeholder, "[redacted]")
+                event[key] = text
+        encoded = (json.dumps(event, ensure_ascii=True, separators=(",", ":")) + "\n").encode()
+        acknowledgement = (
+            {key: event[key] for key in ("version", "generation", "incarnation", "request_id")}
+            if admitted
+            else None
+        )
+        self._write_audit(encoded, acknowledgement)
+        snapshot = getattr(getattr(ctx, "master", None), "gateway_snapshot", None)
+        if snapshot is not None and not admitted:
+            ctx.master.event_loop.call_soon_threadsafe(snapshot, event)
+
+    def _release_request(self, flow: http.HTTPFlow) -> None:
+        with self._active_lock:
+            self._active.discard(flow.id)
+
+    def _finish(self, flow: http.HTTPFlow) -> None:
+        try:
+            self._audit(flow)
+        finally:
+            self._release_request(flow)
+            self.retained.release(f"{flow.id}:request")
+            self.retained.release(f"{flow.id}:response")
+
+    def _deny(self, flow: http.HTTPFlow, status: int, body: bytes) -> None:
+        self._release_request(flow)
+        flow.metadata["sbx_reason"] = (
+            body.decode("ascii").removeprefix("sbx gateway ").replace(" ", "_")
+        )
         if flow.response is None:
-            flow.response = http.Response.make(status, body, {"content-type": "text/plain"})
+            flow.response = http.Response.make(status, b"", {"content-type": "text/plain"})
             return
         flow.response.status_code = status
         flow.response.reason = ""
         flow.response.headers.clear()
+        flow.response.headers["content-type"] = "text/plain"
         flow.response.headers["content-length"] = "0"
+        flow.response.content = b""
         flow.response.stream = lambda _: b""
 
     @staticmethod
@@ -902,39 +1034,14 @@ class GatewayAddon:
                 return False
         return True
 
-    def _package_request_matches(self, request: http.Request, admission: Admission) -> bool:
-        package_auth = self._package_auth
-        assert package_auth is not None
-        return (
-            admission.host == package_auth.host
-            and admission.port == package_auth.port
-            and request.scheme == "https"
-            and _path_is_scoped(request.path, package_auth.path_prefix)
-        )
-
-    def _package_redirect_matches(self, flow: http.HTTPFlow) -> bool:
-        package_auth = self._package_auth
-        assert package_auth is not None and flow.response is not None
-        try:
-            target = urlsplit(urljoin(flow.request.pretty_url, flow.response.headers["location"]))
-            port = target.port or (443 if target.scheme == "https" else 80)
-        except ValueError:
-            return False
-        return (
-            target.scheme == "https"
-            and _normalize_host(target.hostname or "") == package_auth.host
-            and port == package_auth.port
-            and _path_is_scoped(target.path, package_auth.path_prefix)
-        )
-
-    @staticmethod
-    def _redirect_matches(flow: http.HTTPFlow, admission: Admission) -> bool:
+    def _redirect_matches(self, flow: http.HTTPFlow, admission: Admission) -> bool:
         assert flow.response is not None
         try:
             target = urlsplit(urljoin(flow.request.pretty_url, flow.response.headers["location"]))
             port = target.port or (443 if target.scheme == "https" else 80)
         except ValueError:
             return False
+        policy = self._policies.get(admission.rule_id)
         return (
             target.scheme in {"http", "https"}
             and target.username is None
@@ -942,6 +1049,11 @@ class GatewayAddon:
             and _normalize_host(target.hostname or "") == admission.host
             and port == admission.port
             and target.scheme == flow.request.scheme
+            and (
+                policy is None
+                or not policy.paths
+                or any(_path_is_scoped(target.path, path) for path in policy.paths)
+            )
         )
 
     @staticmethod
@@ -969,15 +1081,23 @@ def _normalized_path(value: str) -> str:
     try:
         path = urlsplit(value).path
         for _ in range(4):
-            decoded = unquote(path)
+            if re.search(r"%(?![0-9A-Fa-f]{2})", path):
+                return ""
+            decoded = unquote(path, errors="strict")
             if decoded == path:
                 break
             path = decoded
         else:
             return ""
-    except ValueError:
+    except (UnicodeDecodeError, ValueError):
         return ""
-    return path if not any(part in {".", ".."} for part in path.split("/")) else ""
+    if (
+        "\\" in path
+        or any(ord(character) < 32 or ord(character) == 127 for character in path)
+        or any(part in {".", ".."} for part in path.split("/"))
+    ):
+        return ""
+    return posixpath.normpath(path)
 
 
 def _path_is_scoped(value: str, prefix: str) -> bool:
@@ -1031,40 +1151,20 @@ def _parse_basic_authorization(value: str | None) -> tuple[str, str] | None:
     return (username, password) if separator else None
 
 
-def _expiration(value: Any) -> float | None:
-    if isinstance(value, int | float):
-        return float(value)
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed.timestamp()
-
-
-def _diagnostic_suffix(stderr: str) -> str:
-    text = re.sub(r"(?i)(authorization(?:token)?\s*[=:]\s*)\S+", r"\1REDACTED", stderr.strip())
-    text = re.sub(r"(https://[^\s:]+:)[^@\s]+@", r"\1REDACTED@", text)
-    return f": {text[:1000]}" if text else ""
-
-
-def load_policy(fd: int) -> tuple[tuple[RequestPolicy, ...], tuple[HeaderSecret, ...]]:
+def load_policy(fd: int) -> tuple[tuple[RequestPolicy, ...], tuple[HeaderCredential, ...]]:
     with os.fdopen(fd, "rb") as source:
         raw = source.read(65537)
     if len(raw) > 65536:
         raise ValueError("mediator policy is too large")
     try:
         payload = json.loads(raw)
-        if set(payload) != {"version", "rules", "secrets"} or payload["version"] != 1:
+        if set(payload) != {"version", "rules", "credentials"} or payload["version"] != 2:
             raise ValueError
-        if not isinstance(payload["rules"], list) or not isinstance(payload["secrets"], list):
+        if not isinstance(payload["rules"], list) or not isinstance(payload["credentials"], list):
             raise ValueError
         policies = []
         for item in payload["rules"]:
-            if not isinstance(item, dict) or set(item) != {
+            if not isinstance(item, dict) or set(item) - {"policy"} != {
                 "id",
                 "host",
                 "ports",
@@ -1085,67 +1185,69 @@ def load_policy(fd: int) -> tuple[tuple[RequestPolicy, ...], tuple[HeaderSecret,
                 or not all(name in BUILTIN_HOOKS for name in hooks)
             ):
                 raise ValueError
-            policies.append(RequestPolicy(item["id"], host, ports, methods, paths, tuple(hooks)))
-        secrets = []
-        for item in payload["secrets"]:
+            policy_id = item.get("policy", item["id"])
+            if not _valid_field(policy_id):
+                raise ValueError
+            policies.append(
+                RequestPolicy(item["id"], host, ports, methods, paths, tuple(hooks), policy_id)
+            )
+        credentials = []
+        for item in payload["credentials"]:
             if not isinstance(item, dict) or set(item) != {
-                "name",
-                "hosts",
-                "ports",
+                "credential",
+                "rule_id",
                 "methods",
-                "path_prefix",
+                "paths",
                 "header",
                 "placeholder",
-                "value",
             }:
                 raise ValueError
-            hosts = tuple(_normalize_policy_host(host, exact=True) for host in item["hosts"])
-            ports = _policy_ports(item["ports"])
             methods = _policy_methods(item["methods"])
-            path_prefix = item["path_prefix"]
-            if path_prefix is not None:
-                path_prefix = _policy_paths([path_prefix])[0]
+            paths = _policy_paths(item["paths"])
             header = item["header"]
             placeholder = item["placeholder"]
-            value = item["value"]
             if (
-                not _valid_field(item["name"])
-                or not isinstance(header, str)
-                or header.count("{placeholder}") != 1
-                or ":" not in header
+                not _valid_field(item["credential"])
+                or not _valid_field(item["rule_id"])
                 or not isinstance(placeholder, str)
-                or not placeholder.startswith("SBX_SECRET_")
                 or len(placeholder) < 32
                 or not _valid_field(placeholder)
-                or not isinstance(value, str)
-                or not value
+                or not isinstance(header, dict)
             ):
                 raise ValueError
-            header_name, template = (part.strip() for part in header.split(":", 1))
-            if (
-                re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", header_name) is None
-                or not _valid_header_value(template.replace("{placeholder}", placeholder))
-                or not _valid_header_value(template.replace("{placeholder}", value))
-            ):
+            name = header.get("name")
+            kind = header.get("format")
+            if not isinstance(name, str) or not _valid_header_name(name.encode()):
                 raise ValueError
-            secrets.append(
-                HeaderSecret(
-                    item["name"],
-                    hosts,
-                    ports,
+            if kind == "template" and set(header) == {"name", "format", "value"}:
+                value = header["value"]
+                if (
+                    not isinstance(value, str)
+                    or value.count("{placeholder}") != 1
+                    or not _valid_header_value(value.replace("{placeholder}", placeholder))
+                ):
+                    raise ValueError
+            elif kind == "basic-password" and set(header) == {"name", "format", "username"}:
+                value = header["username"]
+                if not isinstance(value, str) or not value or any(c in value for c in ":\r\n\0"):
+                    raise ValueError
+            else:
+                raise ValueError
+            credentials.append(
+                HeaderCredential(
+                    item["credential"],
+                    item["rule_id"],
                     methods,
-                    path_prefix,
-                    header_name,
-                    template,
-                    placeholder,
+                    paths,
+                    name,
+                    kind,
                     value,
+                    placeholder,
                 )
             )
-        if len({policy.rule_id for policy in policies}) != len(policies) or len(
-            {secret.name for secret in secrets}
-        ) != len(secrets):
+        if len({policy.rule_id for policy in policies}) != len(policies):
             raise ValueError
-        return tuple(policies), tuple(secrets)
+        return tuple(policies), tuple(credentials)
     except (AttributeError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise ValueError("invalid mediator policy") from exc
 
@@ -1207,128 +1309,49 @@ def _policy_paths(value: object) -> tuple[str, ...]:
     return tuple(value)
 
 
-def load_package_auth(fd: int) -> tuple[PackageAuth, Callable[[], str]]:
-    with os.fdopen(fd, "rb") as source:
-        raw = source.read(65537)
-    if len(raw) > 65536:
-        raise ValueError("package-auth configuration is too large")
-    try:
-        payload = json.loads(raw)
-        if (
-            set(payload)
-            != {
-                "version",
-                "rule_id",
-                "host",
-                "port",
-                "path_prefix",
-                "username",
-                "placeholder",
-                "provider",
-            }
-            or payload["version"] != 1
-        ):
-            raise ValueError
-        host = _normalize_host(payload["host"])
-        port = payload["port"]
-        path_prefix = payload["path_prefix"]
-        placeholder = payload["placeholder"]
-        if (
-            host is None
-            or host != payload["host"]
-            or type(port) is not int
-            or not 0 < port <= 65535
-            or not isinstance(path_prefix, str)
-            or path_prefix == "/"
-            or not path_prefix.startswith("/")
-            or not path_prefix.endswith("/")
-            or ".." in path_prefix.split("/")
-            or "?" in path_prefix
-            or "#" in path_prefix
-            or not isinstance(placeholder, str)
-            or not placeholder.startswith("SBX_SECRET_")
-            or len(placeholder) < 32
-            or not _valid_field(placeholder)
-        ):
-            raise ValueError
-        for name in ("rule_id", "username"):
-            if not isinstance(payload[name], str) or not _valid_field(payload[name]):
-                raise ValueError
-        provider = payload["provider"]
-        if not isinstance(provider, dict) or "type" not in provider:
-            raise ValueError
-        if provider["type"] == "command" and set(provider) == {"type", "argv"}:
-            argv = provider["argv"]
-            if (
-                not isinstance(argv, list)
-                or not argv
-                or not all(isinstance(item, str) and item for item in argv)
-            ):
-                raise ValueError
-            token_provider: CommandTokenProvider | AwsCodeArtifactTokenProvider = (
-                CommandTokenProvider(tuple(argv))
-            )
-        elif (
-            provider["type"] == "aws-codeartifact"
-            and set(provider)
-            <= {
-                "type",
-                "domain",
-                "domain_owner",
-                "region",
-                "profile",
-            }
-            and set(provider) >= {"type", "domain", "domain_owner", "region"}
-        ):
-            if not all(
-                isinstance(provider[name], str) and provider[name]
-                for name in ("domain", "domain_owner", "region")
-            ) or ("profile" in provider and not isinstance(provider["profile"], str)):
-                raise ValueError
-            token_provider = AwsCodeArtifactTokenProvider(
-                domain=provider["domain"],
-                domain_owner=provider["domain_owner"],
-                region=provider["region"],
-                profile=provider.get("profile"),
-            )
-        else:
-            raise ValueError
-    except (AttributeError, KeyError, TypeError, json.JSONDecodeError) as exc:
-        raise ValueError("invalid package-auth configuration") from exc
-    package_auth = PackageAuth(
-        payload["rule_id"],
-        host,
-        port,
-        path_prefix,
-        payload["username"],
-        placeholder,
-    )
-    return package_auth, token_provider.get_token
-
-
 def _load() -> GatewayAddon:
+    confdir = os.environ.pop("SBX_GATEWAY_CONFDIR", None)
+    open_files = os.environ.pop("SBX_GATEWAY_OPEN_FILES", None)
+    if confdir is not None and open_files is not None:
+        status = apply(Path(confdir), int(open_files), Path(sys.executable))
+        os.environ["SBX_GATEWAY_HARDENING"] = status.encode()
     fd = int(os.environ.pop("SBX_GATEWAY_KEY_FD"))
     ready = os.environ.pop("SBX_GATEWAY_READY_FD", None)
-    package_auth_fd = os.environ.pop("SBX_GATEWAY_PACKAGE_AUTH_FD", None)
     policy_fd = os.environ.pop("SBX_GATEWAY_POLICY_FD", None)
+    broker_fd = os.environ.pop("SBX_GATEWAY_BROKER_FD", None)
+    lifetime_fd = os.environ.pop("SBX_GATEWAY_LIFETIME_FD", None)
+    audit_fd = os.environ.pop("SBX_GATEWAY_AUDIT_FD", None)
+    audit_ack_fd = os.environ.pop("SBX_GATEWAY_AUDIT_ACK_FD", None)
+    if ready is not None and (audit_fd is None or audit_ack_fd is None):
+        raise RuntimeError("gateway requires durable admission audit transport")
+    generation = os.environ.pop("SBX_GATEWAY_GENERATION", "unknown")
+    if lifetime_fd is not None:
+
+        def monitor_supervisor() -> None:
+            with os.fdopen(int(lifetime_fd), "rb") as lifetime:
+                lifetime.read()
+            os._exit(0)
+
+        threading.Thread(target=monitor_supervisor, daemon=True).start()
     with os.fdopen(fd, "rb") as source:
         key = source.read(33)
-    package_auth, get_real_token = (
-        load_package_auth(int(package_auth_fd)) if package_auth_fd is not None else (None, None)
-    )
-    policies, secrets = load_policy(int(policy_fd)) if policy_fd is not None else ((), ())
-    return GatewayAddon(
-        CapabilityVerifier(
-            key,
-            os.environ.pop("SBX_GATEWAY_VM_ID"),
-            os.environ.pop("SBX_GATEWAY_INCARNATION"),
-        ),
+    policies, credentials = load_policy(int(policy_fd)) if policy_fd is not None else ((), ())
+    vm_id = os.environ.pop("SBX_GATEWAY_VM_ID")
+    incarnation = os.environ.pop("SBX_GATEWAY_INCARNATION")
+    addon = GatewayAddon(
+        CapabilityVerifier(key, vm_id, incarnation),
         int(ready) if ready is not None else None,
-        package_auth,
-        get_real_token,
         policies=policies,
-        secrets=secrets,
+        credentials=credentials,
+        broker=BrokerClient(int(broker_fd), incarnation) if broker_fd is not None else None,
+        audit_fd=int(audit_fd) if audit_fd is not None else None,
+        audit_ack_fd=int(audit_ack_fd) if audit_ack_fd is not None else None,
+        generation=generation,
     )
+    requestheaders = concurrent(addon.requestheaders)
+    requestheaders.__name__ = "requestheaders"
+    addon.requestheaders = requestheaders  # type: ignore[method-assign]
+    return addon
 
 
 addons = [_load()]

@@ -2,6 +2,7 @@ package syntheticdns
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"testing"
 )
@@ -59,8 +60,8 @@ func TestActiveMappingIsNotEvicted(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := r.Resolve("new.example"); err != nil {
-		t.Fatal(err)
+	if _, err := r.Resolve("new.example"); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("full resolver did not refuse a new mapping: %v", err)
 	}
 	if got, _ := r.Resolve("host-0.example"); got != first {
 		t.Fatal("evicted active mapping")
@@ -84,6 +85,42 @@ func TestConfiguredCapacityIsPerResolver(t *testing.T) {
 	}
 	if _, err := b.Resolve("b.example"); err != nil || b.Len() != 2 || a.Len() != 1 {
 		t.Fatal("one VM's DNS mapping ceiling affected another resolver")
+	}
+}
+
+func TestCachedAddressIsNeverReassignedAtCapacity(t *testing.T) {
+	r := NewWithLimit(allow{"one.example": true, "two.example": true}, 1)
+	first := r.Reply(query("one.example", 1))
+	if first == nil || binary.BigEndian.Uint16(first[6:8]) != 1 {
+		t.Fatal("first DNS answer missing")
+	}
+	ip, _ := r.Resolve("one.example")
+	denied := r.Reply(query("two.example", 1))
+	if denied == nil || denied[3]&15 != 5 || binary.BigEndian.Uint16(denied[6:8]) != 0 {
+		t.Fatal("capacity exhaustion did not refuse new DNS mapping")
+	}
+	if host, ok := r.Acquire(ip); !ok || host != "one.example" {
+		t.Fatal("cached address changed its destination")
+	}
+	r.Release(ip)
+	if got, err := r.Resolve("one.example"); err != nil || got != ip || r.Len() != 1 {
+		t.Fatal("existing cached destination stopped working at capacity")
+	}
+}
+
+func TestRestoreDoesNotReuseAnAssignedAddress(t *testing.T) {
+	original := New(allowAll{})
+	first, _ := original.Resolve("first.example")
+	replacement := New(allowAll{})
+	if err := replacement.Restore(original.Snapshot()); err != nil {
+		t.Fatal(err)
+	}
+	second, err := replacement.Resolve("second.example")
+	if err != nil || first == second {
+		t.Fatalf("restored address was reused: %v", err)
+	}
+	if host, ok := replacement.Acquire(first); !ok || host != "first.example" {
+		t.Fatal("restored address lost its hostname")
 	}
 }
 

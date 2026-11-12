@@ -93,6 +93,7 @@ def test_external_network_builds_exact_single_stream_argv(
     unix_socket: Path,
 ) -> None:
     monkeypatch.setattr(smolvm_network, "_capture", support_capture)
+    monkeypatch.setattr(smolvm_network.os, "access", lambda *_args: True)
 
     argv = smolvm_network.build_qemu_argv(
         vm_info,
@@ -114,7 +115,7 @@ def test_external_network_builds_exact_single_stream_argv(
         "-kernel",
         str(vm_info.config.kernel_path),
         "-append",
-        "console=ttyS0 reboot=k panic=1 init=/init",
+        "console=ttyS0 reboot=k panic=1 init=/init smolvm.network=guest",
         "-drive",
         (
             f"file={vm_info.config.rootfs_path},if=none,format=raw,"
@@ -146,6 +147,115 @@ def test_external_network_builds_exact_single_stream_argv(
     ]
     assert len(nics) == 1
     assert not any(mode in " ".join(argv) for mode in ("user,id=", "tap,id=", "hostfwd="))
+
+
+def test_external_network_falls_back_to_tcg_without_usable_kvm(
+    monkeypatch: pytest.MonkeyPatch,
+    vm_info: VMInfo,
+    unix_socket: Path,
+) -> None:
+    monkeypatch.setattr(smolvm_network, "_capture", support_capture)
+    monkeypatch.setattr(smolvm_network.os, "access", lambda *_args: False)
+
+    argv = smolvm_network.build_qemu_argv(
+        vm_info,
+        qemu_bin=Path("/usr/bin/qemu-system-x86_64"),
+        boot_args=vm_info.config.boot_args,
+        platform_spec=_LINUX_SPEC,
+        external_network=backend(unix_socket),
+        host_system="Linux",
+    )
+
+    assert argv[argv.index("-machine") + 1] == "q35,accel=tcg"
+    assert argv[argv.index("-cpu") + 1] == "qemu64"
+    assert argv[argv.index("-smp") + 1] == "1"
+    assert argv[argv.index("-append") + 1].endswith("smolvm.network=guest")
+
+
+def test_tcg_microvm_enables_pit_for_clock_calibration() -> None:
+    argv = smolvm_network._use_tcg_without_kvm(
+        [
+            "qemu",
+            "-smp",
+            "2",
+            "-machine",
+            "microvm,accel=kvm,pic=off,pit=off",
+            "-cpu",
+            "host",
+        ]
+    )
+
+    assert argv[argv.index("-machine") + 1] == "microvm,accel=tcg,pic=on,pit=on"
+    assert argv[argv.index("-smp") + 1] == "1"
+    assert argv[argv.index("-cpu") + 1] == "qemu64"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["qemu", "-append", "boot", "-device", "virtio-net-pci,netdev=net0,mac=00:00:00:00:00:00"],
+        ["qemu", "-append", "boot", "-netdev", "user,id=net0"],
+    ],
+)
+def test_external_network_rejects_missing_stock_nic_parts(
+    argv: list[str], unix_socket: Path
+) -> None:
+    with pytest.raises(ConfigError, match="network argv"):
+        smolvm_network._replace_network(argv, backend(unix_socket))
+
+
+def test_external_network_rejects_missing_boot_args(unix_socket: Path) -> None:
+    with pytest.raises(ConfigError, match="boot argv"):
+        smolvm_network._replace_network(
+            [
+                "qemu",
+                "-netdev",
+                "user,id=net0",
+                "-device",
+                "virtio-net-pci,netdev=net0,mac=00:00:00:00:00:00",
+            ],
+            backend(unix_socket),
+        )
+
+
+def test_external_network_rejects_nic_without_one_mac(unix_socket: Path) -> None:
+    with pytest.raises(ConfigError, match="NIC argv"):
+        smolvm_network._replace_network(
+            [
+                "qemu",
+                "-append",
+                "boot",
+                "-netdev",
+                "user,id=net0",
+                "-device",
+                "virtio-net-pci,netdev=net0",
+            ],
+            backend(unix_socket),
+        )
+
+
+def test_tcg_fallback_rejects_incompatible_stock_argv() -> None:
+    with pytest.raises(ConfigError, match="accelerator argv"):
+        smolvm_network._use_tcg_without_kvm(["qemu", "-machine", "q35,accel=tcg"])
+
+
+def test_external_network_replaces_stock_guest_boot_network(
+    unix_socket: Path,
+) -> None:
+    argv = smolvm_network._replace_network(
+        [
+            "qemu",
+            "-append",
+            "console=ttyS0 ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off",
+            "-netdev",
+            "user,id=net0",
+            "-device",
+            "virtio-net-pci,netdev=net0,mac=52:54:00:00:00:01",
+        ],
+        backend(unix_socket),
+    )
+
+    assert argv[argv.index("-append") + 1] == "console=ttyS0 smolvm.network=guest"
 
 
 def test_non_gateway_argv_is_stock_smolvm_argv(
@@ -180,6 +290,13 @@ def test_qemu_before_7_2_fails_clearly(monkeypatch: pytest.MonkeyPatch, version:
         smolvm_network.require_external_network_support(Path("/usr/bin/qemu"))
 
 
+def test_unparseable_qemu_version_fails_clearly(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(smolvm_network, "_capture", lambda _argv: completed("unknown"))
+
+    with pytest.raises(ConfigError, match="could not determine QEMU version"):
+        smolvm_network.require_external_network_support(Path("/usr/bin/qemu"))
+
+
 def test_qemu_without_stream_backend_fails_clearly(monkeypatch: pytest.MonkeyPatch) -> None:
     def capture(argv: list[str]) -> subprocess.CompletedProcess[str]:
         if argv[-1] == "--version":
@@ -189,20 +306,6 @@ def test_qemu_without_stream_backend_fails_clearly(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(smolvm_network, "_capture", capture)
 
     with pytest.raises(ConfigError, match="required 'stream' netdev backend"):
-        smolvm_network.require_external_network_support(Path("/usr/bin/qemu"))
-
-
-def test_unsupported_smolvm_version_fails_before_qemu_probe(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(smolvm_network, "package_version", lambda _name: "0.0.29")
-    monkeypatch.setattr(
-        smolvm_network,
-        "_capture",
-        lambda _argv: (_ for _ in ()).throw(AssertionError("QEMU probe must not run")),
-    )
-
-    with pytest.raises(ConfigError, match="supports SmolVM 0.0.28; found 0.0.29"):
         smolvm_network.require_external_network_support(Path("/usr/bin/qemu"))
 
 
@@ -262,6 +365,36 @@ def test_malformed_socket_paths_fail_clearly(
         )
 
 
+@pytest.mark.parametrize("mac", ["invalid", "01:00:00:00:00:00"])
+def test_invalid_external_mac_fails_clearly(
+    mac: str, vm_info: VMInfo, unix_socket: Path
+) -> None:
+    external = smolvm_network.ExternalNetworkBackend(
+        "unix-stream", unix_socket, "qemu-connects", mac
+    )
+    with pytest.raises(ConfigError, match="MAC"):
+        smolvm_network.build_qemu_argv(
+            vm_info,
+            qemu_bin=Path("/usr/bin/qemu"),
+            boot_args=vm_info.config.boot_args,
+            platform_spec=_LINUX_SPEC,
+            external_network=external,
+            host_system="Linux",
+        )
+
+
+def test_missing_socket_fails_clearly(tmp_path: Path, vm_info: VMInfo) -> None:
+    with pytest.raises(ConfigError, match="socket is not ready"):
+        smolvm_network.build_qemu_argv(
+            vm_info,
+            qemu_bin=Path("/usr/bin/qemu"),
+            boot_args=vm_info.config.boot_args,
+            platform_spec=_LINUX_SPEC,
+            external_network=backend(tmp_path / "missing.sock"),
+            host_system="Linux",
+        )
+
+
 def test_start_vm_uses_external_backend_for_the_runtime_process(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -286,9 +419,8 @@ def test_start_vm_uses_external_backend_for_the_runtime_process(
             events.append(("popen", argv, kwargs))
 
     context = SimpleNamespace(start_qemu=None)
-    qemu = tmp_path / "qemu-system-x86_64"
-    qemu.touch()
-    qemu.chmod(0o700)
+    qemu = Path("qemu-custom")
+    monkeypatch.setenv("SBX_QEMU_BIN", str(qemu))
     sdk = SimpleNamespace(
         state=State(),
         data_dir=tmp_path,
@@ -296,7 +428,7 @@ def test_start_vm_uses_external_backend_for_the_runtime_process(
         _process_handles={},
         _check_workspace_mounts=lambda info: events.append(("mount-check", info.vm_id)),
         _runtime_context=lambda: context,
-        _find_qemu_binary=lambda: qemu,
+        _find_qemu_binary=lambda: (_ for _ in ()).throw(AssertionError("override ignored")),
         _resolve_boot_args=lambda info: info.config.boot_args,
         _close_runtime_log=lambda *args: events.append(("close-log", args)),
     )
@@ -344,18 +476,6 @@ def test_start_vm_uses_external_backend_for_the_runtime_process(
     assert ("reset", {"close_ssh": False}) in events
     for stream in sdk._log_files.values():
         stream.close()
-
-
-def test_qemu_override_must_be_absolute_executable_and_non_writable(
-    tmp_path: Path,
-) -> None:
-    qemu = tmp_path / "qemu"
-    qemu.write_text("#!/bin/sh\n")
-    qemu.chmod(0o777)
-    with pytest.raises(ConfigError, match="unsafe"):
-        smolvm_network._resolved_executable(qemu, "QEMU executable")
-    with pytest.raises(ConfigError, match="absolute"):
-        smolvm_network._resolved_executable(Path("qemu"), "QEMU executable")
 
 
 def test_start_vm_failure_marks_state_error_and_closes_log(

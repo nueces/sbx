@@ -1,11 +1,14 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/nueces/sbx/gateway/internal/config"
+	gatewaynet "github.com/nueces/sbx/gateway/internal/netstack"
+	"github.com/nueces/sbx/gateway/internal/syntheticdns"
 )
 
 func TestIncarnationProofBindsEveryIdentity(t *testing.T) {
@@ -56,6 +59,58 @@ func TestReadConfigRejectsSymlinkPermissionsAndOversize(t *testing.T) {
 	}
 	if _, err := readConfig(path, true); err == nil {
 		t.Fatal("accepted oversized config")
+	}
+}
+
+func TestPrepareDNSRestoresWildcardAddressesBeforeTraffic(t *testing.T) {
+	cfg := config.Config{VMID: "vm", Generation: "generation", Digest: "digest", Quotas: config.DefaultQuotas(), Rules: []config.Rule{
+		{ID: "wild", Protocol: "tcp", Host: "*.wild.example", Ports: []uint16{443}},
+		{ID: "exact", Protocol: "tcp", Host: "exact.example", Ports: []uint16{443}},
+	}}
+	path := filepath.Join(t.TempDir(), "dns.jsonl")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.NewEncoder(file).Encode(map[string]any{"version": 1, "vm_id": cfg.VMID, "generation": cfg.Generation, "digest": cfg.Digest}); err != nil {
+		t.Fatal(err)
+	}
+	original, err := syntheticdns.NewWithJournal(cfg, cfg.Quotas.DNSMappings, file, cfg.VMID, cfg.Generation, cfg.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _ := original.Resolve("one.wild.example")
+	second, _ := original.Resolve("two.wild.example")
+	file.Close()
+	file, err = os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	network, err := gatewaynet.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer network.Close()
+	replacement, err := prepareDNS(network, cfg, file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for ip, host := range map[string]string{first.String(): "one.wild.example", second.String(): "two.wild.example"} {
+		found := false
+		for _, local := range network.Stack.AllAddresses()[gatewaynet.NICID] {
+			found = found || local.AddressWithPrefix.Address.String() == ip
+		}
+		if !found {
+			t.Fatalf("cached wildcard address not registered at startup: %s (%s)", ip, host)
+		}
+	}
+	if host, ok := replacement.Acquire(first); !ok || host != "one.wild.example" {
+		t.Fatal("cached wildcard connection lost its destination")
+	}
+	newIP, err := replacement.Resolve("new.wild.example")
+	if err != nil || newIP == first || newIP == second {
+		t.Fatalf("new wildcard lookup overwrote a restored destination: %v", err)
 	}
 }
 

@@ -5,7 +5,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"net"
 	"testing"
+	"time"
 )
 
 type shortWriter struct{ bytes.Buffer }
@@ -62,6 +64,77 @@ func TestClosed(t *testing.T) {
 	}
 	if err := s.WriteFrame([]byte{1}); !errors.Is(err, ErrClosed) {
 		t.Fatalf("write: %v", err)
+	}
+}
+
+func TestBetweenFrameIdleDoesNotExpire(t *testing.T) {
+	conn, peer := net.Pipe()
+	defer conn.Close()
+	defer peer.Close()
+	stream := New(conn, 50*time.Millisecond)
+	for i := 0; i < 2; i++ {
+		done := make(chan error, 1)
+		go func() {
+			frame, err := stream.ReadFrame()
+			if err == nil && !bytes.Equal(frame, []byte{1, 2, 3}) {
+				err = errors.New("wrong frame after idle")
+			}
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			t.Fatalf("idle stream terminated: %v", err)
+		case <-time.After(200 * time.Millisecond):
+		}
+		if _, err := peer.Write(framed([]byte{1, 2, 3})); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("frame did not arrive after idle")
+		}
+	}
+}
+
+func TestDisconnectDuringFrameIsNotOrdinaryIdleEOF(t *testing.T) {
+	for _, input := range [][]byte{{0}, {0, 0, 0, 3}} {
+		if _, err := New(bytes.NewBuffer(input), 0).ReadFrame(); !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("incomplete frame was treated as a healthy disconnect: %v", err)
+		}
+	}
+}
+
+func TestPartialFramesAndBlockedWritesStillExpire(t *testing.T) {
+	for _, input := range [][]byte{{0}, {0, 0, 0, 3, 1}} {
+		conn, peer := net.Pipe()
+		stream := New(conn, 50*time.Millisecond)
+		done := make(chan error, 1)
+		go func() { _, err := stream.ReadFrame(); done <- err }()
+		if _, err := peer.Write(input); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case err := <-done:
+			var timeout net.Error
+			if !errors.As(err, &timeout) || !timeout.Timeout() {
+				t.Fatalf("partial frame did not time out: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("partial frame blocked indefinitely")
+		}
+		conn.Close()
+		peer.Close()
+	}
+	conn, peer := net.Pipe()
+	defer conn.Close()
+	defer peer.Close()
+	var timeout net.Error
+	if err := New(conn, 50*time.Millisecond).WriteFrame([]byte{1}); !errors.As(err, &timeout) || !timeout.Timeout() {
+		t.Fatalf("blocked write did not time out: %v", err)
 	}
 }
 
