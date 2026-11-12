@@ -319,7 +319,7 @@ Restart manually if needed:
 sudo SBX_DOCKER_USER="$(id -un)" /usr/local/bin/sbx-start-rootless-docker
 ```
 
-The helper applies the temporary SmolVM/QEMU DNS workaround: `10.0.2.3` is QEMU slirp DNS; `10.0.2.2` is the gateway and can add ~5s resolver delays.
+The helper preserves the resolver installed by DHCP. In gateway mode, `/etc/resolv.conf` must contain only `nameserver 192.0.2.1`; rebuild the curated image if it contains a Docker, host, fallback, or public resolver.
 
 ### Rootful Docker troubleshooting
 

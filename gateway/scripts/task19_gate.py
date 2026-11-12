@@ -22,9 +22,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-import test_tcg as tcg_helpers
-from test_multi_vm_tcg import process_usage
-from test_tcg import (
+INTEGRATION_TESTS = Path(__file__).parents[2] / "tests" / "integration"
+sys.path.insert(0, str(INTEGRATION_TESTS))
+
+import test_gateway_tcg as tcg_helpers  # noqa: E402
+from test_gateway_multi_vm_tcg import process_usage  # noqa: E402
+from test_gateway_tcg import (  # noqa: E402
     MAX_TRANSCRIPT_BYTES,
     PROCESSES,
     SERVERS,
@@ -85,7 +88,8 @@ class BenchmarkHandler(BaseHTTPRequestHandler):
             with server.lock:  # type: ignore[attr-defined]
                 server.active += 1  # type: ignore[attr-defined]
                 server.maximum_active = max(  # type: ignore[attr-defined]
-                    server.maximum_active, server.active  # type: ignore[attr-defined]
+                    server.maximum_active,
+                    server.active,  # type: ignore[attr-defined]
                 )
             try:
                 time.sleep(0.5)

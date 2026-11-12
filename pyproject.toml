@@ -11,7 +11,11 @@ requires-python = ">=3.12"
 license = "Apache-2.0"
 authors = [{ name = "sbx contributors" }]
 dependencies = [
+  "cryptography==50.0.2",
+  "h2==4.4.1",
+  "mitmproxy==12.3.1",
   "smolvm==0.0.28",
+  "tornado",
 ]
 
 [project.optional-dependencies]
@@ -23,11 +27,29 @@ dev = [
 ]
 
 [project.scripts]
+mitmdump = "mitmproxy.tools.main:mitmdump"
+mitmweb = "mitmproxy.tools.main:mitmweb"
 sbx = "sbx.cli:main"
+sbx-gateway-supervisor = "sbx.gateway_supervisor:main"
+
+[project.entry-points."sbx.network.auth.methods"]
+aws-codeartifact = "sbx.gateway_credentials:aws_codeartifact"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sbx"]
 
+[tool.hatch.build.hooks.custom]
+
+[tool.uv]
+environments = [
+  "implementation_name == 'cpython' and sys_platform == 'linux'",
+  "implementation_name == 'cpython' and sys_platform == 'darwin'",
+]
+required-environments = [
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "sys_platform == 'darwin' and platform_machine == 'x86_64'",
+  "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
@@ -38,4 +60,8 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+norecursedirs = ["tests/integration"]
 addopts = "-q --cov=sbx --cov-report=term-missing --cov-fail-under=90"
+
+[tool.coverage.report]
+precision = 2

@@ -267,7 +267,14 @@ func forbiddenIP(ip netip.Addr) bool {
 	if !ip.IsValid() || ip.IsUnspecified() || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() {
 		return true
 	}
-	for _, value := range []string{"192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "198.18.0.0/15"} {
+	if ip.Is6() && !netip.MustParsePrefix("2000::/3").Contains(ip) {
+		return true
+	}
+	for _, value := range []string{
+		"0.0.0.0/8", "100.64.0.0/10", "192.0.0.0/24", "192.88.99.0/24",
+		"192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "198.18.0.0/15", "240.0.0.0/4",
+		"2001::/23", "2001:db8::/32", "2002::/16", "3fff::/20",
+	} {
 		prefix := netip.MustParsePrefix(value)
 		if prefix.Contains(ip) {
 			return true

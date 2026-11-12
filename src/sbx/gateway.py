@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import ctypes
+import fcntl
 import hashlib
 import hmac
 import ipaddress
@@ -16,17 +19,19 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Callable, Mapping, Sequence
-from contextlib import suppress
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, BinaryIO
+from urllib.parse import unquote
 
-from sbx.constants import SBX_STATE_DIR
+from sbx.constants import GATEWAY_UNIX_SOCKET_PATH_MAX_BYTES, SBX_STATE_DIR
 from sbx.runtime import ConfigError, pid_is_alive
 
 GATEWAY_STATE_DIR = SBX_STATE_DIR / "gateway"
@@ -36,35 +41,26 @@ GATEWAY_MEDIATOR_DIR = GATEWAY_RUNTIME_DIR / "mediator"
 _GATEWAY_ARCH = platform.machine().lower().replace("x86_64", "amd64").replace("aarch64", "arm64")
 GATEWAY_WORKER = GATEWAY_RUNTIME_DIR / "bin" / f"sbx-gateway-{sys.platform}-{_GATEWAY_ARCH}"
 GATEWAY_DEV_WORKER = GATEWAY_SOURCE_DIR / "sbx-gateway"
-GATEWAY_DEV_MEDIATOR_PYTHON = GATEWAY_SOURCE_DIR / "mediator" / ".venv" / "bin" / "python"
 GATEWAY_MEDIATOR_LAUNCHER = GATEWAY_MEDIATOR_DIR / "launch.py"
-GATEWAY_UV_VERSION = "0.11.30"
-GATEWAY_PYTHON_VERSION = "3.12.13"
 MAX_CONFIG_BYTES = 1 << 20
 MAX_LOG_BYTES = 100 * 1024 * 1024
 MAX_LOG_TOTAL_BYTES = MAX_LOG_BYTES
 MAX_LOG_EVENTS_PER_SECOND = 1000
 MAX_LOG_EVENT_BURST = 2000
 MAX_LOG_EVENT_BYTES = 64 * 1024
+MAX_AUDIT_EVENT_BYTES = 1 << 20
+MAX_DNS_JOURNAL_BYTES = 1 << 20
 MAX_DATA_PLANE_RSS = 512 * 1024 * 1024
 MAX_DATA_PLANE_PROCESSES = 16
 MAX_DATA_PLANE_THREADS = 256
 GUEST_ADDRESS = "192.0.2.2"
 APPROVED_HOOKS = frozenset({"package-audit"})
 _ALLOWED_NETWORK_KEYS = frozenset(
-    {
-        "default",
-        "http",
-        "tcp",
-        "tls_passthrough",
-        "secret",
-        "ingress",
-        "quotas",
-        "reconnection",
-    }
+    {"default", "mitmweb", "policy", "credential", "ingress", "quotas", "reconnection"}
 )
 _ALLOWED_FAILURES = frozenset(
     {
+        "audit_failed",
         "cleanup_failed",
         "config_invalid",
         "mediator_failed",
@@ -95,17 +91,26 @@ class PolicyRule:
     paths: tuple[str, ...] = ()
     allow_ranges: tuple[str, ...] = ()
     hooks: tuple[str, ...] = ()
+    policy_id: str = ""
 
 
 @dataclass(frozen=True)
-class SecretBinding:
-    name: str
-    provider: str
-    hosts: tuple[str, ...]
-    ports: tuple[int, ...]
-    header: str
+class CredentialBinding:
+    policies: tuple[str, ...]
+    header: str | None = None
     methods: tuple[str, ...] = ()
-    path_prefix: str | None = None
+    paths: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Credential:
+    id: str
+    environment: str
+    method: str
+    options: Mapping[str, Any]
+    inherit_environment: tuple[str, ...]
+    bindings: tuple[CredentialBinding, ...]
+    header: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -137,11 +142,12 @@ class Reconnection:
 @dataclass(frozen=True)
 class GatewayConfig:
     rules: tuple[PolicyRule, ...]
-    secrets: tuple[SecretBinding, ...]
+    credentials: tuple[Credential, ...]
     ingress: tuple[IngressRule, ...]
     quotas: Quotas
     reconnection: Reconnection
     platform: str
+    mitmweb: bool = False
 
     def canonical(self, vm_id: str, generation: str) -> dict[str, Any]:
         _validate_id(vm_id, "VM identity")
@@ -152,9 +158,10 @@ class GatewayConfig:
             "generation": generation,
             "default": "deny",
             "platform": self.platform,
+            "mitmweb": self.mitmweb,
             "rules": [asdict(rule) for rule in self.rules],
-            "secrets": [asdict(binding) for binding in self.secrets],
-            "ingress": [asdict(rule) for rule in self.ingress],
+            "credentials": [asdict(credential) for credential in self.credentials],
+            "ingress": [asdict(rule) for rule in self.ingress if rule.source != "controller"],
             "quotas": asdict(self.quotas),
             "reconnection": asdict(self.reconnection),
         }
@@ -246,8 +253,12 @@ def _tables(value: object, label: str) -> list[Mapping[str, Any]]:
 def _strings(value: object, label: str, *, required: bool = False) -> tuple[str, ...]:
     if value is None and not required:
         return ()
-    if not isinstance(value, list) or not value or not all(isinstance(item, str) for item in value):
-        raise ConfigError(f"{label} must be a non-empty array of strings")
+    if (
+        not isinstance(value, list)
+        or (required and not value)
+        or not all(isinstance(item, str) for item in value)
+    ):
+        raise ConfigError(f"{label} must be an array of strings")
     return tuple(value)
 
 
@@ -307,6 +318,23 @@ def _normalize_host(value: object, label: str, *, exact: bool = False) -> str:
     return address.compressed
 
 
+def _host_pattern_matches(pattern: str, host: str) -> bool:
+    suffix = pattern[1:]
+    prefix = host.removesuffix(suffix)
+    return host.endswith(suffix) and bool(prefix) and "." not in prefix
+
+
+def _path_subset(path: str, parent: str) -> bool:
+    base = parent.rstrip("/") or "/"
+    return base == "/" or path == base or path.startswith(base + "/")
+
+
+def _path_scopes_overlap(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
+    if not left or not right:
+        return True
+    return any(_path_subset(a, b) or _path_subset(b, a) for a in left for b in right)
+
+
 def _methods(value: object, label: str) -> tuple[str, ...]:
     methods = _strings(value, label) if value is not None else ()
     normalized = tuple(sorted({method.upper() for method in methods}))
@@ -315,14 +343,34 @@ def _methods(value: object, label: str) -> tuple[str, ...]:
     return normalized
 
 
+def canonical_path(value: str, label: str = "path") -> str:
+    if not isinstance(value, str) or not value.startswith("/") or "?" in value or "#" in value:
+        raise ConfigError(f"{label} contains an unsafe path")
+    path = value
+    for _ in range(4):
+        if re.search(r"%(?![0-9A-Fa-f]{2})", path):
+            raise ConfigError(f"{label} contains an unsafe path")
+        try:
+            decoded = unquote(path, errors="strict")
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ConfigError(f"{label} contains an unsafe path") from exc
+        if decoded == path:
+            break
+        path = decoded
+    else:
+        raise ConfigError(f"{label} exceeds the percent-decoding limit")
+    if (
+        "\\" in path
+        or any(ord(character) < 32 or ord(character) == 127 for character in path)
+        or any(part in {".", ".."} for part in path.split("/"))
+    ):
+        raise ConfigError(f"{label} contains an unsafe path")
+    return posixpath.normpath(path)
+
+
 def _paths(value: object, label: str) -> tuple[str, ...]:
     paths = _strings(value, label) if value is not None else ()
-    normalized = []
-    for path in paths:
-        if not path.startswith("/") or "?" in path or "#" in path or ".." in path.split("/"):
-            raise ConfigError(f"{label} contains an unsafe path")
-        normalized.append(posixpath.normpath(path))
-    return tuple(sorted(set(normalized)))
+    return tuple(sorted({canonical_path(path, label) for path in paths}))
 
 
 def _hooks(value: object, label: str) -> tuple[str, ...]:
@@ -335,26 +383,82 @@ def _hooks(value: object, label: str) -> tuple[str, ...]:
     return hooks
 
 
-def _rule(item: Mapping[str, Any], protocol: str, index: int) -> PolicyRule:
-    label = f"[[network.{protocol if protocol != 'tls' else 'tls_passthrough'}]]"
-    allowed = {"id", "host", "ports", "allow_ranges"}
-    if protocol == "http":
-        allowed |= {"methods", "paths", "hooks"}
-    _reject_unknown(item, allowed, label)
-    rule_id = item.get("id", f"{protocol}-{index}")
-    if not isinstance(rule_id, str) or _RULE_ID_RE.fullmatch(rule_id) is None:
+def validate_header_descriptor(value: object, *, allow_none: bool = False) -> dict[str, Any] | None:
+    if value is None and allow_none:
+        return None
+    if not isinstance(value, Mapping) or not isinstance(value.get("name"), str):
+        raise ConfigError("credential header descriptor is invalid")
+    name = value["name"]
+    if _TOKEN_RE.fullmatch(name) is None:
+        raise ConfigError("credential header descriptor is invalid")
+    if value.get("format") == "template" and set(value) == {"name", "format", "value"}:
+        template = value.get("value")
+        if not isinstance(template, str) or template.count("{placeholder}") != 1:
+            raise ConfigError("credential header descriptor is invalid")
+        _header(f"{name}: {template}", "credential header descriptor")
+        return {"name": name, "format": "template", "value": template}
+    if value.get("format") == "basic-password" and set(value) == {"name", "format", "username"}:
+        username = value.get("username")
+        if not isinstance(username, str) or not username or any(c in username for c in ":\r\n\0"):
+            raise ConfigError("credential header descriptor is invalid")
+        return {"name": name, "format": "basic-password", "username": username}
+    raise ConfigError("credential header descriptor is invalid")
+
+
+def _header(value: object, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or value.count("{placeholder}") != 1
+        or ":" not in value
+        or any(character in value for character in "\r\n\x00")
+        or len(value.encode()) > 8192
+    ):
+        raise ConfigError(f"{label} must contain one structural {{placeholder}}")
+    name, template = (part.strip() for part in value.split(":", 1))
+    if _TOKEN_RE.fullmatch(name) is None or not template:
+        raise ConfigError(f"{label} has an invalid field name or value")
+    return f"{name}: {template}"
+
+
+def _policy(item: Mapping[str, Any], index: int) -> list[PolicyRule]:
+    label = "[[network.policy]]"
+    _reject_unknown(
+        item,
+        {"id", "mode", "hosts", "ports", "methods", "path_prefixes", "hooks", "allow_ranges"},
+        label,
+    )
+    policy_id = item.get("id")
+    mode = item.get("mode")
+    if not isinstance(policy_id, str) or _RULE_ID_RE.fullmatch(policy_id) is None:
         raise ConfigError(f"{label}.id is invalid")
-    host = _normalize_host(item.get("host"), f"{label}.host", exact=protocol == "tls")
+    protocols = {"http-mediated": "http", "tls-passthrough": "tls", "tcp-forward": "tcp"}
+    if mode not in protocols:
+        raise ConfigError(f"{label}.mode must be http-mediated, tls-passthrough, or tcp-forward")
+    protocol = protocols[mode]
+    hosts = tuple(
+        _normalize_host(host, f"{label}.hosts", exact=protocol == "tls")
+        for host in _strings(item.get("hosts"), f"{label}.hosts", required=True)
+    )
+    if len(set(hosts)) != len(hosts):
+        raise ConfigError(f"{label}.hosts contains a duplicate hostname")
     ports = _ports(item.get("ports"), f"{label}.ports")
+    if protocol != "http" and any(key in item for key in ("methods", "path_prefixes", "hooks")):
+        raise ConfigError(
+            f"{label} permits methods, path_prefixes, and hooks only in http-mediated mode"
+        )
+    if protocol == "http" and "allow_ranges" in item:
+        raise ConfigError(f"{label}.allow_ranges is not permitted in http-mediated mode")
     methods = _methods(item.get("methods"), f"{label}.methods") if protocol == "http" else ()
-    paths = _paths(item.get("paths"), f"{label}.paths") if protocol == "http" else ()
+    paths = (
+        _paths(item.get("path_prefixes"), f"{label}.path_prefixes") if protocol == "http" else ()
+    )
     hooks = _hooks(item.get("hooks"), f"{label}.hooks") if protocol == "http" else ()
     ranges = (
         _strings(item.get("allow_ranges"), f"{label}.allow_ranges")
-        if item.get("allow_ranges") is not None
+        if "allow_ranges" in item
         else ()
     )
-    normalized_ranges: list[str] = []
+    normalized_ranges = []
     for value in ranges:
         try:
             normalized_ranges.append(str(ipaddress.ip_network(value, strict=False)))
@@ -362,82 +466,82 @@ def _rule(item: Mapping[str, Any], protocol: str, index: int) -> PolicyRule:
             raise ConfigError(f"{label}.allow_ranges contains an invalid network") from exc
     if len(set(normalized_ranges)) != len(normalized_ranges):
         raise ConfigError(f"{label}.allow_ranges contains a duplicate network")
-    return PolicyRule(
-        rule_id,
-        protocol,
-        host,
-        ports,
-        methods,
-        paths,
-        tuple(sorted(normalized_ranges)),
-        hooks,
-    )
-
-
-def _provider(value: object, label: str) -> str:
-    if not isinstance(value, str) or ":" not in value or "\x00" in value:
-        raise ConfigError(f"{label} must be a supported provider reference")
-    kind, reference = value.split(":", 1)
-    if kind == "env" and _ENV_RE.fullmatch(reference):
-        return value
-    if kind == "file" and Path(reference).is_absolute() and ".." not in Path(reference).parts:
-        return value
-    if kind == "aws-codeartifact" and _RULE_ID_RE.fullmatch(reference):
-        return value
-    raise ConfigError(f"{label} must use env:NAME, file:/absolute/path, or aws-codeartifact:NAME")
-
-
-def _secret(item: Mapping[str, Any], index: int) -> SecretBinding:
-    label = "[[network.secret]]"
-    _reject_unknown(
-        item,
-        {"name", "provider", "hosts", "ports", "header", "methods", "path_prefix"},
-        label,
-    )
-    name = item.get("name")
-    if not isinstance(name, str) or _ENV_RE.fullmatch(name) is None:
-        raise ConfigError(f"{label}.name is invalid")
-    hosts = tuple(
-        sorted(
-            {
-                _normalize_host(host, f"{label}.hosts", exact=True)
-                for host in _strings(item.get("hosts"), f"{label}.hosts", required=True)
-            }
+    return [
+        PolicyRule(
+            policy_id if len(hosts) == 1 else f"{policy_id}-{host_index}",
+            protocol,
+            host,
+            ports,
+            methods,
+            paths,
+            tuple(sorted(normalized_ranges)),
+            hooks,
+            policy_id,
         )
-    )
-    ports = _ports(item.get("ports"), f"{label}.ports")
-    header = item.get("header")
-    if (
-        not isinstance(header, str)
-        or header.count("{placeholder}") != 1
-        or "\n" in header
-        or "\r" in header
-        or ":" not in header
+        for host_index, host in enumerate(hosts, 1)
+    ]
+
+
+def _binding(item: Mapping[str, Any], label: str) -> CredentialBinding:
+    _reject_unknown(item, {"policies", "header", "methods", "path_prefixes"}, label)
+    policies = _strings(item.get("policies"), f"{label}.policies", required=True)
+    if len(set(policies)) != len(policies) or any(
+        _RULE_ID_RE.fullmatch(value) is None for value in policies
     ):
-        raise ConfigError(f"{label}.header must contain one structural {{placeholder}}")
-    header_name, _ = header.split(":", 1)
-    if _TOKEN_RE.fullmatch(header_name.strip()) is None:
-        raise ConfigError(f"{label}.header has an invalid field name")
-    path_prefix = item.get("path_prefix")
-    if path_prefix is not None:
-        if (
-            not isinstance(path_prefix, str)
-            or not path_prefix.startswith("/")
-            or ".." in path_prefix.split("/")
-            or "?" in path_prefix
-            or "#" in path_prefix
-        ):
-            raise ConfigError(f"{label}.path_prefix is unsafe")
-        path_prefix = posixpath.normpath(path_prefix)
-    return SecretBinding(
-        name,
-        _provider(item.get("provider"), f"{label}.provider"),
-        hosts,
-        ports,
-        header,
+        raise ConfigError(f"{label}.policies contains an invalid or duplicate policy ID")
+    return CredentialBinding(
+        tuple(policies),
+        _header(item["header"], f"{label}.header") if "header" in item else None,
         _methods(item.get("methods"), f"{label}.methods"),
-        path_prefix,
+        _paths(item.get("path_prefixes"), f"{label}.path_prefixes"),
     )
+
+
+def _credential(item: Mapping[str, Any], index: int) -> Credential:
+    label = "[[network.credential]]"
+    _reject_unknown(item, {"id", "environment", "method", "options", "bindings"}, label)
+    credential_id = item.get("id")
+    environment = item.get("environment")
+    method = item.get("method")
+    if not isinstance(credential_id, str) or _RULE_ID_RE.fullmatch(credential_id) is None:
+        raise ConfigError(f"{label}.id is invalid")
+    if not isinstance(environment, str) or _ENV_RE.fullmatch(environment) is None:
+        raise ConfigError(f"{label}.environment is invalid")
+    if method != "command" and not (
+        isinstance(method, str)
+        and method.startswith("plugin:")
+        and _RULE_ID_RE.fullmatch(method[7:])
+    ):
+        raise ConfigError(f"{label}.method must be command or plugin:NAME")
+    options = dict(_mapping(item.get("options", {}), f"{label}.options"))
+    inherited = options.pop("inherit_environment", [])
+    if (
+        not isinstance(inherited, list)
+        or not all(isinstance(name, str) and _ENV_RE.fullmatch(name) for name in inherited)
+        or len(set(inherited)) != len(inherited)
+    ):
+        raise ConfigError(
+            f"{label}.options.inherit_environment must contain unique environment names"
+        )
+    if method == "command":
+        _reject_unknown(options, {"argv", "format"}, f"{label}.options")
+        argv = options.get("argv")
+        if (
+            not isinstance(argv, list)
+            or not argv
+            or not all(isinstance(arg, str) and arg and "\x00" not in arg for arg in argv)
+        ):
+            raise ConfigError(f"{label}.options.argv must be a non-empty argv array")
+        if options.get("format", "text") not in {"text", "json"}:
+            raise ConfigError(f"{label}.options.format must be text or json")
+        options.setdefault("format", "text")
+    bindings = tuple(
+        _binding(binding, f"{label}.bindings")
+        for binding in _tables(item.get("bindings"), f"{label}.bindings")
+    )
+    if method == "command" and any(binding.header is None for binding in bindings):
+        raise ConfigError("command credential bindings require an explicit header")
+    return Credential(credential_id, environment, str(method), options, tuple(inherited), bindings)
 
 
 def _listen(value: object, label: str) -> tuple[str, int]:
@@ -579,38 +683,118 @@ def parse_config(config: Mapping[str, Any], *, platform: str | None = None) -> G
     if network.get("default", "deny") != "deny":
         raise ConfigError("[network].default must be 'deny'")
 
-    rules = tuple(
-        _rule(item, protocol, index)
-        for protocol, key in (("http", "http"), ("tcp", "tcp"), ("tls", "tls_passthrough"))
-        for index, item in enumerate(_tables(network.get(key), f"[[network.{key}]]"), 1)
-    )
-    ids = [rule.id for rule in rules]
-    if len(set(ids)) != len(ids):
-        raise ConfigError("network policy rule IDs must be unique")
-    destinations: dict[tuple[str, str, int], str] = {}
-    for rule in rules:
-        transport = "tcp" if rule.protocol in {"http", "tls"} else rule.protocol
-        for port in rule.ports:
-            key = (transport, rule.host, port)
-            if key in destinations:
-                raise ConfigError(f"network rules {destinations[key]!r} and {rule.id!r} conflict")
-            destinations[key] = rule.id
+    mitmweb = network.get("mitmweb", False)
+    if type(mitmweb) is not bool:
+        raise ConfigError("[network].mitmweb must be a boolean")
 
-    secrets = tuple(
-        _secret(item, index)
-        for index, item in enumerate(_tables(network.get("secret"), "[[network.secret]]"), 1)
+    policy_tables = _tables(network.get("policy"), "[[network.policy]]")
+    public_ids = [item.get("id") for item in policy_tables]
+    if len(set(public_ids)) != len(public_ids):
+        raise ConfigError("network policy IDs must be unique")
+    rules = tuple(
+        rule for index, item in enumerate(policy_tables, 1) for rule in _policy(item, index)
     )
-    secret_names = [binding.name for binding in secrets]
-    if len(set(secret_names)) != len(secret_names):
-        raise ConfigError("network secret binding names must be unique")
-    http_rules = [rule for rule in rules if rule.protocol == "http"]
-    for binding in secrets:
-        for host in binding.hosts:
-            for port in binding.ports:
-                if not any(rule.host == host and port in rule.ports for rule in http_rules):
+    if len({rule.id for rule in rules}) != len(rules):
+        raise ConfigError("normalized network policy rule IDs must be unique")
+
+    def overlaps(left: str, right: str) -> bool:
+        if left == right:
+            return True
+        if left.startswith("*."):
+            return _host_pattern_matches(left, right)
+        if right.startswith("*."):
+            return _host_pattern_matches(right, left)
+        return False
+
+    for index, rule in enumerate(rules):
+        for other in rules[index + 1 :]:
+            # Every supported public policy mode uses TCP, regardless of mediation.
+            if set(rule.ports) & set(other.ports) and overlaps(rule.host, other.host):
+                raise ConfigError(
+                    f"network policies {rule.policy_id!r} and {other.policy_id!r} overlap"
+                )
+
+    credentials = tuple(
+        _credential(item, index)
+        for index, item in enumerate(
+            _tables(network.get("credential"), "[[network.credential]]"), 1
+        )
+    )
+    ids = [credential.id for credential in credentials]
+    environments = [credential.environment for credential in credentials]
+    if len(set(ids)) != len(ids):
+        raise ConfigError("network credential IDs must be unique")
+    if len(set(environments)) != len(environments):
+        raise ConfigError("network credential environment names must be unique")
+    forwarded = (
+        config.get("sbx", {}).get("env", []) if isinstance(config.get("sbx", {}), Mapping) else []
+    )
+    if isinstance(forwarded, str):
+        forwarded = [forwarded]
+    if (
+        not isinstance(forwarded, list)
+        or not all(isinstance(name, str) and _ENV_RE.fullmatch(name) for name in forwarded)
+        or len(set(forwarded)) != len(forwarded)
+    ):
+        raise ConfigError("[sbx].env must contain unique environment names")
+    collisions = set(environments) & set(forwarded)
+    if (
+        collisions
+        or "SBX_NETWORK_CREDENTIAL_NAMES" in environments
+        or "SBX_NETWORK_CREDENTIAL_NAMES" in forwarded
+    ):
+        raise ConfigError(
+            "network credential environment collides with forwarded or reserved names"
+        )
+    policies = {rule.policy_id: rule for rule in rules}
+    credential_policies: set[str] = set()
+    scopes: list[tuple[str, str, frozenset[str], tuple[str, ...], str]] = []
+    for credential in credentials:
+        for binding in credential.bindings:
+            for policy_id in binding.policies:
+                policy = policies.get(policy_id)
+                if policy is None:
                     raise ConfigError(
-                        f"network secret {binding.name!r} is not scoped to an exact HTTP policy"
+                        f"credential {credential.id!r} references unknown policy {policy_id!r}"
                     )
+                if policy.protocol != "http":
+                    raise ConfigError("credential bindings require http-mediated policies")
+                if (
+                    binding.methods
+                    and policy.methods
+                    and not set(binding.methods) <= set(policy.methods)
+                ):
+                    raise ConfigError(
+                        "credential binding methods must be a subset of policy methods"
+                    )
+                if (
+                    binding.paths
+                    and policy.paths
+                    and any(
+                        not any(_path_subset(path, parent) for parent in policy.paths)
+                        for path in binding.paths
+                    )
+                ):
+                    raise ConfigError("credential binding paths must be a subset of policy paths")
+                credential_policies.add(policy_id)
+                if binding.header is not None:
+                    header_name = binding.header.split(":", 1)[0].lower()
+                    methods = frozenset(binding.methods or policy.methods)
+                    paths = binding.paths or policy.paths
+                    for old_policy, old_header, old_methods, old_paths, old_credential in scopes:
+                        if (
+                            old_policy == policy_id
+                            and old_header == header_name
+                            and (not old_methods or not methods or old_methods & methods)
+                            and _path_scopes_overlap(old_paths, paths)
+                        ):
+                            raise ConfigError(
+                                "credential bindings "
+                                f"{old_credential!r} and {credential.id!r} overlap"
+                            )
+                    scopes.append((policy_id, header_name, methods, paths, credential.id))
+    if any(rule.host.startswith("*.") and rule.policy_id in credential_policies for rule in rules):
+        raise ConfigError("credential-bound policies require exact hosts")
 
     ingress = [
         _ingress(item, index)
@@ -654,15 +838,69 @@ def parse_config(config: Mapping[str, Any], *, platform: str | None = None) -> G
         raise ConfigError("network ingress listeners exceed the per-VM resource ceilings")
     return GatewayConfig(
         tuple(sorted(rules, key=lambda rule: rule.id)),
-        tuple(sorted(secrets, key=lambda binding: binding.name)),
+        tuple(sorted(credentials, key=lambda credential: credential.id)),
         tuple(ingress),
         quotas,
         _reconnection(network.get("reconnection")),
         selected_platform,
+        mitmweb,
     )
 
 
 parse_gateway_config = parse_config
+
+
+def validate_runtime_paths(vm_id: str, *, runtime_root: Path | None = None) -> None:
+    _validate_id(vm_id, "VM identity")
+    _select_runtime_directory(uuid.UUID(int=0).hex, root=runtime_root)
+
+
+def finalize_credentials(config: GatewayConfig, described: Sequence[Credential]) -> GatewayConfig:
+    by_id = {credential.id: credential for credential in described}
+    if set(by_id) != {credential.id for credential in config.credentials}:
+        raise ConfigError("credential descriptions do not match configuration")
+    policies = {rule.policy_id: rule for rule in config.rules}
+    scopes: list[tuple[str, str, frozenset[str], tuple[str, ...], str]] = []
+    for credential in described:
+        for binding in credential.bindings:
+            descriptor = (
+                validate_header_descriptor(
+                    {
+                        "name": binding.header.split(":", 1)[0].strip(),
+                        "format": "template",
+                        "value": binding.header.split(":", 1)[1].strip(),
+                    }
+                )
+                if binding.header is not None
+                else credential.header
+            )
+            if descriptor is None:
+                raise ConfigError(f"credential {credential.id!r} binding requires a header")
+            header_name = str(descriptor["name"]).lower()
+            for policy_id in binding.policies:
+                policy = policies[policy_id]
+                methods = frozenset(binding.methods or policy.methods)
+                paths = binding.paths or policy.paths
+                for old_policy, old_header, old_methods, old_paths, old_id in scopes:
+                    if (
+                        old_policy == policy_id
+                        and old_header == header_name
+                        and (not old_methods or not methods or old_methods & methods)
+                        and _path_scopes_overlap(old_paths, paths)
+                    ):
+                        raise ConfigError(
+                            f"credential bindings {old_id!r} and {credential.id!r} overlap"
+                        )
+                scopes.append((policy_id, header_name, methods, paths, credential.id))
+    return replace(config, credentials=tuple(sorted(described, key=lambda item: item.id)))
+
+
+def write_effective_policy(
+    directory: Path, config: GatewayConfig, vm_id: str, generation: str
+) -> None:
+    state = _read_json(directory / "state.json")
+    state["config_digest"] = config.digest(vm_id, generation)
+    _atomic_json(directory, "state.json", state)
 
 
 def _private_directory(path: Path, *, create: bool = False) -> None:
@@ -685,8 +923,14 @@ def _private_directory(path: Path, *, create: bool = False) -> None:
 
 def _reject_symlink_ancestors(path: Path) -> None:
     for parent in (path, *path.parents):
-        if parent.exists() and parent.is_symlink():
-            raise GatewayStateError(f"unsafe gateway state parent: {parent}")
+        try:
+            info = parent.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise GatewayStateError(f"cannot inspect gateway path parent: {parent}: {exc}") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise GatewayStateError(f"unsafe gateway path parent: {parent}")
 
 
 def _state_root(root: Path | None = None) -> Path:
@@ -697,6 +941,117 @@ def _state_root(root: Path | None = None) -> Path:
     _reject_symlink_ancestors(parent)
     _private_directory(selected, create=True)
     return selected
+
+
+_SOCKET_NAMES = {"qemu": "qemu-net.sock", "control": "control.sock"}
+
+
+def _compact_runtime_generation(generation: str) -> str:
+    try:
+        raw = uuid.UUID(hex=generation).bytes
+    except ValueError:
+        raw = hashlib.sha256(generation.encode()).digest()
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def _runtime_directory_under(base: Path, generation: str) -> Path | None:
+    for component in (generation, _compact_runtime_generation(generation)):
+        directory = base / component
+        if all(
+            len(os.fsencode(directory / name)) <= GATEWAY_UNIX_SOCKET_PATH_MAX_BYTES
+            for name in _SOCKET_NAMES.values()
+        ):
+            return directory
+    return None
+
+
+def _safe_existing_runtime_root(path: Path) -> bool:
+    if not path.is_absolute():
+        return False
+    try:
+        _reject_symlink_ancestors(path)
+        info = path.lstat()
+    except (GatewayStateError, OSError):
+        return False
+    return (
+        stat.S_ISDIR(info.st_mode)
+        and not stat.S_ISLNK(info.st_mode)
+        and info.st_uid == os.getuid()
+        and stat.S_IMODE(info.st_mode) == 0o700
+    )
+
+
+def _select_runtime_directory(generation: str, *, root: Path | None = None) -> Path:
+    _validate_id(generation, "gateway generation")
+    if root is not None:
+        if not root.is_absolute():
+            raise ConfigError("gateway runtime directory must be absolute")
+        directory = _runtime_directory_under(root, generation)
+        if directory is None:
+            raise ConfigError(
+                f"gateway runtime socket paths exceed {GATEWAY_UNIX_SOCKET_PATH_MAX_BYTES} bytes"
+            )
+        return directory
+
+    configured = os.environ.get("XDG_RUNTIME_DIR")
+    if configured:
+        xdg_root = Path(configured)
+        if _safe_existing_runtime_root(xdg_root):
+            directory = _runtime_directory_under(xdg_root / "sbx", generation)
+            if directory is not None:
+                return directory
+
+    temporary = Path("/private/tmp" if sys.platform == "darwin" else "/tmp")
+    directory = _runtime_directory_under(temporary / f"sbx-{os.getuid()}", generation)
+    if directory is None:
+        raise ConfigError(
+            f"gateway runtime socket paths exceed {GATEWAY_UNIX_SOCKET_PATH_MAX_BYTES} bytes"
+        )
+    return directory
+
+
+def _create_runtime_directory(generation: str, *, root: Path | None = None) -> Path:
+    directory = _select_runtime_directory(generation, root=root)
+    base = directory.parent
+    parent = base.parent
+    _reject_symlink_ancestors(parent)
+    if root is not None:
+        parent.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_ancestors(parent)
+    _private_directory(base, create=True)
+    directory_fd = os.open(
+        base,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        os.mkdir(directory.name, mode=0o700, dir_fd=directory_fd)
+    except FileExistsError as exc:
+        raise GatewayStateError(f"gateway runtime directory already exists: {directory}") from exc
+    finally:
+        os.close(directory_fd)
+    _private_directory(directory)
+    return directory
+
+
+def _remove_runtime_directory(directory: Path) -> None:
+    _reject_symlink_ancestors(directory)
+    _private_directory(directory)
+    for name in _SOCKET_NAMES.values():
+        path = directory / name
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        if (
+            not stat.S_ISSOCK(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != os.getuid()
+        ):
+            raise GatewayStateError(f"unsafe gateway runtime socket: {path}")
+        path.unlink()
+    directory.rmdir()
+    with suppress(OSError):
+        directory.parent.rmdir()
 
 
 def _atomic_json(directory: Path, name: str, data: Mapping[str, Any]) -> None:
@@ -745,12 +1100,19 @@ def _atomic_json(directory: Path, name: str, data: Mapping[str, Any]) -> None:
         os.close(directory_fd)
 
 
-def _new_state(config: GatewayConfig, vm_id: str, generation: str) -> dict[str, Any]:
+def _new_state(
+    config: GatewayConfig,
+    vm_id: str,
+    generation: str,
+    runtime_directory: Path | None = None,
+) -> dict[str, Any]:
     return {
         "version": 1,
         "vm_id": vm_id,
         "generation": generation,
+        "runtime_directory": None if runtime_directory is None else str(runtime_directory),
         "config_digest": config.digest(vm_id, generation),
+        "requested_config_digest": config.digest(vm_id, generation),
         "platform": config.platform,
         "created_at": datetime.now(UTC).isoformat(),
         "status": "prepared",
@@ -762,27 +1124,117 @@ def _new_state(config: GatewayConfig, vm_id: str, generation: str) -> dict[str, 
     }
 
 
+@contextmanager
+def _state_lock(
+    vm_directory: Path,
+    owned_fd: int | None = None,
+    *,
+    timeout: float = 0,
+) -> Iterator[int]:
+    if owned_fd is not None:
+        yield owned_fd
+        return
+    fd = _fallback_lock(vm_directory / "state", timeout=timeout)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _read_vm_state(vm_directory: Path) -> tuple[dict[str, dict[str, Any]], str | None]:
+    _private_directory(vm_directory)
+    generations = {}
+    for entry in vm_directory.iterdir():
+        if entry.name == "current.json":
+            continue
+        if entry.name == "ownership.lock":
+            info = entry.lstat()
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+            ):
+                raise GatewayStateError("unsafe gateway ownership lock")
+            continue
+        if entry.is_symlink() or not entry.is_dir() or _ID_RE.fullmatch(entry.name) is None:
+            raise GatewayStateError("unsafe gateway incarnation entry")
+        generations[entry.name] = read_state(entry, vm_id=vm_directory.name)
+    pointer = vm_directory / "current.json"
+    if not pointer.exists() and not pointer.is_symlink():
+        if generations:
+            raise GatewayStateError(
+                "unsupported pointerless gateway state; explicit reset required"
+            )
+        return generations, None
+    reference = _read_json(pointer)
+    generation = reference.get("generation")
+    if (
+        set(reference) != {"version", "vm_id", "generation"}
+        or type(reference.get("version")) is not int
+        or reference["version"] != 1
+        or reference.get("vm_id") != vm_directory.name
+        or (
+            generation is not None
+            and (
+                not isinstance(generation, str)
+                or _ID_RE.fullmatch(generation) is None
+                or generation not in generations
+            )
+        )
+    ):
+        raise GatewayStateError("invalid gateway current-generation reference")
+    return generations, generation
+
+
+def _write_current(vm_directory: Path, generation: str | None) -> None:
+    if generation is not None:
+        _validate_id(generation, "gateway generation")
+        read_state(vm_directory / generation, vm_id=vm_directory.name)
+    _atomic_json(
+        vm_directory,
+        "current.json",
+        {
+            "version": 1,
+            "vm_id": vm_directory.name,
+            "generation": generation,
+        },
+    )
+
+
 def create_state(
     config: GatewayConfig,
     vm_id: str,
     generation: str,
     *,
     root: Path | None = None,
+    runtime_directory: Path | None = None,
+    ownership_fd: int | None = None,
 ) -> Path:
     _validate_id(vm_id, "VM identity")
     _validate_id(generation, "gateway generation")
     base = _state_root(root)
     vm_directory = base / vm_id
     _private_directory(vm_directory, create=True)
-    directory = vm_directory / generation
-    try:
-        directory.mkdir(mode=0o700)
-    except FileExistsError as exc:
-        raise GatewayStateError(f"gateway incarnation state already exists: {directory}") from exc
-    _private_directory(directory)
-    _atomic_json(directory, "policy.json", config.worker_config(vm_id, generation))
-    _atomic_json(directory, "state.json", _new_state(config, vm_id, generation))
-    return directory
+    with _state_lock(vm_directory, ownership_fd):
+        _read_vm_state(vm_directory)
+        if not (vm_directory / "current.json").exists():
+            _write_current(vm_directory, None)
+        directory = vm_directory / generation
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError as exc:
+            raise GatewayStateError(
+                f"gateway incarnation state already exists: {directory}"
+            ) from exc
+        _private_directory(directory)
+        _atomic_json(directory, "policy.json", config.worker_config(vm_id, generation))
+        _atomic_json(
+            directory,
+            "state.json",
+            _new_state(config, vm_id, generation, runtime_directory),
+        )
+        _write_current(vm_directory, generation)
+        return directory
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -800,7 +1252,7 @@ def _read_json(path: Path) -> dict[str, Any]:
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         with os.fdopen(fd, "r", encoding="utf-8") as source:
             data = json.load(source)
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise GatewayStateError(f"corrupt gateway state: {path}") from exc
     if not isinstance(data, dict):
         raise GatewayStateError(f"corrupt gateway state: {path}")
@@ -820,7 +1272,9 @@ def _validated_state(data: Mapping[str, Any], vm_id: str, generation: str) -> di
         "version",
         "vm_id",
         "generation",
+        "runtime_directory",
         "config_digest",
+        "requested_config_digest",
         "platform",
         "created_at",
         "status",
@@ -834,8 +1288,11 @@ def _validated_state(data: Mapping[str, Any], vm_id: str, generation: str) -> di
         raise GatewayStateError("corrupt gateway state schema")
     if data.get("vm_id") != vm_id or data.get("generation") != generation:
         raise GatewayStateError("cross-VM gateway state identity mismatch")
-    digest = data.get("config_digest")
-    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+    digests = (data.get("config_digest"), data.get("requested_config_digest"))
+    if any(
+        not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        for digest in digests
+    ):
         raise GatewayStateError("corrupt gateway config digest")
     if data.get("platform") not in {"linux", "darwin"} or data.get("status") not in _ALLOWED_STATES:
         raise GatewayStateError("corrupt gateway state metadata")
@@ -846,15 +1303,32 @@ def _validated_state(data: Mapping[str, Any], vm_id: str, generation: str) -> di
     pids = data.get("pids")
     if (
         not isinstance(pids, dict)
-        or set(pids) - {"worker", "mediator", "qemu"}
+        or set(pids) - {"worker", "mediator", "qemu", "supervisor"}
         or any(type(pid) is not int or pid <= 0 for pid in pids.values())
     ):
         raise GatewayStateError("corrupt gateway process metadata")
+    runtime_value = data.get("runtime_directory")
+    runtime_directory = Path(runtime_value) if isinstance(runtime_value, str) else None
+    if runtime_value is not None and (
+        runtime_directory is None
+        or "\0" in runtime_value
+        or not runtime_directory.is_absolute()
+        or runtime_directory != Path(os.path.abspath(runtime_directory))
+        or runtime_directory.name not in {generation, _compact_runtime_generation(generation)}
+    ):
+        raise GatewayStateError("corrupt gateway runtime directory metadata")
     sockets = data.get("sockets")
     if (
         not isinstance(sockets, dict)
-        or set(sockets) - {"qemu", "control"}
+        or set(sockets) - _SOCKET_NAMES.keys()
         or any(not isinstance(value, str) for value in sockets.values())
+        or (sockets and runtime_directory is None)
+        or any(
+            Path(value).parent != runtime_directory
+            or Path(value).name != _SOCKET_NAMES[name]
+            or len(os.fsencode(value)) > GATEWAY_UNIX_SOCKET_PATH_MAX_BYTES
+            for name, value in sockets.items()
+        )
     ):
         raise GatewayStateError("corrupt gateway socket metadata")
     listeners = data.get("listeners")
@@ -918,19 +1392,25 @@ def update_state(
             raise GatewayStateError("invalid gateway state classification")
         data["status"] = status
     if pids is not None:
-        if set(pids) - {"worker", "mediator", "qemu"} or any(
+        if set(pids) - {"worker", "mediator", "qemu", "supervisor"} or any(
             type(pid) is not int or pid <= 0 for pid in pids.values()
         ):
             raise GatewayStateError("invalid gateway process metadata")
         data["pids"] = dict(pids)
     if sockets is not None:
         checked: dict[str, str] = {}
-        if set(sockets) - {"qemu", "control"}:
+        runtime_value = data["runtime_directory"]
+        runtime_directory = Path(runtime_value) if isinstance(runtime_value, str) else None
+        if set(sockets) - _SOCKET_NAMES.keys() or runtime_directory is None:
             raise GatewayStateError("invalid gateway socket metadata")
         for name, raw_path in sockets.items():
             path = Path(raw_path)
-            if path.parent != directory or path.name not in {"qemu-net.sock", "control.sock"}:
-                raise GatewayStateError("gateway socket path crosses its incarnation directory")
+            if (
+                path.parent != runtime_directory
+                or path.name != _SOCKET_NAMES[name]
+                or len(os.fsencode(path)) > GATEWAY_UNIX_SOCKET_PATH_MAX_BYTES
+            ):
+                raise GatewayStateError("gateway socket path crosses its runtime directory")
             checked[name] = str(path)
         data["sockets"] = checked
     if listeners is not None:
@@ -979,89 +1459,24 @@ class GatewayAuthenticationError(GatewayLifecycleError):
 
 
 def _resolve_artifact(
-    environment_name: str,
+    environment_name: str | None,
     candidates: Sequence[Path | str | None],
     *,
-    executable: bool,
     label: str,
 ) -> Path:
-    override = os.environ.get(environment_name)
-    selected = (override,) if override is not None else candidates
-    for candidate in selected:
-        if candidate is None:
-            continue
-        path = Path(candidate).expanduser()
-        if override is not None and not path.is_absolute():
-            break
-        try:
-            resolved = path.resolve(strict=True)
-            info = resolved.stat()
-        except OSError:
-            continue
-        if (
-            stat.S_ISREG(info.st_mode)
-            and not stat.S_IMODE(info.st_mode) & 0o022
-            and (not executable or os.access(resolved, os.X_OK))
-        ):
-            return path.absolute()
-    raise GatewayLifecycleError(f"{label} is missing or unsafe")
+    if environment_name and (override := os.environ.get(environment_name)):
+        return Path(override).expanduser()
+    for candidate in candidates:
+        if candidate is not None and (path := Path(candidate).expanduser()).exists():
+            return path
+    raise GatewayLifecycleError(f"{label} is missing")
 
 
-def _gateway_checksums() -> dict[str, str]:
-    path = GATEWAY_RUNTIME_DIR / "SHA256SUMS"
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return {}
-    checksums: dict[str, str] = {}
-    for line in lines:
-        digest, _, name = line.partition("  ")
-        if re.fullmatch(r"[0-9a-f]{64}", digest) and name:
-            checksums[name] = digest
-    return checksums
-
-
-def _verify_packaged_artifact(path: Path) -> None:
-    try:
-        relative = path.resolve(strict=True).relative_to(GATEWAY_RUNTIME_DIR.resolve(strict=True))
-    except (OSError, ValueError) as error:
-        if path.exists():
-            return
-        raise GatewayLifecycleError("packaged gateway artifact is missing") from error
-    expected = _gateway_checksums().get(relative.as_posix())
-    if expected is None:
-        raise GatewayLifecycleError(f"packaged gateway artifact checksum is missing: {relative}")
-    actual = hashlib.sha256(path.read_bytes()).hexdigest()
-    if not hmac.compare_digest(actual, expected):
-        raise GatewayLifecycleError(f"packaged gateway artifact checksum mismatch: {relative}")
-
-
-def _resolve_uv() -> Path:
-    uv = _resolve_artifact(
-        "SBX_UV_BIN",
-        (shutil.which("uv"),),
-        executable=True,
-        label=f"uv {GATEWAY_UV_VERSION}",
-    )
-    try:
-        version = subprocess.run(
-            [str(uv), "--version"], check=True, capture_output=True, text=True, timeout=5
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError) as error:
-        raise GatewayLifecycleError("failed to verify uv version") from error
-    expected = f"uv {GATEWAY_UV_VERSION}"
-    if not version.startswith(f"{expected} ") and version != expected:
-        raise GatewayLifecycleError(
-            f"gateway mediator requires uv {GATEWAY_UV_VERSION}; found {version}"
-        )
-    return uv
-
-
-def _sanitized_child_environment(directory: Path) -> dict[str, str]:
+def _sanitized_child_environment(directory: Path, *, path: str = os.defpath) -> dict[str, str]:
     return {
         "HOME": str(directory),
         "LANG": "C.UTF-8",
-        "PATH": os.defpath,
+        "PATH": path,
         "TZ": "UTC",
     }
 
@@ -1113,6 +1528,7 @@ class GatewayController:
         vm_id: str,
         *,
         root: Path | None = None,
+        runtime_root: Path | None = None,
         generation: str | None = None,
         runner: Callable[..., Any] = subprocess.Popen,
         socket_factory: Callable[..., socket.socket] = socket.socket,
@@ -1123,18 +1539,22 @@ class GatewayController:
         self.generation = generation or uuid.uuid4().hex
         _validate_id(self.generation, "gateway generation")
         self.root = root
+        self.runtime_root = runtime_root
         self.runner = runner
         self.socket_factory = socket_factory
         if timeout <= 0:
             raise ValueError("gateway lifecycle timeout must be positive")
         self.timeout = timeout
         self.directory: Path | None = None
+        self.runtime_directory: Path | None = None
         self.listeners: list[socket.socket] = []
         self.listener_rules: tuple[IngressRule, ...] = ()
         self.qemu_listener: socket.socket | None = None
         self.processes: dict[str, Any] = {}
         self._worker_stdout: BinaryIO | None = None
         self._worker_buffer = bytearray()
+        self._dns_state_fd: int | None = None
+        self._dns_state_initialized = False
         self._logs: list[BinaryIO] = []
         self._log_threads: list[threading.Thread] = []
         self._log_lock = threading.Lock()
@@ -1151,26 +1571,46 @@ class GatewayController:
         self._immutable_policy: bytes | None = None
         self._qemu_pid: int | None = None
         self._warned_hardening = False
+        self._lifetime_read_fd: int | None = None
+        self._lifetime_write_fd: int | None = None
+        self._broker_socket: socket.socket | None = None
+        self._credential_broker: Any | None = None
+        self._owner_pid: int | None = None
+        self._ownership_fd: int | None = None
+        self._requested_config_digest = config.digest(vm_id, self.generation)
         self.mediator_address: str | None = None
+        self._audit_stream: BinaryIO | None = None
+        self._audit_directory_synced = False
+        self._audit_failure: GatewayLifecycleError | None = None
+        self._audit_write_fd: int | None = None
+        self._audit_ack_read_fd: int | None = None
         self.worker_incarnation = uuid.uuid4().hex
         self._incarnation_token = secrets.token_bytes(32)
-        self._placeholders = {
-            binding.name: f"SBX_SECRET_{binding.name}_{secrets.token_urlsafe(24)}"
-            for binding in config.secrets
-        }
+        self._placeholders: dict[str, str] = {}
+        for credential in config.credentials:
+            if not credential.bindings:
+                continue
+            placeholder = secrets.token_urlsafe(32)
+            while placeholder in self._placeholders.values():
+                placeholder = secrets.token_urlsafe(32)
+            self._placeholders[credential.id] = placeholder
         random = bytearray(secrets.token_bytes(6))
         random[0] = (random[0] | 2) & 0xFE
         self.mac = ":".join(f"{value:02x}" for value in random)
 
     @property
     def qemu_socket(self) -> Path:
-        if self.directory is None:
+        if self.runtime_directory is None:
             raise GatewayLifecycleError("gateway has not been prepared")
-        return self.directory / "qemu-net.sock"
+        return self.runtime_directory / "qemu-net.sock"
 
     @property
-    def secret_placeholders(self) -> dict[str, str]:
-        return dict(self._placeholders)
+    def credential_placeholders(self) -> dict[str, str]:
+        return {
+            credential.environment: self._placeholders[credential.id]
+            for credential in self.config.credentials
+            if credential.id in self._placeholders
+        }
 
     def _open_log(self, name: str) -> BinaryIO:
         assert self.directory is not None
@@ -1187,7 +1627,7 @@ class GatewayController:
         self._log_bytes = size
         fd = os.open(
             self.directory / name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
             0o600,
         )
         os.fchmod(fd, 0o600)
@@ -1195,7 +1635,26 @@ class GatewayController:
         self._logs.append(stream)
         return stream
 
-    def _emit_log(self, destination: BinaryIO, event: bytes) -> None:
+    def _emit_log(self, destination: BinaryIO, event: bytes, *, required: bool = False) -> None:
+        values = list(self._placeholders.values())
+        if self._credential_broker is not None:
+            values.extend(tuple(self._credential_broker.values))
+        try:
+            record = json.loads(event)
+        except (ValueError, UnicodeDecodeError):
+            record = None
+        if isinstance(record, dict) and all(
+            not isinstance(v, (dict, list)) for v in record.values()
+        ):
+            for key, text in record.items():
+                if isinstance(text, str):
+                    for value in values:
+                        text = text.replace(value, "[redacted]")
+                    record[key] = text
+            event = json.dumps(record, ensure_ascii=True, separators=(",", ":")).encode()
+        else:
+            for value in values:
+                event = event.replace(value.encode(), b"[redacted]")
         now = time.monotonic()
         with self._log_lock:
             self._log_tokens = min(
@@ -1204,13 +1663,178 @@ class GatewayController:
             )
             self._log_last = now
             if self._log_tokens < 1 or self._log_bytes >= MAX_LOG_BYTES:
+                if required:
+                    raise GatewayLifecycleError("gateway audit rate or storage limit exhausted")
                 return
             self._log_tokens -= 1
-            event = event[:MAX_LOG_EVENT_BYTES].rstrip(b"\n") + b"\n"
-            event = event[: MAX_LOG_BYTES - self._log_bytes]
-            if event:
-                destination.write(event)
-                self._log_bytes += len(event)
+            if required:
+                if len(event) > MAX_AUDIT_EVENT_BYTES:
+                    raise GatewayLifecycleError(
+                        "gateway audit event exceeds transport memory limit"
+                    )
+                event = event.rstrip(b"\n") + b"\n"
+            else:
+                event = event[:MAX_LOG_EVENT_BYTES].rstrip(b"\n") + b"\n"
+            if len(event) > MAX_LOG_BYTES - self._log_bytes:
+                if required:
+                    raise GatewayLifecycleError("gateway audit storage limit exhausted")
+                return
+            remaining = memoryview(event)
+            while remaining:
+                written = destination.write(remaining)
+                if not written:
+                    raise OSError("gateway log write failed")
+                self._log_bytes += written
+                remaining = remaining[written:]
+
+    def _open_dns_state(self, policy: Mapping[str, Any]) -> int:
+        assert self.directory is not None
+        _private_directory(self.directory)
+        path = self.directory / "dns-mappings.jsonl"
+        flags = os.O_RDWR | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        created = False
+        if self._dns_state_initialized:
+            fd = os.open(path, flags)
+        else:
+            try:
+                fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+                created = True
+            except FileExistsError:
+                # Existing generation state is opened unchanged, never reinitialized.
+                fd = os.open(path, flags)
+        try:
+            info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_size > MAX_DNS_JOURNAL_BYTES
+            ):
+                raise GatewayStateError("unsafe gateway DNS state")
+            if info.st_size == 0 and not created:
+                raise GatewayStateError("empty gateway DNS state")
+            if created:
+                header = (
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "vm_id": self.vm_id,
+                            "generation": self.generation,
+                            "digest": policy["digest"],
+                        },
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode()
+                if os.write(fd, header) != len(header):
+                    raise GatewayLifecycleError("incomplete gateway DNS state header")
+                os.fsync(fd)
+            os.lseek(fd, 0, os.SEEK_SET)
+            self._dns_state_initialized = True
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def _sync_audit(self, destination: BinaryIO) -> None:
+        destination.flush()
+        os.fsync(destination.fileno())
+        if sys.platform == "darwin":
+            if not hasattr(fcntl, "F_FULLFSYNC"):
+                raise GatewayLifecycleError("durable audit sync unavailable")
+            fcntl.fcntl(destination.fileno(), fcntl.F_FULLFSYNC)
+        assert self.directory is not None
+        if not self._audit_directory_synced:
+            # Persist newly created generation/state ancestors as well as the log entry.
+            for directory in (self.directory, *self.directory.parents):
+                directory_fd = os.open(
+                    directory,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                )
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            self._audit_directory_synced = True
+
+    def _route_audit(
+        self, source: BinaryIO, destination: BinaryIO, ack_fd: int | None = None
+    ) -> None:
+        incarnation = self.worker_incarnation
+        if ack_fd is not None:
+            os.set_blocking(ack_fd, False)
+
+        def route() -> None:
+            buffered = bytearray()
+            try:
+                while chunk := os.read(source.fileno(), MAX_LOG_EVENT_BYTES):
+                    buffered.extend(chunk)
+                    while b"\n" in buffered:
+                        event, _, remainder = bytes(buffered).partition(b"\n")
+                        buffered.clear()
+                        buffered.extend(remainder)
+                        if len(event) > MAX_AUDIT_EVENT_BYTES:
+                            raise GatewayLifecycleError(
+                                "gateway audit event exceeds transport memory limit"
+                            )
+                        record = json.loads(event)
+                        if not isinstance(record, dict) or record.get("version") not in (1, 2):
+                            raise GatewayLifecycleError("invalid gateway audit record")
+                        if "audit_error" in record:
+                            raise GatewayLifecycleError("mediator audit delivery failed")
+                        if record.get("version") == 2 and (
+                            record.get("event") not in ("admitted", "outcome")
+                            or record.get("generation") != self.generation
+                            or record.get("incarnation") != incarnation
+                            or not isinstance(record.get("request_id"), str)
+                            or not 1 <= len(record["request_id"]) <= 128
+                        ):
+                            raise GatewayLifecycleError("invalid gateway audit identity")
+                        admitted = record.get("event") == "admitted"
+                        if admitted and (record.get("version") != 2 or ack_fd is None):
+                            raise GatewayLifecycleError(
+                                "audit admission acknowledgement unavailable"
+                            )
+                        self._emit_log(destination, event, required=True)
+                        if admitted:
+                            self._sync_audit(destination)
+                            ack = {
+                                key: record[key]
+                                for key in ("version", "generation", "incarnation", "request_id")
+                            }
+                            raw = (json.dumps(ack, ensure_ascii=True) + "\n").encode()
+                            if len(raw) > 4096 or not select.select([], [ack_fd], [], 1.0)[1]:
+                                raise GatewayLifecycleError("audit acknowledgement timed out")
+                            if os.write(ack_fd, raw) != len(raw):
+                                raise GatewayLifecycleError("audit acknowledgement interrupted")
+                    if len(buffered) > MAX_AUDIT_EVENT_BYTES:
+                        raise GatewayLifecycleError(
+                            "gateway audit event exceeds transport memory limit"
+                        )
+                if buffered:
+                    raise GatewayLifecycleError("gateway audit record interrupted")
+            except (OSError, ValueError, GatewayLifecycleError) as exc:
+                reason = (
+                    str(exc)
+                    if isinstance(exc, GatewayLifecycleError)
+                    else "invalid audit record encoding"
+                    if isinstance(exc, ValueError)
+                    else "audit sink I/O failed"
+                )
+                self._audit_failure = GatewayLifecycleError(reason)
+                print(
+                    f"sbx: {reason}; stopping gateway (see network diagnostics)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            finally:
+                source.close()
+                if ack_fd is not None:
+                    os.close(ack_fd)
+
+        thread = threading.Thread(target=route, name=f"sbx-gateway-audit-{self.vm_id}", daemon=True)
+        self._log_threads.append(thread)
+        thread.start()
 
     def _route_log(self, source: BinaryIO | None, destination: BinaryIO) -> None:
         if source is None:
@@ -1237,9 +1861,7 @@ class GatewayController:
                 with suppress(Exception):
                     source.close()
 
-        thread = threading.Thread(
-            target=route, name=f"sbx-gateway-log-{self.vm_id}", daemon=True
-        )
+        thread = threading.Thread(target=route, name=f"sbx-gateway-log-{self.vm_id}", daemon=True)
         self._log_threads.append(thread)
         thread.start()
 
@@ -1307,6 +1929,7 @@ class GatewayController:
         rules = [
             {
                 "id": rule.id,
+                "policy": rule.policy_id or rule.id,
                 "host": rule.host,
                 "ports": list(rule.ports),
                 "methods": list(rule.methods),
@@ -1317,114 +1940,47 @@ class GatewayController:
             if rule.protocol == "http"
         ]
         bindings = []
-        for binding in self.config.secrets:
-            kind, reference = binding.provider.split(":", 1)
-            if kind == "env":
-                value = os.environ.get(reference)
-            elif kind == "file":
-                try:
-                    fd = os.open(
-                        reference,
-                        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-                    )
-                    try:
-                        info = os.fstat(fd)
-                        raw = os.read(fd, 65537)
-                    finally:
-                        os.close(fd)
-                except OSError as exc:
+        for credential in self.config.credentials:
+            for binding in credential.bindings:
+                if binding.header is not None:
+                    name, value = (part.strip() for part in binding.header.split(":", 1))
+                    header = {"name": name, "format": "template", "value": value}
+                else:
+                    header = credential.header
+                if header is None:
                     raise GatewayLifecycleError(
-                        "gateway credential provider is unavailable"
-                    ) from exc
-                try:
-                    value = (
-                        raw.decode(errors="strict").strip() if stat.S_ISREG(info.st_mode) else None
+                        f"credential {credential.id!r} binding requires a header"
                     )
-                except UnicodeError as exc:
-                    raise GatewayLifecycleError(
-                        "gateway credential provider is unavailable"
-                    ) from exc
-            else:
-                value = None
-            if (
-                not value
-                or len(value.encode()) > 65536
-                or any(character in value for character in "\r\n\x00")
-            ):
-                raise GatewayLifecycleError("gateway credential provider is unavailable")
-            bindings.append(
-                {
-                    "name": binding.name,
-                    "hosts": list(binding.hosts),
-                    "ports": list(binding.ports),
-                    "methods": list(binding.methods),
-                    "path_prefix": binding.path_prefix,
-                    "header": binding.header,
-                    "placeholder": self._placeholders[binding.name],
-                    "value": value,
-                }
-            )
-        payload = _compact_json({"version": 1, "rules": rules, "secrets": bindings})
+                for policy_id in binding.policies:
+                    for rule in self.config.rules:
+                        if rule.policy_id != policy_id:
+                            continue
+                        bindings.append(
+                            {
+                                "credential": credential.id,
+                                "rule_id": rule.id,
+                                "methods": list(binding.methods),
+                                "paths": list(binding.paths),
+                                "header": header,
+                                "placeholder": self._placeholders[credential.id],
+                            }
+                        )
+        payload = _compact_json({"version": 2, "rules": rules, "credentials": bindings})
         if len(payload) > 65536:
             raise GatewayLifecycleError("gateway mediator policy is too large")
         return payload
 
-    def _mediator_python(self) -> Path:
+    def _mediator_command(
+        self, key_fd: int, ready_fd: int, policy_fd: int, broker_fd: int
+    ) -> list[str]:
         assert self.directory is not None
-        override = os.environ.get("SBX_GATEWAY_MEDIATOR_PYTHON")
-        if override is not None:
-            return _resolve_artifact(
-                "SBX_GATEWAY_MEDIATOR_PYTHON",
-                (),
-                executable=True,
-                label="pinned gateway mediator runtime",
-            )
-        packaged_python = self.directory / "mediator-venv" / "bin" / "python"
-        if not packaged_python.exists() and GATEWAY_MEDIATOR_DIR.exists():
-            _verify_packaged_artifact(GATEWAY_MEDIATOR_DIR / "uv.lock")
-            env = _sanitized_child_environment(self.directory)
-            env["UV_PROJECT_ENVIRONMENT"] = str(self.directory / "mediator-venv")
-            subprocess.run(
-                [
-                    str(_resolve_uv()),
-                    "sync",
-                    "--directory",
-                    str(GATEWAY_MEDIATOR_DIR),
-                    "--locked",
-                    "--no-build",
-                    "--no-dev",
-                    "--managed-python",
-                    "--python",
-                    GATEWAY_PYTHON_VERSION,
-                ],
-                check=True,
-                env=env,
-                timeout=120,
-            )
-            with suppress(OSError):
-                packaged_python.resolve(strict=True).chmod(0o555)
-        with suppress(OSError):
-            packaged_python.resolve(strict=True).chmod(0o555)
-        return _resolve_artifact(
-            "SBX_GATEWAY_MEDIATOR_PYTHON",
-            (packaged_python, GATEWAY_DEV_MEDIATOR_PYTHON, shutil.which("python3.12")),
-            executable=True,
-            label="pinned gateway mediator runtime",
-        )
-
-    def _mediator_command(self, key_fd: int, ready_fd: int, policy_fd: int) -> list[str]:
-        assert self.directory is not None
-        python = self._mediator_python()
         launcher = _resolve_artifact(
-            "SBX_GATEWAY_MEDIATOR_LAUNCHER",
+            None,
             (GATEWAY_MEDIATOR_LAUNCHER, GATEWAY_SOURCE_DIR / "mediator" / "launch.py"),
-            executable=False,
             label="gateway mediator launcher",
         )
-        if launcher.is_relative_to(GATEWAY_RUNTIME_DIR):
-            _verify_packaged_artifact(GATEWAY_MEDIATOR_DIR / "uv.lock")
         return [
-            str(python),
+            sys.executable,
             str(launcher),
             "--vm-id",
             self.vm_id,
@@ -1436,10 +1992,27 @@ class GatewayController:
             str(ready_fd),
             "--policy-fd",
             str(policy_fd),
+            "--broker-fd",
+            str(broker_fd),
+            "--lifetime-fd",
+            str(self._lifetime_read_fd if self._lifetime_read_fd is not None else -1),
             "--confdir",
             str(self.directory),
             "--open-files",
             str(self.config.quotas.open_files // 2),
+            *(["--mitmweb"] if self.config.mitmweb else []),
+            "--generation",
+            self.generation,
+            *(
+                [
+                    "--audit-fd",
+                    str(self._audit_write_fd),
+                    "--audit-ack-fd",
+                    str(self._audit_ack_read_fd),
+                ]
+                if self._audit_write_fd is not None
+                else []
+            ),
         ]
 
     def _worker_command(self, key_fd: int | None, token_fd: int) -> list[str]:
@@ -1447,11 +2020,8 @@ class GatewayController:
         worker = _resolve_artifact(
             "SBX_GATEWAY_BIN",
             (GATEWAY_WORKER, GATEWAY_DEV_WORKER, shutil.which("sbx-gateway")),
-            executable=True,
-            label="exact gateway worker artifact",
+            label="gateway worker artifact",
         )
-        if worker.is_relative_to(GATEWAY_RUNTIME_DIR):
-            _verify_packaged_artifact(worker)
         policy = _read_json(self.directory / "policy.json")
         digest = policy.get("digest")
         if not isinstance(digest, str):
@@ -1472,8 +2042,15 @@ class GatewayController:
             str(self.qemu_listener.fileno() if self.qemu_listener is not None else -1),
             "--worker-incarnation",
             self.worker_incarnation,
+            *(
+                ["--dns-state-fd", str(self._dns_state_fd)]
+                if self._dns_state_fd is not None
+                else []
+            ),
             "--incarnation-token-fd",
             str(token_fd),
+            "--supervisor-lifetime-fd",
+            str(self._lifetime_read_fd if self._lifetime_read_fd is not None else -1),
         ]
         if key_fd is not None and self.mediator_address is not None:
             command.extend(
@@ -1530,9 +2107,7 @@ class GatewayController:
                 raise GatewayLifecycleError(f"{label} returned oversized readiness data")
         raise GatewayLifecycleError(f"timed out waiting for {label} readiness")
 
-    def _read_worker_status(
-        self, expected: str, deadline: float | None = None
-    ) -> dict[str, Any]:
+    def _read_worker_status(self, expected: str, deadline: float | None = None) -> dict[str, Any]:
         process = self.processes["worker"]
         stdout = self._worker_stdout
         if stdout is None:
@@ -1571,6 +2146,28 @@ class GatewayController:
         assert self.directory is not None and self._mediator_policy_payload is not None
         policy = self._policy()
         key = secrets.token_bytes(32)
+        lifetime_read, lifetime_write = os.pipe()
+        self._lifetime_read_fd = lifetime_read
+        self._lifetime_write_fd = lifetime_write
+        self._broker_socket, mediator_broker = socket.socketpair()
+        if self._credential_broker is not None:
+            threading.Thread(
+                target=self._credential_broker.serve,
+                args=(self._broker_socket, self.worker_incarnation),
+                daemon=True,
+                name=f"sbx-credential-broker-{self.vm_id}",
+            ).start()
+        if self._audit_stream is None:
+            self._audit_stream = self._open_log("audit.log")
+        audit_read, audit_write = os.pipe()
+        self._audit_write_fd = audit_write
+        try:
+            ack_read, ack_write = os.pipe()
+        except OSError:
+            os.close(audit_read)
+            raise
+        self._audit_ack_read_fd = ack_read
+        self._route_audit(os.fdopen(audit_read, "rb", buffering=0), self._audit_stream, ack_write)
         mediator_key = self._pipe_with(key)
         mediator_policy_fd, mediator_policy_write = os.pipe()
         ready_read, ready_write = os.pipe()
@@ -1578,21 +2175,38 @@ class GatewayController:
             try:
                 mediator_log = self._open_log(f"mediator-{self.worker_incarnation}.log")
                 mediator = self.runner(
-                    self._mediator_command(mediator_key, ready_write, mediator_policy_fd),
+                    self._mediator_command(
+                        mediator_key, ready_write, mediator_policy_fd, mediator_broker.fileno()
+                    ),
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    pass_fds=(mediator_key, ready_write, mediator_policy_fd),
+                    pass_fds=(
+                        mediator_key,
+                        ready_write,
+                        mediator_policy_fd,
+                        mediator_broker.fileno(),
+                        lifetime_read,
+                        audit_write,
+                        ack_read,
+                    ),
                     close_fds=True,
                     start_new_session=True,
-                    env=_sanitized_child_environment(self.directory),
+                    env=_sanitized_child_environment(
+                        self.directory, path=os.environ.get("PATH", os.defpath)
+                    ),
                 )
                 self.processes["mediator"] = mediator
                 self._route_log(getattr(mediator, "stdout", None), mediator_log)
             finally:
+                os.close(audit_write)
+                self._audit_write_fd = None
+                os.close(ack_read)
+                self._audit_ack_read_fd = None
                 os.close(mediator_key)
                 os.close(mediator_policy_fd)
                 os.close(ready_write)
+                mediator_broker.close()
             view = memoryview(self._mediator_policy_payload)
             os.set_blocking(mediator_policy_write, False)
             while view:
@@ -1605,7 +2219,15 @@ class GatewayController:
                 view = view[os.write(mediator_policy_write, view) :]
             os.close(mediator_policy_write)
             mediator_policy_write = -1
-            ready = self._read_json_fd(ready_read, mediator, "mediator", deadline=deadline)
+            try:
+                ready = self._read_json_fd(ready_read, mediator, "mediator", deadline=deadline)
+            except GatewayLifecycleError as exc:
+                self._reap_log_threads()
+                log_path = self.directory / f"mediator-{self.worker_incarnation}.log"
+                detail = log_path.read_text(errors="replace").strip()[-1000:]
+                if detail:
+                    raise GatewayLifecycleError(f"{exc}: {detail}") from exc
+                raise
         finally:
             if mediator_policy_write >= 0:
                 os.close(mediator_policy_write)
@@ -1631,7 +2253,13 @@ class GatewayController:
                 file=sys.stderr,
             )
             self._warned_hardening = True
+        if self.config.mitmweb:
+            web_port = ready.get("web_port")
+            if type(web_port) is not int or not 1 <= web_port <= 65535:
+                raise GatewayAuthenticationError("mediator web readiness mismatch")
+            _atomic_json(self.directory, "web.json", {"port": web_port})
         self.mediator_address = f"127.0.0.1:{ready['port']}"
+        deadline = time.monotonic() + self.timeout
 
         has_http = any(rule.protocol == "http" for rule in self.config.rules)
         worker_key = self._pipe_with(key) if has_http else None
@@ -1639,15 +2267,29 @@ class GatewayController:
         qemu_fd = self.qemu_listener.fileno() if self.qemu_listener is not None else -1
         ingress_fds = tuple(listener.fileno() for listener in self.listeners)
         try:
+            try:
+                self._dns_state_fd = self._open_dns_state(policy)
+            except GatewayStateError as exc:
+                raise GatewayAuthenticationError("unsafe worker DNS state") from exc
+            except OSError as exc:
+                # Translate filesystem failure at worker startup so recovery fails closed.
+                raise GatewayLifecycleError("worker DNS state I/O failed") from exc
             worker_log = self._open_log(f"worker-{self.worker_incarnation}.log")
             worker = self.runner(
                 self._worker_command(worker_key, token_fd),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                pass_fds=(qemu_fd, token_fd, *ingress_fds)
+                pass_fds=(qemu_fd, token_fd, lifetime_read, self._dns_state_fd, *ingress_fds)
                 if worker_key is None
-                else (qemu_fd, token_fd, worker_key, *ingress_fds),
+                else (
+                    qemu_fd,
+                    token_fd,
+                    worker_key,
+                    lifetime_read,
+                    self._dns_state_fd,
+                    *ingress_fds,
+                ),
                 close_fds=True,
                 start_new_session=True,
                 env=_sanitized_child_environment(self.directory),
@@ -1657,10 +2299,23 @@ class GatewayController:
             self._route_log(getattr(worker, "stderr", None), worker_log)
             self._worker_buffer.clear()
         finally:
+            if self._dns_state_fd is not None:
+                os.close(self._dns_state_fd)
+                self._dns_state_fd = None
             os.close(token_fd)
             if worker_key is not None:
                 os.close(worker_key)
-        ready = self._read_worker_status("ready", deadline)
+            os.close(lifetime_read)
+            self._lifetime_read_fd = None
+        try:
+            ready = self._read_worker_status("ready", deadline)
+        except GatewayLifecycleError as exc:
+            self._reap_log_threads()
+            log_path = self.directory / f"worker-{self.worker_incarnation}.log"
+            detail = log_path.read_text(errors="replace").strip()[-1000:]
+            if detail:
+                raise GatewayLifecycleError(f"{exc}: {detail}") from exc
+            raise
         if (
             ready.get("version") != 1
             or ready.get("vm_id") != self.vm_id
@@ -1677,6 +2332,28 @@ class GatewayController:
             raise GatewayAuthenticationError("worker readiness identity mismatch")
 
     def _discard_data_plane(self) -> None:
+        if self._audit_ack_read_fd is not None:
+            with suppress(OSError):
+                os.close(self._audit_ack_read_fd)
+            self._audit_ack_read_fd = None
+        if self._audit_write_fd is not None:
+            with suppress(OSError):
+                os.close(self._audit_write_fd)
+            self._audit_write_fd = None
+        if self._lifetime_write_fd is not None:
+            with suppress(OSError):
+                os.close(self._lifetime_write_fd)
+            self._lifetime_write_fd = None
+        if self._lifetime_read_fd is not None:
+            with suppress(OSError):
+                os.close(self._lifetime_read_fd)
+            self._lifetime_read_fd = None
+        if self._broker_socket is not None:
+            # Wake the broker reader so disconnected lock/slot waiters can cancel.
+            with suppress(OSError):
+                self._broker_socket.shutdown(socket.SHUT_RDWR)
+            self._broker_socket.close()
+            self._broker_socket = None
         for name in ("worker", "mediator"):
             process = self.processes.pop(name, None)
             if process is not None:
@@ -1695,7 +2372,16 @@ class GatewayController:
             raise GatewayLifecycleError("gateway is already prepared")
         self._mediator_policy_payload = self._mediator_policy()
         try:
-            self.directory = create_state(self.config, self.vm_id, self.generation, root=self.root)
+            self.runtime_directory = _create_runtime_directory(
+                self.generation, root=self.runtime_root
+            )
+            self.directory = create_state(
+                self.config,
+                self.vm_id,
+                self.generation,
+                root=self.root,
+                runtime_directory=self.runtime_directory,
+            )
             self._immutable_policy = (self.directory / "policy.json").read_bytes()
             update_state(self.directory, status="starting")
             self._reserve_qemu_listener()
@@ -1715,14 +2401,17 @@ class GatewayController:
         pids = {name: process.pid for name, process in self.processes.items()}
         if self._qemu_pid is not None:
             pids["qemu"] = self._qemu_pid
+        if self._owner_pid is not None:
+            pids["supervisor"] = self._owner_pid
         return pids
 
-    def vm_network_ready(self, qemu_pid: int) -> None:
+    def vm_network_ready(self, qemu_pid: int, timeout: float | None = None) -> None:
         """Complete readiness only after QEMU exchanges a valid framed packet."""
         if self.directory is None:
             raise GatewayLifecycleError("gateway has not been prepared")
+        deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
         try:
-            ready = self._read_worker_status("network-ready")
+            ready = self._read_worker_status("network-ready", deadline)
             if self.config.platform == "linux" and ready.get("qemu_pid") != qemu_pid:
                 raise GatewayAuthenticationError("QEMU peer process identity mismatch")
             if any(process.poll() is not None for process in self.processes.values()):
@@ -1792,7 +2481,7 @@ class GatewayController:
                     last_error = exc
             error = GatewayLifecycleError(f"gateway reconnection failed: {last_error}")
             self._fail_recovery(error)
-            raise error
+            raise error from last_error
 
     def _resource_ceiling_exceeded(self) -> bool:
         if self.config.platform != "linux":
@@ -1896,6 +2585,19 @@ class GatewayController:
                     failure=("controller", "worker_failed"),
                 )
 
+    def _fail_audit(self) -> None:
+        self._supervisor_failure = self._audit_failure
+        self._draining = True
+        self._discard_data_plane()
+        self._close_endpoints()
+        if self.directory is not None:
+            update_state(
+                self.directory,
+                status="failed",
+                pids=self._process_ids(),
+                failure=("controller", "audit_failed"),
+            )
+
     def _supervise(self) -> None:
         while not self._supervisor_stop.wait(0.05):
             if self._closed or self._draining:
@@ -1903,18 +2605,19 @@ class GatewayController:
             worker = self.processes.get("worker")
             mediator = self.processes.get("mediator")
             try:
+                if self._audit_failure is not None:
+                    with self._lock:
+                        self._fail_audit()
+                    return
                 if (
                     self.directory is not None
                     and read_state(self.directory)["status"] == "draining"
                 ):
                     return
-                if worker is not None and worker.poll() is not None:
+                if (worker is not None and worker.poll() is not None) or (
+                    mediator is not None and mediator.poll() is not None
+                ):
                     self.recover()
-                elif mediator is not None and mediator.poll() is not None:
-                    with self._lock:
-                        error = GatewayLifecycleError("gateway mediator exited")
-                        self._fail_recovery(error)
-                        return
                 else:
                     self._drain_worker_stats()
                     if self._resource_ceiling_exceeded():
@@ -1928,6 +2631,10 @@ class GatewayController:
                 return
 
     def check(self) -> None:
+        if self._audit_failure is not None:
+            with self._lock:
+                self._fail_audit()
+            raise self._audit_failure
         if self._supervisor_failure is not None:
             raise self._supervisor_failure
         worker = self.processes.get("worker")
@@ -1936,9 +2643,8 @@ class GatewayController:
             return
         mediator = self.processes.get("mediator")
         if mediator is not None and mediator.poll() is not None:
-            error = GatewayLifecycleError("gateway mediator exited")
-            self._fail_recovery(error)
-            raise error
+            self.recover()
+            return
         if self.directory is not None and read_state(self.directory)["status"] == "ready":
             self._drain_worker_stats()
             if self._resource_ceiling_exceeded():
@@ -1982,61 +2688,452 @@ class GatewayController:
             with suppress(Exception):
                 self.qemu_listener.close()
             self.qemu_listener = None
-        if self.directory is not None:
+        if self.runtime_directory is not None:
             with suppress(FileNotFoundError):
                 self.qemu_socket.unlink()
 
     def drain(self) -> None:
         """Stop accepting controller-owned endpoints before QEMU teardown."""
-        self._draining = True
-        self._close_endpoints()
-        if self.directory is not None and not self._closed:
-            with suppress(Exception):
-                update_state(self.directory, status="draining")
+        with self._lock:
+            self._draining = True
+            self._close_endpoints()
+            self._discard_data_plane()
+            if self.directory is not None and not self._closed:
+                with suppress(Exception):
+                    update_state(self.directory, status="draining")
 
-    def rollback(self, code: str = "cleanup_failed") -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._draining = True
-        self._supervisor_stop.set()
-        if self.directory is not None:
-            with suppress(Exception):
-                update_state(
-                    self.directory,
-                    status="failed",
-                    pids=self._process_ids(),
-                    failure=("controller", code),
-                )
-        self._close_endpoints()
-        self._discard_data_plane()
+    def rollback(self, code: str = "cleanup_failed", *, preserve_state: bool = False) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._draining = True
+            self._supervisor_stop.set()
+            if self.directory is not None and not preserve_state:
+                with suppress(Exception):
+                    update_state(
+                        self.directory,
+                        status="failed",
+                        pids=self._process_ids(),
+                        failure=("controller", code),
+                    )
+            self._close_endpoints()
+            self._discard_data_plane()
+            for stream in self._logs:
+                with suppress(Exception):
+                    stream.close()
+            self._logs.clear()
+            self._mediator_policy_payload = None
+            self._incarnation_token = b""
+            if self.directory is not None:
+                if preserve_state:
+                    _preserve_stopped_state(self.directory, ownership_fd=self._ownership_fd)
+                else:
+                    _rollback_state_directory(self.directory, ownership_fd=self._ownership_fd)
+            elif self.runtime_directory is not None:
+                with suppress(Exception):
+                    _remove_runtime_directory(self.runtime_directory)
         if self._supervisor is not None and self._supervisor is not threading.current_thread():
             self._supervisor.join(timeout=1)
-        for stream in self._logs:
-            with suppress(Exception):
-                stream.close()
-        self._logs.clear()
-        self._mediator_policy_payload = None
-        self._incarnation_token = b""
+
+    def close(self) -> None:
+        self.rollback(preserve_state=True)
+
+
+from sbx import gateway_supervisor  # noqa: E402 - imported after GatewayController is defined
+
+
+class PersistentGatewayController:
+    """CLI-side handle for a dedicated supervisor subprocess."""
+
+    def __init__(
+        self,
+        config: GatewayConfig,
+        vm_id: str,
+        *,
+        root: Path | None = None,
+        runtime_root: Path | None = None,
+        generation: str | None = None,
+        timeout: float = 10.0,
+        runner: Callable[..., Any] = subprocess.Popen,
+    ) -> None:
+        self.config = config
+        self.vm_id = _validate_id(vm_id, "VM identity")
+        self.generation = generation or uuid.uuid4().hex
+        self.root = GATEWAY_STATE_DIR if root is None else root
+        self.runtime_root = runtime_root
+        if timeout <= 0:
+            raise ValueError("gateway lifecycle timeout must be positive")
+        self.timeout = timeout
+        self.runner = runner
+        self.directory: Path | None = None
+        self.runtime_directory: Path | None = None
+        self.mac = ""
+        self._placeholders: dict[str, str] = {}
+        self._bootstrap: socket.socket | None = None
+        self._process: Any = None
+        self._committed = False
+        self._lock_fd: int | None = None
+
+    @property
+    def qemu_socket(self) -> Path:
+        if self.runtime_directory is None:
+            raise GatewayLifecycleError("gateway has not been prepared")
+        return self.runtime_directory / "qemu-net.sock"
+
+    @property
+    def credential_placeholders(self) -> dict[str, str]:
+        return {
+            credential.environment: self._placeholders[credential.id]
+            for credential in self.config.credentials
+            if credential.id in self._placeholders
+        }
+
+    def _acquire_lock(self) -> int:
+        base = _state_root(self.root)
+        vm_directory = base / self.vm_id
+        _private_directory(vm_directory, create=True)
+        path = vm_directory / "ownership.lock"
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        os.fchmod(fd, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(fd)
+            raise GatewayLifecycleError("gateway is already owned by a live supervisor") from exc
+        try:
+            generations, _current = _read_vm_state(vm_directory)
+            for generation, state in generations.items():
+                entry = vm_directory / generation
+                if any(_pid_is_running(pid) for pid in state["pids"].values()):
+                    raise GatewayLifecycleError(
+                        "gateway has live stale processes; stop/start required"
+                    )
+                if state["status"] == "prepared" and not (entry / "audit.log").exists():
+                    _remove_state_directory(entry, ownership_fd=fd)
+                else:
+                    _preserve_stopped_state(entry, ownership_fd=fd)
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    @staticmethod
+    def _payload_file(directory: Path, payload: bytes) -> BinaryIO:
+        stream = tempfile.TemporaryFile(dir=directory)  # noqa: SIM115
+        stream.write(payload)
+        stream.seek(0)
+        return stream
+
+    def prepare(self) -> None:
         if self.directory is not None:
-            with suppress(Exception):
-                _remove_state_directory(self.directory)
+            raise GatewayLifecycleError("gateway is already prepared")
+        self._lock_fd = self._acquire_lock()
+        staging = GatewayController(
+            self.config,
+            self.vm_id,
+            root=self.root,
+            runtime_root=self.runtime_root,
+            generation=self.generation,
+            timeout=self.timeout,
+        )
+        inherited: list[Any] = []
+        try:
+            inherited_names = {
+                name
+                for credential in self.config.credentials
+                for name in credential.inherit_environment
+            }
+            missing = sorted(inherited_names - os.environ.keys())
+            if missing:
+                raise GatewayLifecycleError(
+                    f"credential provider requires missing host environment {missing[0]!r}"
+                )
+            provider_payload = _compact_json(
+                {
+                    "baseline": {
+                        "HOME": os.environ.get("HOME", str(Path.home())),
+                        "PATH": os.environ.get("PATH", os.defpath),
+                        "TZ": os.environ.get("TZ", "UTC"),
+                    },
+                    "inherited": {name: os.environ[name] for name in inherited_names},
+                }
+            )
+            self.runtime_directory = _create_runtime_directory(
+                self.generation, root=self.runtime_root
+            )
+            self.directory = create_state(
+                self.config,
+                self.vm_id,
+                self.generation,
+                root=self.root,
+                runtime_directory=self.runtime_directory,
+                ownership_fd=self._lock_fd,
+            )
+            staging.directory = self.directory
+            staging.runtime_directory = self.runtime_directory
+            staging._reserve_qemu_listener()
+            staging._reserve_listeners()
+            self.mac = staging.mac
+            self._placeholders = dict(staging._placeholders)
+            metadata = {
+                "config": gateway_supervisor.config_payload(self.config),
+                "requested_config_digest": self.config.digest(self.vm_id, self.generation),
+                "vm_id": self.vm_id,
+                "generation": self.generation,
+                "root": str(self.root),
+                "directory": str(self.directory),
+                "runtime_directory": str(self.runtime_directory),
+                "timeout": self.timeout,
+                "mac": self.mac,
+                "placeholders": self._placeholders,
+                "listener_rules": [asdict(rule) for rule in staging.listener_rules],
+                "qemu_fd": staging.qemu_listener.fileno(),
+                "listener_fds": [listener.fileno() for listener in staging.listeners],
+            }
+            config_file = self._payload_file(self.directory, _compact_json(metadata))
+            provider_file = self._payload_file(self.directory, provider_payload)
+            parent, child = socket.socketpair()
+            self._bootstrap = parent
+            inherited.extend((config_file, provider_file, child))
+            pass_fds = (
+                child.fileno(),
+                config_file.fileno(),
+                provider_file.fileno(),
+                self._lock_fd,
+                staging.qemu_listener.fileno(),
+                *(listener.fileno() for listener in staging.listeners),
+            )
+            command = [
+                sys.executable,
+                "-m",
+                "sbx.gateway_supervisor",
+                "--bootstrap-fd",
+                str(child.fileno()),
+                "--config-fd",
+                str(config_file.fileno()),
+                "--provider-fd",
+                str(provider_file.fileno()),
+                "--lock-fd",
+                str(self._lock_fd),
+            ]
+            self._process = self.runner(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                pass_fds=pass_fds,
+                close_fds=True,
+                start_new_session=True,
+                cwd=self.directory,
+                env=_sanitized_child_environment(
+                    self.directory, path=os.environ.get("PATH", os.defpath)
+                ),
+            )
+            response = gateway_supervisor.recv_frame(parent, self.timeout)
+            if (
+                response.get("status") != "prepared"
+                or response.get("generation") != self.generation
+            ):
+                detail = str(response.get("error", "failed to prepare"))
+                raise GatewayLifecycleError(f"gateway supervisor failed to prepare: {detail}")
+            os.close(self._lock_fd)
+            self._lock_fd = None
+        except BaseException:
+            self.rollback("startup_failed")
+            raise
+        finally:
+            for resource in inherited:
+                with suppress(Exception):
+                    resource.close()
+            if staging.qemu_listener is not None:
+                staging.qemu_listener.close()
+                staging.qemu_listener = None
+            for listener in staging.listeners:
+                listener.close()
+            staging.listeners.clear()
+
+    def vm_network_ready(self, qemu_pid: int, timeout: float | None = None) -> None:
+        if self._bootstrap is None:
+            raise GatewayLifecycleError("gateway has not been prepared")
+        try:
+            gateway_supervisor.send_frame(
+                self._bootstrap,
+                {
+                    "version": 1,
+                    "generation": self.generation,
+                    "operation": "commit",
+                    "qemu_pid": qemu_pid,
+                    "timeout": self.timeout if timeout is None else timeout,
+                },
+            )
+            response = gateway_supervisor.recv_frame(
+                self._bootstrap, self.timeout if timeout is None else timeout
+            )
+            if response.get("status") != "ready" or response.get("generation") != self.generation:
+                detail = str(response.get("error", "failed readiness commit"))
+                raise GatewayLifecycleError(f"gateway supervisor failed readiness commit: {detail}")
+        except BaseException:
+            self.rollback("startup_failed")
+            raise
+        self._committed = True
+        self._bootstrap.close()
+        self._bootstrap = None
+
+    def _request(self, operation: str) -> dict[str, Any]:
+        if self.directory is None:
+            raise GatewayLifecycleError("gateway has not been prepared")
+        return control_request(self.vm_id, operation, root=self.root, timeout=self.timeout)
+
+    def check(self) -> None:
+        response = self._request("check")
+        if response.get("status") == "failed":
+            raise GatewayLifecycleError("gateway supervisor reports failure")
+
+    def drain(self) -> None:
+        if self._committed:
+            self._request("drain")
+
+    def rollback(self, code: str = "cleanup_failed") -> None:
+        del code
+        if self._committed:
+            try:
+                self._request("shutdown")
+            except GatewayLifecycleError:
+                stop(self.vm_id, root=self.root)
+        else:
+            if self._bootstrap is not None:
+                self._bootstrap.close()
+                self._bootstrap = None
+            if self._process is not None:
+                GatewayController._terminate(self._process)
+            if self.directory is not None and self.directory.exists():
+                _rollback_state_directory(self.directory, ownership_fd=self._lock_fd)
+            elif self.runtime_directory is not None and self.runtime_directory.exists():
+                with suppress(Exception):
+                    _remove_runtime_directory(self.runtime_directory)
+        if self._lock_fd is not None:
+            os.close(self._lock_fd)
+            self._lock_fd = None
+        self._committed = False
 
     close = rollback
 
 
-def _remove_state_directory(directory: Path) -> None:
-    _private_directory(directory)
+def control_request(
+    vm_id: str,
+    operation: str,
+    *,
+    root: Path | None = None,
+    timeout: float = 3.0,
+) -> dict[str, Any]:
+    directory = _latest_directory(vm_id, root)
+    if directory is None:
+        raise GatewayLifecycleError("gateway supervisor is inactive")
+    state = read_state(directory, vm_id=vm_id)
+    path_value = state["sockets"].get("control")
+    if not isinstance(path_value, str):
+        raise GatewayLifecycleError("gateway supervisor is inactive")
+    path = Path(path_value)
+    _reject_symlink_ancestors(path.parent)
+    _private_directory(path.parent)
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise GatewayLifecycleError("gateway supervisor is unresponsive") from exc
+    if (
+        not stat.S_ISSOCK(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o600
+    ):
+        raise GatewayStateError("unsafe gateway control socket")
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        client.settimeout(timeout)
+        client.connect(str(path))
+        gateway_supervisor.send_frame(
+            client,
+            {"version": 1, "generation": state["generation"], "operation": operation},
+        )
+        response = gateway_supervisor.recv_frame(client, timeout)
+    except OSError as exc:
+        raise GatewayLifecycleError("gateway supervisor is unresponsive") from exc
+    finally:
+        client.close()
+    if (
+        response.get("version") != 1
+        or response.get("generation") != state["generation"]
+        or "error" in response
+    ):
+        raise GatewayLifecycleError(str(response.get("error", "gateway control identity mismatch")))
+    return response
+
+
+def drain(vm_id: str, *, root: Path | None = None) -> None:
+    directory = _latest_directory(vm_id, root)
+    if directory is None:
+        return
+    control_request(vm_id, "drain", root=root)
+
+
+def _rollback_state_directory(directory: Path, *, ownership_fd: int | None = None) -> None:
+    audit = directory / "audit.log"
+    if audit.exists() or audit.is_symlink():
+        info = audit.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise GatewayStateError("unsafe gateway audit file")
+        if info.st_size > 0:
+            _preserve_stopped_state(directory, ownership_fd=ownership_fd)
+            return
+    _remove_state_directory(directory, ownership_fd=ownership_fd)
+
+
+def _preserve_stopped_state(directory: Path, *, ownership_fd: int | None = None) -> None:
+    """Remove runtime secrets/endpoints, retaining generation audit evidence."""
+    with _state_lock(directory.parent, ownership_fd):
+        _private_directory(directory)
+        state = read_state(directory)
+        runtime = state["runtime_directory"]
+        if isinstance(runtime, str):
+            path = Path(runtime)
+            if path.exists() or path.is_symlink():
+                _remove_runtime_directory(path)
+        for entry in directory.iterdir():
+            if entry.name in {"web-auth.json", "web.json"} or (
+                entry.name.startswith("mitmproxy-") and not entry.name.endswith(".log")
+            ):
+                entry.unlink()
+        update_state(
+            directory,
+            status="stopped",
+            pids={},
+            sockets={} if runtime is not None else None,
+            listeners=[],
+        )
+
+
+def _remove_state_directory(directory: Path, *, ownership_fd: int | None = None) -> None:
     vm_directory = directory.parent
-    shutil.rmtree(directory)
-    with suppress(OSError):
-        vm_directory.rmdir()
+    with _state_lock(vm_directory, ownership_fd):
+        _private_directory(directory)
+        state = read_state(directory)
+        _generations, current = _read_vm_state(vm_directory)
+        if current == directory.name:
+            # The selected directory remains intact if clearing/syncing its reference fails.
+            _write_current(vm_directory, None)
+        runtime_value = state["runtime_directory"]
+        if isinstance(runtime_value, str):
+            runtime_directory = Path(runtime_value)
+            if runtime_directory.exists() or runtime_directory.is_symlink():
+                _remove_runtime_directory(runtime_directory)
+        shutil.rmtree(directory)
 
 
 def _latest_directory(vm_id: str, root: Path | None = None) -> Path | None:
     state, error = _latest_state(vm_id, root)
     if error is not None:
-        raise GatewayStateError("unsafe gateway state")
+        raise GatewayStateError(f"unsafe gateway state: {error}")
     if state is None:
         return None
     base = GATEWAY_STATE_DIR if root is None else root
@@ -2064,51 +3161,170 @@ def _process_matches(pid: int, component: str, directory: Path) -> bool:
     return marker in command and os.fsencode(directory) in command
 
 
-def stop(vm_id: str, *, root: Path | None = None) -> None:
-    """Stop a persisted gateway without trusting arbitrary PIDs from stale state."""
-    directory = _latest_directory(vm_id, root)
-    if directory is None:
+def _fallback_lock(directory: Path, *, timeout: float = 0) -> int:
+    path = directory.parent / "ownership.lock"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            # Shutdown acknowledgement can precede process exit and lock release.
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                raise GatewayStateError("gateway supervisor still owns the lifecycle lock") from exc
+            time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+        else:
+            return fd
+
+
+def _pidfd_open(pid: int) -> int:
+    if opener := getattr(os, "pidfd_open", None):
+        return opener(pid)
+    libc = ctypes.CDLL(None, use_errno=True)
+    fd = int(libc.syscall(434, pid, 0))
+    if fd < 0:
+        error = ctypes.get_errno()
+        if error == 3:
+            raise ProcessLookupError(pid)
+        if error in {22, 38}:
+            raise GatewayStateError("safe gateway cleanup requires Linux pidfd support")
+        raise OSError(error, os.strerror(error))
+    return fd
+
+
+def _pidfd_send_signal(fd: int, sig: signal.Signals) -> None:
+    if sender := getattr(signal, "pidfd_send_signal", None):
+        sender(fd, sig)
         return
-    state = read_state(directory, vm_id=vm_id)
-    update_state(directory, status="draining")
-    for component in ("worker", "mediator"):
-        pid = state["pids"].get(component)
-        if pid is None or not _pid_is_running(pid):
-            continue
-        if not _process_matches(pid, component, directory):
-            raise GatewayStateError(f"refusing unverified gateway {component} process")
-        with suppress(ProcessLookupError):
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-    deadline = time.monotonic() + 3
-    while time.monotonic() < deadline and any(
-        _pid_is_running(state["pids"].get(name, 0)) for name in ("worker", "mediator")
-    ):
-        time.sleep(0.05)
-    remaining = []
-    for component in ("worker", "mediator"):
-        pid = state["pids"].get(component)
-        if pid and _pid_is_running(pid):
-            with suppress(ProcessLookupError):
-                os.killpg(os.getpgid(pid), signal.SIGKILL)
-            remaining.append((component, pid))
-    deadline = time.monotonic() + 1
-    while remaining and time.monotonic() < deadline:
-        remaining = [(name, pid) for name, pid in remaining if _pid_is_running(pid)]
-        if remaining:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.syscall(424, fd, int(sig), 0, 0) < 0:
+        error = ctypes.get_errno()
+        if error in {22, 38}:
+            raise GatewayStateError("safe gateway cleanup requires Linux pidfd signaling")
+        if error != 3:
+            raise OSError(error, os.strerror(error))
+
+
+def _pidfd_for_owned_process(pid: int, component: str, directory: Path) -> int:
+    if sys.platform != "linux":
+        raise GatewayStateError(
+            "refusing unauthenticated macOS orphan cleanup; manual cleanup is required"
+        )
+    try:
+        fd = _pidfd_open(pid)
+    except ProcessLookupError:
+        return -1
+    if component == "supervisor":
+        try:
+            command = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+            cwd = (Path("/proc") / str(pid) / "cwd").resolve()
+        except OSError:
+            os.close(fd)
+            raise GatewayStateError("refusing unverified gateway supervisor process") from None
+        matches = b"sbx.gateway_supervisor" in command and cwd == directory.resolve()
+    else:
+        matches = _process_matches(pid, component, directory)
+    if not matches:
+        os.close(fd)
+        raise GatewayStateError(f"refusing unverified gateway {component} process")
+    return fd
+
+
+def stop(vm_id: str, *, root: Path | None = None) -> None:
+    """Shutdown a drained supervisor, using pidfds only after its lock is released."""
+    directory = _latest_directory(vm_id, root)
+    if directory is None or read_state(directory, vm_id=vm_id)["status"] == "stopped":
+        vm_directory = (GATEWAY_STATE_DIR if root is None else root) / vm_id
+        if vm_directory.exists():
+            with _state_lock(vm_directory, timeout=3):
+                states, current = _read_vm_state(vm_directory)
+                if current is not None and states[current]["status"] != "stopped":
+                    raise GatewayStateError("gateway lifecycle changed; retry stop")
+        return
+    try:
+        control_request(vm_id, "shutdown", root=root)
+        return
+    except GatewayLifecycleError:
+        pass
+    lock_fd = _fallback_lock(directory)
+    pidfds: list[tuple[str, int]] = []
+    try:
+        state = read_state(directory, vm_id=vm_id)
+        for component in ("supervisor", "worker", "mediator"):
+            pid = state["pids"].get(component)
+            if pid and _pid_is_running(pid):
+                fd = _pidfd_for_owned_process(pid, component, directory)
+                if fd >= 0:
+                    pidfds.append((component, fd))
+        for _, fd in pidfds:
+            _pidfd_send_signal(fd, signal.SIGTERM)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and any(
+            _pid_is_running(state["pids"].get(name, 0))
+            for name in ("supervisor", "worker", "mediator")
+        ):
             time.sleep(0.05)
-    if remaining:
-        raise GatewayStateError(f"gateway {remaining[0][0]} did not stop")
-    _remove_state_directory(directory)
+        for name, fd in pidfds:
+            if _pid_is_running(state["pids"].get(name, 0)):
+                _pidfd_send_signal(fd, signal.SIGKILL)
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and any(
+            _pid_is_running(state["pids"].get(name, 0))
+            for name in ("supervisor", "worker", "mediator")
+        ):
+            time.sleep(0.05)
+        if any(
+            _pid_is_running(state["pids"].get(name, 0))
+            for name in ("supervisor", "worker", "mediator")
+        ):
+            raise GatewayStateError("gateway process did not stop")
+        _preserve_stopped_state(directory, ownership_fd=lock_fd)
+    finally:
+        for _, fd in pidfds:
+            os.close(fd)
+        os.close(lock_fd)
+
+
+def remove(vm_id: str, *, root: Path | None = None) -> None:
+    """Explicit VM removal deletes retained generations under the ownership lock."""
+    stop(vm_id, root=root)
+    vm_directory = (GATEWAY_STATE_DIR if root is None else root) / vm_id
+    if not vm_directory.exists():
+        return
+    lock_fd = _fallback_lock(vm_directory / "state", timeout=3)
+    try:
+        generations, _current = _read_vm_state(vm_directory)
+        for state in generations.values():
+            if any(_pid_is_running(pid) for pid in state["pids"].values()):
+                raise GatewayStateError("refusing to remove live gateway generation")
+        for generation in generations:
+            _remove_state_directory(vm_directory / generation, ownership_fd=lock_fd)
+        pointer = vm_directory / "current.json"
+        if pointer.exists():
+            pointer.unlink()
+            directory_fd = os.open(vm_directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        os.close(lock_fd)
 
 
 def active(vm_id: str, *, root: Path | None = None) -> bool:
-    directory = _latest_directory(vm_id, root)
-    if directory is None:
+    try:
+        return control_request(vm_id, "status", root=root).get("status") in {
+            "ready",
+            "recovering",
+        }
+    except (GatewayLifecycleError, GatewayStateError):
         return False
-    state = read_state(directory, vm_id=vm_id)
-    return state["status"] == "ready" and all(
-        _pid_is_running(state["pids"].get(name, 0)) for name in ("qemu", "worker", "mediator")
-    )
+
+
+def configuration_drift(vm_id: str, configured: GatewayConfig, *, root: Path | None = None) -> bool:
+    response = control_request(vm_id, "status", root=root)
+    return response["config_digest"] != configured.digest(vm_id, response["generation"])
 
 
 def _latest_state(vm_id: str, root: Path | None = None) -> tuple[dict[str, Any] | None, str | None]:
@@ -2122,17 +3338,25 @@ def _latest_state(vm_id: str, root: Path | None = None) -> tuple[dict[str, Any] 
         if not vm_directory.exists() and not vm_directory.is_symlink():
             return None, None
         _private_directory(vm_directory)
-        candidates = []
-        for entry in vm_directory.iterdir():
-            if entry.is_symlink() or not entry.is_dir() or _ID_RE.fullmatch(entry.name) is None:
-                raise GatewayStateError("unsafe gateway incarnation entry")
-            state = read_state(entry, vm_id=vm_id)
-            candidates.append(state)
-        if not candidates:
-            return None, None
-        return max(candidates, key=lambda item: str(item["created_at"])), None
+        generations, current = _read_vm_state(vm_directory)
+        return (None if current is None else generations[current]), None
     except GatewayStateError as exc:
         return None, str(exc)
+
+
+def _web_diagnostic_lines(vm_id: str, state: Mapping[str, Any], *, root: Path | None) -> list[str]:
+    directory = _state_root(root) / vm_id / state["generation"]
+    try:
+        web = _read_json(directory / "web.json")
+        port = web.get("port")
+        if type(port) is not int or not 1 <= port <= 65535:
+            return []
+    except GatewayStateError:
+        return []
+    return [
+        f"Gateway web UI: http://127.0.0.1:{port}/ (read-only; active only while ready)",
+        f"Gateway web authentication file: {directory / 'web-auth.json'}",
+    ]
 
 
 def diagnostic_lines(
@@ -2154,10 +3378,21 @@ def diagnostic_lines(
         return [f"Gateway: configured{platform_note}", "Gateway state: inactive"]
 
     pids = state["pids"]
-    stale = state["status"] in _ACTIVE_STATES and (
-        not pids or any(not pid_is_alive(pid) for pid in pids.values())
-    )
-    status = "stale" if stale else state["status"]
+    try:
+        live = control_request(vm_id, "diagnostics", root=root)
+    except GatewayLifecycleError:
+        live = None
+    qemu_stale = "qemu" in pids and not pid_is_alive(pids["qemu"])
+    if live is not None:
+        status = "stale QEMU" if qemu_stale else str(live["status"])
+        state["counters"] = live["counters"]
+        state["last_failure"] = live["last_failure"]
+    elif any(_pid_is_running(pids.get(name, 0)) for name in ("worker", "mediator")):
+        status = "dead supervisor with orphaned children"
+    elif state["status"] in _ACTIVE_STATES:
+        status = "stale"
+    else:
+        status = state["status"]
     platform_note = " (unverified on macOS)" if state["platform"] == "darwin" else ""
     process_detail = (
         ", ".join(
@@ -2185,9 +3420,17 @@ def diagnostic_lines(
         f"Gateway state: {status}",
         f"Gateway generation: {state['generation']}",
         f"Gateway config digest: {state['config_digest']}",
+        *(
+            ["Gateway configuration: drift (stop/start required)"]
+            if configured is not None
+            and configured.digest(vm_id, state["generation"]) != state["requested_config_digest"]
+            else ["Gateway configuration: current"]
+        ),
         f"Gateway processes: {process_detail}",
         f"Gateway sockets: {sockets}",
         f"Gateway ingress: {listeners}",
         f"Gateway counters: {counters}",
         f"Gateway last failure: {failure_detail}",
+        f"Gateway audit log: {_state_root(root) / vm_id / state['generation'] / 'audit.log'}",
+        *_web_diagnostic_lines(vm_id, state, root=root),
     ]

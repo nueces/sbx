@@ -19,18 +19,27 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from sbx import gateway as gateway_runtime
+
+AUDIT_CONTROLLERS: dict[Path, gateway_runtime.GatewayController] = {}
+DNS_CONTROLLERS: dict[Path, gateway_runtime.GatewayController] = {}
 PROCESSES: list[subprocess.Popen[str]] = []
 SERVERS: list[ThreadingHTTPServer] = []
-PLACEHOLDER = "SBX_SECRET_package_" + "p" * 43
+LIFETIME_FDS: list[int] = []
+PLACEHOLDER = "p" * 43
+VM_ID = "tcg-" + "v" * 124
 FAKE_TOKEN = "fake-real-token-task10"
 COMMAND_TIMEOUT = 10
 PROCESS_STOP_TIMEOUT = 5
 INTEGRATION_TIMEOUT = 180
 MAX_TRANSCRIPT_BYTES = 1024 * 1024
+ROOT = Path(__file__).parents[2]
+GATEWAY_DIR = ROOT / "gateway"
 
 
 def tool(environment: str, *names: str) -> str:
@@ -156,43 +165,82 @@ def start_mediator(
     upstream_port: int,
     key: bytes,
     incarnation: str = "worker1",
-    vm_id: str = "tcg-test",
+    vm_id: str = VM_ID,
     open_files: int = 2048,
 ) -> tuple[subprocess.Popen[str], dict[str, object], Path]:
-    mediator_dir = Path(__file__).parents[1] / "mediator"
-    python = tool(
-        "SBX_GATEWAY_MEDIATOR_PYTHON",
-        str(mediator_dir / ".venv/bin/python"),
-        "python3.12",
-    )
+    mediator_dir = GATEWAY_DIR / "mediator"
     confdir = runtime / "mediator"
     confdir.mkdir(mode=0o700, exist_ok=True)
-    helper = runtime / "token-helper"
-    helper.write_text(
-        "#!/bin/sh\nprintf '%s%s%s\\n' 'fake-' 'real-token-' 'task10'\n",
-        encoding="utf-8",
-    )
-    helper.chmod(0o700)
-    package_auth = {
-        "version": 1,
-        "rule_id": "package-index",
-        "host": "localhost.localdomain",
-        "port": upstream_port,
-        "path_prefix": "/pypi/repo/",
-        "username": "aws",
-        "placeholder": PLACEHOLDER,
-        "provider": {"type": "command", "argv": [str(helper)]},
+    policy = {
+        "version": 2,
+        "rules": [
+            {
+                "id": "package-index",
+                "host": "localhost.localdomain",
+                "ports": [upstream_port],
+                "methods": ["GET"],
+                "paths": ["/pypi/repo"],
+                "hooks": [],
+            }
+        ],
+        "credentials": [
+            {
+                "credential": "package",
+                "rule_id": "package-index",
+                "methods": ["GET"],
+                "paths": ["/pypi/repo"],
+                "header": {"name": "Authorization", "format": "basic-password", "username": "aws"},
+                "placeholder": PLACEHOLDER,
+            }
+        ],
     }
     key_read, key_write = os.pipe()
     ready_read, ready_write = os.pipe()
-    auth_read, auth_write = os.pipe()
+    policy_read, policy_write = os.pipe()
+    lifetime_read, lifetime_write = os.pipe()
+    LIFETIME_FDS.append(lifetime_write)
+    broker, broker_child = socket.socketpair()
     os.write(key_write, key)
-    os.write(auth_write, json.dumps(package_auth).encode())
+    os.write(policy_write, json.dumps(policy).encode())
     os.close(key_write)
-    os.close(auth_write)
+    os.close(policy_write)
+
+    def serve_broker() -> None:
+        try:
+            while header := broker.recv(4):
+                size = int.from_bytes(header, "big")
+                request = json.loads(broker.recv(size))
+                response = {
+                    "version": 1,
+                    "request_id": request["request_id"],
+                    "incarnation": incarnation,
+                    "value": FAKE_TOKEN,
+                }
+                data = json.dumps(response, separators=(",", ":")).encode()
+                broker.sendall(len(data).to_bytes(4, "big") + data)
+        finally:
+            broker.close()
+
+    threading.Thread(target=serve_broker, daemon=True).start()
+    if confdir not in AUDIT_CONTROLLERS:
+        config = gateway_runtime.parse_config({"network": {}})
+        assert config is not None
+        controller = gateway_runtime.GatewayController(config, vm_id, root=runtime)
+        controller.directory = confdir
+        controller.generation = "tcg-generation"
+        controller._audit_stream = controller._open_log("audit.log")
+        AUDIT_CONTROLLERS[confdir] = controller
+    controller = AUDIT_CONTROLLERS[confdir]
+    controller.worker_incarnation = incarnation
+    audit_read, audit_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    controller._route_audit(
+        os.fdopen(audit_read, "rb", buffering=0), controller._audit_stream, ack_write
+    )
     process = subprocess.Popen(
         [
-            python,
+            sys.executable,
+            str(mediator_dir / "fixture_launch.py"),
             str(mediator_dir / "launch.py"),
             "--vm-id",
             vm_id,
@@ -202,26 +250,48 @@ def start_mediator(
             str(key_read),
             "--ready-fd",
             str(ready_write),
-            "--package-auth-fd",
-            str(auth_read),
+            "--policy-fd",
+            str(policy_read),
+            "--broker-fd",
+            str(broker_child.fileno()),
+            "--lifetime-fd",
+            str(lifetime_read),
             "--confdir",
             str(confdir),
             "--upstream-ca",
             str(upstream_ca),
             "--open-files",
             str(open_files),
+            "--audit-fd",
+            str(audit_write),
+            "--audit-ack-fd",
+            str(ack_read),
+            "--generation",
+            controller.generation,
         ],
-        pass_fds=(key_read, ready_write, auth_read),
+        pass_fds=(
+            key_read,
+            ready_write,
+            policy_read,
+            broker_child.fileno(),
+            lifetime_read,
+            audit_write,
+            ack_read,
+        ),
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=True,
-        env=child_environment(runtime),
+        env=child_environment(runtime) | {"PATH": os.environ.get("PATH", os.defpath)},
     )
     PROCESSES.append(process)
+    os.close(audit_write)
+    os.close(ack_read)
     os.close(key_read)
     os.close(ready_write)
-    os.close(auth_read)
+    os.close(policy_read)
+    os.close(lifetime_read)
+    broker_child.close()
     readable, _, _ = select.select([ready_read], [], [], COMMAND_TIMEOUT)
     payload = os.read(ready_read, 4096) if readable else b""
     os.close(ready_read)
@@ -244,16 +314,32 @@ def start_worker(
     incarnation: str,
     ingress_listeners: list[socket.socket],
     *,
-    vm_id: str = "tcg-test",
+    vm_id: str = VM_ID,
     generation: str = "g1",
     ingress_ids: tuple[str, ...] = ("dev-server", "oauth-callback"),
 ) -> subprocess.Popen[str]:
     key_read, key_write = os.pipe()
     token_read, token_write = os.pipe()
+    lifetime_read, lifetime_write = os.pipe()
     os.write(key_write, key)
     os.write(token_write, os.urandom(32))
     os.close(key_write)
     os.close(token_write)
+    try:
+        if config.parent not in DNS_CONTROLLERS:
+            journal_config = gateway_runtime.parse_config({"network": {}})
+            assert journal_config is not None
+            journal_owner = gateway_runtime.GatewayController(
+                journal_config, vm_id, generation=generation
+            )
+            journal_owner.directory = config.parent
+            DNS_CONTROLLERS[config.parent] = journal_owner
+        dns_fd = DNS_CONTROLLERS[config.parent]._open_dns_state({"digest": digest})
+    except BaseException:
+        # Journal validation failed before spawn; release staging FDs and propagate.
+        for fd in (key_read, token_read, lifetime_read, lifetime_write):
+            os.close(fd)
+        raise
     command = [
         str(gateway),
         "--socket",
@@ -276,26 +362,40 @@ def start_worker(
         str(key_read),
         "--worker-incarnation",
         incarnation,
+        "--supervisor-lifetime-fd",
+        str(lifetime_read),
+        "--dns-state-fd",
+        str(dns_fd),
     ]
     require(len(ingress_ids) == len(ingress_listeners), "ingress listener identity mismatch")
     for ingress_id, listener in zip(ingress_ids, ingress_listeners, strict=True):
         command.extend(("--ingress-fd", f"{vm_id}/{generation}/{ingress_id}={listener.fileno()}"))
-    process = subprocess.Popen(
-        command,
-        pass_fds=(
-            qemu_listener.fileno(),
-            token_read,
-            key_read,
-            *(item.fileno() for item in ingress_listeners),
-        ),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-        env=child_environment(config.parent),
-    )
-    os.close(token_read)
-    os.close(key_read)
+    try:
+        process = subprocess.Popen(
+            command,
+            pass_fds=(
+                qemu_listener.fileno(),
+                token_read,
+                key_read,
+                lifetime_read,
+                dns_fd,
+                *(item.fileno() for item in ingress_listeners),
+            ),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=child_environment(config.parent),
+        )
+    except BaseException:
+        os.close(lifetime_write)
+        raise
+    finally:
+        os.close(dns_fd)
+        os.close(token_read)
+        os.close(key_read)
+        os.close(lifetime_read)
+    process.sbx_lifetime_write = lifetime_write  # type: ignore[attr-defined]
     PROCESSES.append(process)
     assert process.stdout is not None
     readable, _, _ = select.select([process.stdout], [], [], COMMAND_TIMEOUT)
@@ -315,7 +415,14 @@ def start_worker(
 
 
 def terminate(process: subprocess.Popen[str] | None) -> None:
-    if process is None or process.poll() is not None:
+    if process is None:
+        return
+    lifetime_write = getattr(process, "sbx_lifetime_write", None)
+    if lifetime_write is not None:
+        with suppress(OSError):
+            os.close(lifetime_write)
+        del process.sbx_lifetime_write  # type: ignore[attr-defined]
+    if process.poll() is not None:
         return
     os.killpg(process.pid, signal.SIGTERM)
     try:
@@ -325,7 +432,7 @@ def terminate(process: subprocess.Popen[str] | None) -> None:
         process.wait(PROCESS_STOP_TIMEOUT)
 
 
-def main() -> int:
+def run_gateway_tcg() -> int:
     require(platform.system() == "Linux", "required Linux TCG test unavailable")
     qemu = tool("SBX_QEMU_BIN", "qemu-system-x86_64")
     accelerators = subprocess.check_output(
@@ -336,7 +443,8 @@ def main() -> int:
     gateway = Path(
         tool(
             "SBX_GATEWAY_BIN",
-            str(Path(__file__).parents[1] / "sbx-gateway"),
+            str(ROOT / "src/sbx/gateway_runtime/bin/sbx-gateway-linux-amd64"),
+            str(GATEWAY_DIR / "sbx-gateway"),
             "sbx-gateway",
         )
     )
@@ -416,7 +524,7 @@ def main() -> int:
             json.dumps(
                 {
                     "version": 1,
-                    "vm_id": "tcg-test",
+                    "vm_id": VM_ID,
                     "generation": "g1",
                     "rules": [
                         {
@@ -432,7 +540,7 @@ def main() -> int:
                             "host": "localhost.localdomain",
                             "ports": [package.server_port],
                             "methods": ["GET"],
-                            "paths": ["/pypi/repo/"],
+                            "paths": ["/pypi/repo"],
                         },
                         {
                             "id": "public-ca-install",
@@ -507,6 +615,7 @@ def main() -> int:
             "none",
             "-nographic",
             "-no-reboot",
+            "-snapshot",
             "-smp",
             "1",
             "-m",
@@ -529,7 +638,10 @@ def main() -> int:
             "virtio-blk-device,drive=rootdisk",
         ]
         joined = " ".join(command)
-        require("accel=tcg" in joined and "stream,id=net0" in joined, "unsafe QEMU command")
+        require(
+            "-snapshot" in command and "accel=tcg" in joined and "stream,id=net0" in joined,
+            "unsafe QEMU command",
+        )
         forbidden = ("-net user", "tap", "nft", "sudo", "/dev/kvm")
         require(
             all(value not in joined for value in forbidden),
@@ -559,7 +671,16 @@ def main() -> int:
             base64.b64encode(f"aws:{FAKE_TOKEN}".encode()),
         )
         while time.monotonic() < deadline:
-            require(qemu_process.poll() is None, "QEMU exited before test completion")
+            returncode = qemu_process.poll()
+            if returncode is not None:
+                with suppress(BlockingIOError):
+                    transcript.append(
+                        os.read(qemu_process.stdout.fileno(), 65536).decode(errors="replace")
+                    )
+                raise SystemExit(
+                    f"QEMU exited before test completion ({returncode}): "
+                    f"{''.join(transcript)[-4000:]}"
+                )
             if not selector.select(timeout=1):
                 continue
             chunk = os.read(qemu_process.stdout.fileno(), 65536).decode(errors="replace")
@@ -588,8 +709,7 @@ def main() -> int:
                     connection.close()
                 ingress_complete = True
                 transcript.append(
-                    "GATEWAY_DEV_SERVER_PASS GATEWAY_OAUTH_CALLBACK_PASS "
-                    "GATEWAY_PORT0_PASS\n"
+                    "GATEWAY_DEV_SERVER_PASS GATEWAY_OAUTH_CALLBACK_PASS GATEWAY_PORT0_PASS\n"
                 )
             if "GATEWAY_TEST_PASS" in output and not initial_complete:
                 require(ingress_complete, "guest completed without ingress workloads")
@@ -646,9 +766,7 @@ def main() -> int:
                     timeout=PROCESS_STOP_TIMEOUT
                 )
                 old_logs = mediator_stdout + mediator_stderr + worker_stdout
-                transcript.append(
-                    "GATEWAY_INGRESS_WORKER_LOSS_PASS GATEWAY_WORKER_LOSS_PASS\n"
-                )
+                transcript.append("GATEWAY_INGRESS_WORKER_LOSS_PASS GATEWAY_WORKER_LOSS_PASS\n")
 
                 replacement_key = os.urandom(32)
                 mediator, mediator_ready, _ = start_mediator(
@@ -729,12 +847,33 @@ def main() -> int:
     return 1
 
 
-if __name__ == "__main__":
+def cleanup() -> None:
+    for fd in LIFETIME_FDS:
+        with suppress(OSError):
+            os.close(fd)
+    LIFETIME_FDS.clear()
+    for process in reversed(PROCESSES):
+        terminate(process)
+    PROCESSES.clear()
+    audit_failed = False
+    for controller in AUDIT_CONTROLLERS.values():
+        for thread in controller._log_threads:
+            thread.join(timeout=PROCESS_STOP_TIMEOUT)
+            audit_failed |= thread.is_alive()
+        for stream in controller._logs:
+            stream.close()
+        audit_failed |= controller._audit_failure is not None
+    AUDIT_CONTROLLERS.clear()
+    DNS_CONTROLLERS.clear()
+    for server in SERVERS:
+        server.shutdown()
+        server.server_close()
+    SERVERS.clear()
+    require(not audit_failed, "TCG audit persistence or cleanup failed")
+
+
+def test_gateway_tcg() -> None:
     try:
-        raise SystemExit(main())
+        assert run_gateway_tcg() == 0
     finally:
-        for process in reversed(PROCESSES):
-            terminate(process)
-        for server in SERVERS:
-            server.shutdown()
-            server.server_close()
+        cleanup()

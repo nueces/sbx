@@ -330,6 +330,7 @@ def _build_docker_kernel(
         temporary_kernel = image_dir / f".{KERNEL_NAME}.tmp"
         try:
             shutil.copy2(out_dir / f"vmlinux-{arch}.image", temporary_kernel)
+            temporary_kernel.chmod(0o644)
             temporary_kernel.replace(kernel_path)
         finally:
             temporary_kernel.unlink(missing_ok=True)

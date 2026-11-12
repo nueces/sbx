@@ -1,0 +1,49 @@
+flowchart LR
+  Operator[Operator / sbx CLI]
+
+  subgraph Host[Unprivileged host user]
+    Supervisor[Persistent per-VM supervisor<br/>state, lifecycle, recovery]
+    State[(Owner-only per-VM state)]
+    Ingress[Controller-owned<br/>ingress listeners]
+    Worker[Per-VM sbx-gateway worker<br/>gVisor netstack]
+    Mediator[Per-VM mitmproxy mediator<br/>HTTP, hooks, credential injection]
+    Provider[Credential provider]
+    Upstream[(Approved upstream)]
+    CA[Per-VM CA<br/>private key host-only]
+  end
+
+  subgraph VM[Disposable VM]
+    QEMU[QEMU / SmolVM<br/>one Unix-stream NIC]
+    Guest[Guest network stack and workload]
+    GuestCA[Public CA certificate]
+  end
+
+  Operator -->|inherited bootstrap FDs| Supervisor
+  Supervisor -->|atomic metadata| State
+  Supervisor -->|spawn, authenticate, monitor| Worker
+  Supervisor -->|spawn, authenticate, monitor| Mediator
+  Supervisor -->|pre-opened Unix socket| QEMU
+  Supervisor -->|reserved descriptors| Ingress
+
+  Guest <-->|Ethernet: DHCP, DNS, TCP| QEMU
+  QEMU <-->|length-framed Ethernet<br/>Unix stream| Worker
+
+  Worker -->|destination-bound<br/>single-use SOCKS capability| Mediator
+  Mediator -->|approved HTTP/TLS| Upstream
+  Mediator <-->|bounded secret request/response| Provider
+  Worker -->|exact TLS passthrough<br/>or approved raw TCP| Upstream
+
+  Ingress -->|owned listener descriptor| Worker
+  Worker -->|approved guest TCP| Guest
+
+  CA --> Mediator
+  CA -->|public certificate only| GuestCA
+  GuestCA --> Guest
+
+  Worker -. default deny .-> Denied[Unknown host, direct IP,<br/>wrong port, unsupported UDP]
+  Mediator -. fail closed .-> Denied
+
+  classDef security fill:#fee,stroke:#b33,color:#111;
+  classDef runtime fill:#eef,stroke:#336,color:#111;
+  class Denied security;
+  class Supervisor,Worker,Mediator,QEMU runtime;

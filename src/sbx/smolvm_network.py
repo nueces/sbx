@@ -10,7 +10,6 @@ import subprocess
 import sys
 from contextlib import suppress
 from dataclasses import dataclass
-from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any, Literal
 
@@ -20,11 +19,10 @@ from smolvm.runtime.qemu import QEMU_ROOT_NODE_NAME, QemuRuntimeAdapter
 from smolvm.runtime.qemu_args import build_qemu_argv as _build_smolvm_qemu_argv
 from smolvm.types import VMInfo, VMState
 
+from sbx.constants import GATEWAY_UNIX_SOCKET_PATH_MAX_BYTES
 from sbx.runtime import ConfigError
 
 _MINIMUM_QEMU_VERSION = (7, 2, 0)
-_SUPPORTED_SMOLVM_VERSIONS = {"0.0.28"}
-_UNIX_SOCKET_PATH_MAX_BYTES = 103
 _MAC_PATTERN = re.compile(r"(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\Z")
 _QEMU_VERSION_PATTERN = re.compile(r"QEMU emulator version (\d+)\.(\d+)(?:\.(\d+))?")
 _QEMU_SANDBOX = "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"
@@ -40,23 +38,6 @@ class ExternalNetworkBackend:
     mac: str
 
 
-def _resolved_executable(path: Path, label: str) -> Path:
-    if not path.is_absolute():
-        raise ConfigError(f"{label} path must be absolute")
-    try:
-        target = path.resolve(strict=True)
-        info = target.stat()
-    except OSError as exc:
-        raise ConfigError(f"{label} is missing: {path}: {exc}") from exc
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or stat.S_IMODE(info.st_mode) & 0o022
-        or not os.access(target, os.X_OK)
-    ):
-        raise ConfigError(f"{label} is unsafe: {path}")
-    return path
-
-
 def _capture(argv: list[str]) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(argv, check=False, capture_output=True, text=True, timeout=5)
@@ -70,9 +51,10 @@ def _validate_socket_path(path: Path) -> None:
         raise ConfigError("gateway QEMU socket path must be absolute")
     if "\0" in value or "," in value:
         raise ConfigError("gateway QEMU socket path cannot contain NUL or ','")
-    if len(os.fsencode(path)) > _UNIX_SOCKET_PATH_MAX_BYTES:
+    if len(os.fsencode(path)) > GATEWAY_UNIX_SOCKET_PATH_MAX_BYTES:
         raise ConfigError(
-            f"gateway QEMU socket path exceeds {_UNIX_SOCKET_PATH_MAX_BYTES} filesystem bytes"
+            "gateway QEMU socket path exceeds "
+            f"{GATEWAY_UNIX_SOCKET_PATH_MAX_BYTES} filesystem bytes"
         )
     try:
         info = path.lstat()
@@ -106,14 +88,7 @@ def _validate_backend(backend: ExternalNetworkBackend) -> None:
 
 
 def require_external_network_support(qemu_bin: Path) -> tuple[int, int, int]:
-    """Fail before launch unless the pinned SmolVM and QEMU support stream netdevs."""
-    smolvm_version = package_version("smolvm")
-    if smolvm_version not in _SUPPORTED_SMOLVM_VERSIONS:
-        expected = ", ".join(sorted(_SUPPORTED_SMOLVM_VERSIONS))
-        raise ConfigError(
-            f"gateway external networking supports SmolVM {expected}; found {smolvm_version}"
-        )
-
+    """Fail before launch unless QEMU supports stream netdevs."""
     result = _capture([str(qemu_bin), "--version"])
     match = _QEMU_VERSION_PATTERN.search(f"{result.stdout}\n{result.stderr}")
     if result.returncode != 0 or match is None:
@@ -135,6 +110,30 @@ def _qemu_sandbox_supported(qemu_bin: Path) -> bool:
     return result.returncode == 0 and "-sandbox" in result.stdout
 
 
+def _use_tcg_without_kvm(argv: list[str]) -> list[str]:
+    result = list(argv)
+    machine = [index + 1 for index, value in enumerate(result[:-1]) if value == "-machine"]
+    cpu = [index + 1 for index, value in enumerate(result[:-1]) if value == "-cpu"]
+    smp = [index + 1 for index, value in enumerate(result[:-1]) if value == "-smp"]
+    if (
+        len(machine) != 1
+        or "accel=kvm" not in result[machine[0]]
+        or len(cpu) != 1
+        or result[cpu[0]] != "host"
+        or len(smp) != 1
+    ):
+        raise ConfigError("SmolVM QEMU accelerator argv is incompatible with TCG fallback")
+    result[machine[0]] = result[machine[0]].replace("accel=kvm", "accel=tcg")
+    if result[machine[0]].startswith("microvm,"):
+        result[machine[0]] = (
+            result[machine[0]].replace("pic=off", "pic=on").replace("pit=off", "pit=on")
+        )
+    result[cpu[0]] = "max" if result[machine[0]].startswith("virt,") else "qemu64"
+    # ponytail: one TCG vCPU avoids microvm clock calibration stalls; revisit with SmolVM TCG.
+    result[smp[0]] = "1"
+    return result
+
+
 def _replace_network(argv: list[str], backend: ExternalNetworkBackend) -> list[str]:
     netdev_values = [index + 1 for index, value in enumerate(argv[:-1]) if value == "-netdev"]
     device_values = [
@@ -147,7 +146,13 @@ def _replace_network(argv: list[str], backend: ExternalNetworkBackend) -> list[s
             "SmolVM QEMU network argv is incompatible with the external-network facade"
         )
 
+    append_values = [index + 1 for index, value in enumerate(argv[:-1]) if value == "-append"]
+    if len(append_values) != 1:
+        raise ConfigError("SmolVM QEMU boot argv is incompatible with gateway networking")
+
     result = list(argv)
+    boot_args = re.sub(r"(?<!\S)(?:ip|smolvm\.network)=\S+\s*", "", result[append_values[0]])
+    result[append_values[0]] = f"{boot_args.strip()} smolvm.network=guest"
     result[netdev_values[0]] = (
         f"stream,id=net0,server=off,reconnect-ms=100,addr.type=unix,addr.path={backend.socket_path}"
     )
@@ -201,6 +206,10 @@ def build_qemu_argv(
     )
     if external_network is None:
         return argv
+    if (host_system or platform.system()) == "Linux" and not os.access(
+        "/dev/kvm", os.R_OK | os.W_OK
+    ):
+        argv = _use_tcg_without_kvm(argv)
     argv = _replace_network(argv, external_network)
     if sandbox:
         argv[1:1] = ["-sandbox", _QEMU_SANDBOX]
@@ -238,7 +247,6 @@ def start_vm(
         qemu_bin = Path(override).expanduser() if override else sdk._find_qemu_binary()
         if qemu_bin is None:
             raise SmolVMError("qemu-system binary is missing")
-        qemu_bin = _resolved_executable(qemu_bin, "QEMU executable")
         platform_spec = get_guest_platform(
             info.config.guest_os,
             host_system=platform.system(),

@@ -8,7 +8,8 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 out="$root/src/sbx/gateway_runtime"
 mkdir -p "$out/bin" "$out/mediator"
 
-for file in pyproject.toml .python-version uv.lock launch.py hardening.py sbx_gateway_mediator.py; do
+rm -f "$out/SHA256SUMS" "$out/mediator/pyproject.toml" "$out/mediator/.python-version" "$out/mediator/uv.lock"
+for file in launch.py hardening.py sbx_gateway_mediator.py sbx_gateway_web.py; do
   cp "$root/gateway/mediator/$file" "$out/mediator/$file"
 done
 
@@ -23,5 +24,3 @@ build() {
 build linux amd64
 build darwin amd64
 build darwin arm64
-
-(cd "$out" && sha256sum bin/sbx-gateway-* mediator/uv.lock > SHA256SUMS)

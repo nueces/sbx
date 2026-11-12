@@ -59,7 +59,13 @@ def install_fake_smolvm(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     smolvm = bin_dir / "smolvm"
-    smolvm.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\"\n", encoding="utf-8")
+    smolvm.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = sandbox ] && [ "$2" = delete ]; then\n'
+        "  printf '%s\\n' '{\"data\": {\"failed\": []}}'\n"
+        "else\n  printf '%s\\n' \"$*\"\nfi\n",
+        encoding="utf-8",
+    )
     smolvm.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setattr(cli.runtime, "smolvm_argv", lambda args: ["smolvm", *args])
@@ -96,6 +102,54 @@ def capture_preset(
         )
 
     monkeypatch.setattr(cli.smolvm_preset, "create_preset", fake_create)
+
+
+def test_cli_forwarded_environment_cannot_replace_credential_placeholder(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(
+        """
+[network]
+[[network.credential]]
+id = "token"
+environment = "TOKEN"
+method = "command"
+[network.credential.options]
+argv = ["token"]
+""",
+        encoding="utf-8",
+    )
+
+    assert cli.main(["--config", str(config), "run", "vm1", "--env", "TOKEN", "--no-attach"]) == 2
+    assert "collides with forwarded environment" in capsys.readouterr().err
+
+
+def test_recreate_validates_gateway_socket_path_before_destroying(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = cli.argparse.Namespace(
+        config_data={},
+        force=True,
+        name="gateway-credential-smoke",
+        gateway_config=object(),
+        json=False,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_delete_vm",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("must validate before deletion")
+        ),
+    )
+    monkeypatch.setattr(
+        cli.gateway,
+        "validate_runtime_paths",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(cli.ConfigError("bad runtime path")),
+    )
+
+    with pytest.raises(cli.ConfigError, match="bad runtime path"):
+        cli.cmd_recreate(args)
 
 
 def test_smolvm_runner_does_not_need_console_script_on_path() -> None:

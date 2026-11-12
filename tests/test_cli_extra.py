@@ -97,6 +97,10 @@ def fake_smolvm_sdk(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str
         captured["vm_config"] = kwargs
         return kwargs
 
+    def fake_ssh_key(key_dir: Path) -> tuple[Path, Path]:
+        captured["ssh_key_dir"] = key_dir
+        return private_key, public_key
+
     monkeypatch.setattr(smolvm, "SmolVM", FakeSmolVM)
     monkeypatch.setattr(smolvm, "VMConfig", fake_vm_config)
     monkeypatch.setattr(smolvm.utils, "ensure_ssh_key", lambda: (private_key, public_key))
@@ -1673,6 +1677,18 @@ def test_stop_vm_skips_when_other_sessions_active(monkeypatch: pytest.MonkeyPatc
     cli._stop_vm_if_last_session("vm1", stop_on_exit=True)
 
     assert stopped == []
+
+
+def test_delete_vm_malformed_success_preserves_gateway_evidence(monkeypatch):
+    monkeypatch.setattr(
+        cli.runtime,
+        "run_smolvm_capture",
+        lambda argv: subprocess.CompletedProcess(argv, 0, stdout="not-json", stderr=""),
+    )
+    removed = []
+    monkeypatch.setattr(cli.gateway, "remove", lambda vm_id: removed.append(vm_id))
+    assert cli._delete_vm("vm1") == 1
+    assert removed == []
 
 
 def test_delete_vm_success_path(

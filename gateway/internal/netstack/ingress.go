@@ -14,10 +14,15 @@ import (
 	"time"
 
 	"github.com/nueces/sbx/gateway/internal/config"
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 )
+
+const maxDiscardedIngress = 4096
+
+var ErrIngressBacklogLimit = errors.New("ingress backlog drain limit exhausted")
 
 type RegisteredIngress struct {
 	Rule     config.Ingress
@@ -105,31 +110,54 @@ func NewIngressForwarder(network *Network, listeners []RegisteredIngress, total 
 	return forwarder
 }
 
-func (q *FlowQuota) acquireContext(ctx context.Context) bool {
-	select {
-	case q.tokens <- struct{}{}:
-		return true
-	case <-ctx.Done():
-		return false
-	}
-}
-
-func (f *IngressForwarder) DiscardPending() {
+func (f *IngressForwarder) DiscardPending() error {
 	for _, item := range f.listeners {
 		listener, ok := item.Listener.(*net.TCPListener)
 		if !ok {
-			continue
+			return fmt.Errorf("ingress %q has a non-TCP listener", item.Rule.ID)
 		}
-		_ = listener.SetDeadline(time.Now())
-		for {
-			conn, err := listener.Accept()
+		raw, err := listener.SyscallConn()
+		if err != nil {
+			return fmt.Errorf("access ingress %q: %w", item.Rule.ID, err)
+		}
+		var drainErr error
+		err = raw.Control(func(fd uintptr) {
+			flags, err := unix.FcntlInt(fd, unix.F_GETFL, 0)
 			if err != nil {
-				break
+				drainErr = err
+				return
 			}
-			conn.Close()
+			if flags&unix.O_NONBLOCK == 0 {
+				drainErr = errors.New("ingress listener is blocking")
+				return
+			}
+			for range maxDiscardedIngress {
+				accepted, _, err := unix.Accept(int(fd))
+				if errors.Is(err, unix.EINTR) || errors.Is(err, unix.ECONNABORTED) {
+					continue // Interrupted or already-aborted accepts expose no live connection.
+				}
+				if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
+					return // Only a genuinely empty kernel backlog completes the drain.
+				}
+				if err != nil {
+					drainErr = err
+					return
+				}
+				if err := unix.Close(accepted); err != nil {
+					drainErr = err
+					return
+				}
+			}
+			drainErr = ErrIngressBacklogLimit
+		})
+		if err != nil {
+			return fmt.Errorf("control ingress %q: %w", item.Rule.ID, err)
 		}
-		_ = listener.SetDeadline(time.Time{})
+		if drainErr != nil {
+			return fmt.Errorf("drain ingress %q: %w", item.Rule.ID, drainErr)
+		}
 	}
+	return nil
 }
 
 func (f *IngressForwarder) Start() {
@@ -144,20 +172,23 @@ func (f *IngressForwarder) Start() {
 func (f *IngressForwarder) accept(item RegisteredIngress) {
 	defer f.wg.Done()
 	for {
-		select {
-		case f.concurrent <- struct{}{}:
-		case <-f.ctx.Done():
-			return
-		}
-		if !f.total.acquireContext(f.ctx) {
-			<-f.concurrent
-			return
-		}
 		conn, err := item.Listener.Accept()
 		if err != nil {
-			f.total.release()
-			<-f.concurrent
 			return
+		}
+		select {
+		case <-f.ctx.Done():
+			conn.Close()
+			return
+		case f.concurrent <- struct{}{}:
+		default:
+			conn.Close()
+			continue
+		}
+		if !f.total.acquire() {
+			<-f.concurrent
+			conn.Close()
+			continue
 		}
 		f.track(conn, true)
 		f.active.Add(1)
@@ -198,6 +229,11 @@ func (f *IngressForwarder) track(conn net.Conn, add bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if add {
+		// Cancellation can race with an accepted connection or guest dial completing.
+		if f.ctx.Err() != nil {
+			conn.Close()
+			return
+		}
 		f.connections[conn] = struct{}{}
 	} else {
 		delete(f.connections, conn)

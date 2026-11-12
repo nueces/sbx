@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"net/netip"
 	"testing"
 )
 
@@ -133,6 +134,39 @@ func TestCanonicalDigestIsDeterministic(t *testing.T) {
 	bd, _ := b.ComputeDigest()
 	if ad != bd {
 		t.Fatalf("non-deterministic digest: %s != %s", ad, bd)
+	}
+}
+
+func TestSpecialUseDestinationsRequireExplicitRanges(t *testing.T) {
+	for _, value := range []string{
+		"0.1.2.3", "100.64.0.1", "100.100.100.200", "100.127.255.255",
+		"127.0.0.1", "169.254.169.254", "192.0.0.1", "192.88.99.1",
+		"192.0.2.1", "198.18.0.1", "198.51.100.1", "203.0.113.1", "240.0.0.1",
+		"255.255.255.255", "::1", "fc00::1", "fe80::1", "64:ff9b::a9fe:a9fe",
+		"100::1", "2001::1", "2001:db8::1", "2002:7f00:1::", "3fff::1",
+		"::ffff:100.100.100.200",
+	} {
+		t.Run(value, func(t *testing.T) {
+			ip := netip.MustParseAddr(value)
+			if (Rule{}).AllowsIP(ip) {
+				t.Fatal("special-use destination allowed without an exception")
+			}
+			prefix := netip.PrefixFrom(ip.Unmap(), ip.Unmap().BitLen()).String()
+			if !(Rule{AllowRanges: []string{prefix}}).AllowsIP(ip) {
+				t.Fatal("explicit destination exception was ignored")
+			}
+		})
+	}
+	if !(Rule{AllowRanges: []string{"100.64.0.0/10"}}).AllowsIP(netip.MustParseAddr("100.100.100.200")) {
+		t.Fatal("explicit shared-address range was ignored")
+	}
+	for _, value := range []string{"8.8.8.8", "100.63.255.255", "100.128.0.1", "2606:4700:4700::1111"} {
+		if !(Rule{}).AllowsIP(netip.MustParseAddr(value)) {
+			t.Fatalf("public address denied: %s", value)
+		}
+	}
+	if (Rule{}).AllowsIP(netip.Addr{}) {
+		t.Fatal("invalid address allowed")
 	}
 }
 

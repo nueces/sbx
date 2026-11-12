@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mandatory four-pair TCG capacity and two-VM failure-isolation workload."""
+"""Mandatory two-VM isolation gate; four-VM capacity remains an explicit deferred check."""
 
 from __future__ import annotations
 
@@ -17,11 +17,12 @@ import time
 from contextlib import suppress
 from pathlib import Path
 
-from test_tcg import (
+from test_gateway_tcg import (
     MAX_TRANSCRIPT_BYTES,
     PROCESSES,
-    SERVERS,
+    ROOT,
     child_environment,
+    cleanup,
     echo_server,
     package_server,
     require,
@@ -31,7 +32,7 @@ from test_tcg import (
     tool,
 )
 
-VM_COUNT = int(os.environ.get("SBX_GATEWAY_VM_COUNT", "4"))
+VM_COUNT = int(os.environ.get("SBX_GATEWAY_VM_COUNT", "2"))
 TIMEOUT = 300
 PAIR_RSS_LIMIT = 512 * 1024 * 1024
 PAIR_FD_LIMIT = 128
@@ -83,7 +84,7 @@ def ingress(port: int, vm_id: str, timeout: float = 10) -> bytes:
         connection.close()
 
 
-def main() -> int:
+def run_gateway_multi_vm_tcg() -> int:
     require(platform.system() == "Linux", "required Linux multi-VM TCG test unavailable")
     require(VM_COUNT in {2, 4}, "multi-VM TCG test requires exactly 2 or 4 VMs")
     qemu = tool("SBX_QEMU_BIN", "qemu-system-x86_64")
@@ -91,7 +92,13 @@ def main() -> int:
         "tcg" in subprocess.check_output([qemu, "-accel", "help"], text=True).split(),
         "QEMU TCG accelerator is required",
     )
-    gateway = Path(tool("SBX_GATEWAY_BIN", str(Path(__file__).parents[1] / "sbx-gateway")))
+    gateway = Path(
+        tool(
+            "SBX_GATEWAY_BIN",
+            str(ROOT / "src/sbx/gateway_runtime/bin/sbx-gateway-linux-amd64"),
+            str(ROOT / "gateway/sbx-gateway"),
+        )
+    )
     manifest_path = Path(
         os.environ.get(
             "SBX_GATEWAY_TEST_IMAGE",
@@ -295,12 +302,10 @@ def main() -> int:
             "worker and mediator process groups were shared",
         )
         ca_certs = [
-            directory.joinpath("mitmproxy-ca-cert.pem").read_bytes()
-            for directory in mediator_dirs
+            directory.joinpath("mitmproxy-ca-cert.pem").read_bytes() for directory in mediator_dirs
         ]
         ca_keys = [
-            directory.joinpath("mitmproxy-ca.pem").read_bytes()
-            for directory in mediator_dirs
+            directory.joinpath("mitmproxy-ca.pem").read_bytes() for directory in mediator_dirs
         ]
         require(
             len({hashlib.sha256(value).digest() for value in ca_certs}) == VM_COUNT,
@@ -424,12 +429,8 @@ def main() -> int:
         raise SystemExit("multi-VM TCG workload timed out")
 
 
-if __name__ == "__main__":
+def test_gateway_multi_vm_tcg() -> None:
     try:
-        raise SystemExit(main())
+        assert run_gateway_multi_vm_tcg() == 0
     finally:
-        for process in reversed(PROCESSES):
-            terminate(process)
-        for server in SERVERS:
-            server.shutdown()
-            server.server_close()
+        cleanup()

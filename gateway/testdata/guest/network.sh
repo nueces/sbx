@@ -236,7 +236,7 @@ with socket.create_connection(("localhost.localdomain", int(sys.argv[1])), timeo
     while chunk := conn.recv(65536):
         payload += chunk
 placeholder, certificate = payload.split(b"\n", 1)
-assert placeholder.startswith(b"SBX_SECRET_")
+assert len(placeholder) >= 32 and b"SBX" not in placeholder
 assert certificate.count(b"BEGIN CERTIFICATE") == 1
 assert b"PRIVATE KEY" not in certificate
 open("/run/sbx-package-placeholder", "wb").write(placeholder)
@@ -320,7 +320,7 @@ old_tcp = socket.create_connection((host, 18080), timeout=5)
 old_tcp.sendall(b"gateway-test")
 assert old_tcp.recv(64) == b"gateway-test"
 
-for destination in ((host, 18081), ("1.1.1.1", 80)):
+for destination in ((host, 18081), ("1.1.1.1", 80), ("1.1.1.1", 53)):
     try:
         socket.create_connection(destination, timeout=2)
     except OSError:
@@ -335,17 +335,21 @@ except OSError:
 else:
     raise AssertionError("unexpected DNS answer")
 
-udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-udp.settimeout(2)
-udp.sendto(b"denied", ("1.1.1.1", 443))
-try:
-    udp.recv(1)
-except OSError:
-    pass
-else:
-    raise AssertionError("unexpected UDP response")
-finally:
-    udp.close()
+for port, payload in (
+    (53, b"\0\1\1\0\0\1\0\0\0\0\0\0\7example\3com\0\0\1\0\1"),
+    (443, b"denied"),
+):
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp.settimeout(2)
+    udp.sendto(payload, ("1.1.1.1", port))
+    try:
+        udp.recv(1)
+    except OSError:
+        pass
+    else:
+        raise AssertionError(f"unexpected UDP response from port {port}")
+    finally:
+        udp.close()
 
 assert not any(name.lower() in {"http_proxy", "https_proxy"} for name in os.environ)
 port = int(os.environ["SBX_PACKAGE_PORT"])
@@ -393,7 +397,7 @@ for root in ("/etc", "/home", "/root", "/run", "/tmp", "/var"):
             assert fake_token not in content and encoded_token not in content, path
 
 print(
-    "GATEWAY_GUEST_FAKE_TOKEN_SCAN_PASS GATEWAY_PACKAGE_AUTH_PASS "
+    "GATEWAY_GUEST_FAKE_TOKEN_SCAN_PASS GATEWAY_CREDENTIAL_INJECTION_PASS "
     "GATEWAY_OLD_FLOW_READY GATEWAY_TEST_PASS",
     flush=True,
 )
