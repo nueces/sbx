@@ -19,6 +19,7 @@ import sbx.image.ls
 import sbx.network as network
 from sbx import (
     __version__,
+    auth_ports,
     bootstrap,
     doctor,
     guest_setup,
@@ -38,10 +39,10 @@ from sbx.constants import (
 from sbx.image import build_debian
 from sbx.runtime import ConfigError
 
-AGENTS = ("pi", "claude", "codex")
-RUNTIME_INSTALLERS = ("pi", "specify")
+AGENTS = ("pi", "claude", "codex", "opencode")
+RUNTIME_INSTALLERS = ("pi", "specify", "claude", "opencode")
 MIB = 1024 * 1024
-LAUNCH_COMMANDS = {"pi": "pi", "claude": "claude", "codex": "codex"}
+LAUNCH_COMMANDS = {agent: agent for agent in AGENTS}
 DEFAULT_CONFIG_PATHS = (Path.home() / ".config" / "sbx" / "config.toml",)
 
 
@@ -565,7 +566,8 @@ def _post_start_actions(
     command: str | None,
     attach: bool,
     run_user: str | None,
-    auth_port: bool,
+    auth_port: bool | None,
+    auth_forwards: list[tuple[int, int]] | None = None,
     auth_host_port: int = 0,
     auth_guest_port: int = 0,
     stop_on_exit: bool,
@@ -597,6 +599,8 @@ def _post_start_actions(
     needs_boot_setup = started_now or provision
     registered = False
     attempted_attach = False
+    created_auth_tunnels: list[dict[str, Any]] = []
+    provisioning_complete = False
     try:
         try:
             with ExitStack() as scope:
@@ -617,14 +621,8 @@ def _post_start_actions(
                         guest_setup.prepare_boot(vm_name, runtime_user, env_values, guest=guest)
                     elif not _sync_forwarded_env_or_error(vm_name, env_values, guest=guest):
                         return 1
-                elif not diagnostic_root and not _sync_forwarded_env_or_error(
-                    vm_name, env_values
-                ):
+                elif not diagnostic_root and not _sync_forwarded_env_or_error(vm_name, env_values):
                     return 1
-                if auth_port:
-                    port_rc = network.expose_auth_port(vm_name, auth_host_port, auth_guest_port)
-                    if port_rc != 0:
-                        return port_rc
                 if require_provisioned and not provision and not metadata.get("provisioned"):
                     print(
                         f"sbx: VM {vm_name!r} has not completed provisioning; "
@@ -656,6 +654,24 @@ def _post_start_actions(
                 if provision:
                     guest.phase("check")
                     vm_metadata.mark_provisioned(vm_name)
+                    provisioning_complete = True
+                open_auth = (
+                    auth_port if auth_port is not None else provision and not was_provisioned
+                )
+                if attach and not diagnostic_root and open_auth:
+                    port_rc, created_auth_tunnels = network.expose_auth_ports(
+                        vm_name,
+                        auth_forwards
+                        if auth_forwards is not None
+                        else [(auth_host_port, auth_guest_port)],
+                    )
+                    if port_rc != 0:
+                        print(
+                            f"sbx: auth forwarding failed; retry `sbx run {vm_name} --auth-port` "
+                            "or use `sbx network auth-port` with an explicit profile.",
+                            file=sys.stderr,
+                        )
+                        return port_rc
                 if attach:
                     with session_state.session_lock():
                         # Boot setup still owns the lifecycle lock; read-only reuse does not.
@@ -670,7 +686,7 @@ def _post_start_actions(
                         registered = True
         except Exception as exc:  # noqa: BLE001 - preserve provisioning diagnostics.
             details = bootstrap.redact(str(exc), env_values.values())
-            if provision:
+            if provision and not provisioning_complete:
                 _print_provisioning_failure(vm_name, details, was_provisioned=was_provisioned)
             elif isinstance(exc, ConfigError) or env_values:
                 print(
@@ -712,6 +728,11 @@ def _post_start_actions(
             )
         return rc
     finally:
+        if created_auth_tunnels:
+            try:
+                network.close_session_auth_ports(vm_name, created_auth_tunnels)
+            except OSError as exc:
+                print(f"sbx: warning: auth tunnel cleanup failed: {exc}", file=sys.stderr)
         if registered:
             with session_state.session_lock():
                 remaining = session_state.unregister_session(vm_name)
@@ -792,6 +813,7 @@ def _project_config_values(
             "auth_port",
             "auth_host_port",
             "auth_guest_port",
+            "auth_provider",
         )
         if key in inherited
     }
@@ -807,6 +829,8 @@ def _project_config_values(
         "writable_mounts",
         "env",
         "runtime_install",
+        "auth_port",
+        "auth_provider",
         "boot_timeout",
         "install_timeout",
         "stop_on_exit",
@@ -942,7 +966,7 @@ def _start_local_image(
     writable_mounts: bool,
     attach: bool,
     run_user: str | None,
-    auth_port: bool,
+    auth_port: bool | None,
     auth_host_port: int,
     auth_guest_port: int,
     stop_on_exit: bool,
@@ -953,6 +977,7 @@ def _start_local_image(
     copy_initial_state: bool = False,
     env_values: Mapping[str, str | None] | None = None,
     port_forwards: Sequence[str] = (),
+    auth_forwards: list[tuple[int, int]] | None = None,
     operation: vm_metadata.Lifecycle | None = None,
 ) -> int:
     _warn_obsolete_manifest_fields(manifest)
@@ -1040,6 +1065,7 @@ def _start_local_image(
             attach=attach,
             run_user=run_user,
             auth_port=auth_port,
+            auth_forwards=auth_forwards,
             auth_host_port=auth_host_port,
             auth_guest_port=auth_guest_port,
             stop_on_exit=stop_on_exit,
@@ -1160,9 +1186,10 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
         f"env_names={list(env_values)!r}"
     )
 
-    auth_port = attach and bool(_arg_or_config(args, "auth_port", config, "sbx", default=True))
-    auth_host_port = int(_arg_or_config(args, "auth_host_port", config, "sbx", default=1455))
-    auth_guest_port = int(_arg_or_config(args, "auth_guest_port", config, "sbx", default=1455))
+    auth_port, auth_forwards = auth_ports.resolve(args, config, str(agent))
+    if not attach:
+        auth_port = False
+    auth_host_port, auth_guest_port = auth_forwards[0] if auth_forwards else (0, 0)
     stop_on_exit = bool(_arg_or_config(args, "stop_on_exit", config, "sbx", default=True))
     git_config = bool(_arg_or_config(args, "git_config", config, "sbx", default=True))
     git_config_text = None
@@ -1242,6 +1269,7 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
                 attach=attach,
                 run_user=str(run_user) if run_user is not None else None,
                 auth_port=auth_port,
+                auth_forwards=auth_forwards,
                 auth_host_port=auth_host_port,
                 auth_guest_port=auth_guest_port,
                 stop_on_exit=stop_on_exit,
@@ -1284,6 +1312,7 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
                 attach=attach,
                 run_user=str(run_user) if run_user is not None else None,
                 auth_port=auth_port,
+                auth_forwards=auth_forwards,
                 auth_host_port=auth_host_port,
                 auth_guest_port=auth_guest_port,
                 stop_on_exit=stop_on_exit,
@@ -1377,6 +1406,7 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
         attach=attach,
         run_user=str(run_user) if run_user is not None else None,
         auth_port=auth_port,
+        auth_forwards=auth_forwards,
         auth_host_port=auth_host_port,
         auth_guest_port=auth_guest_port,
         stop_on_exit=stop_on_exit,
@@ -1690,6 +1720,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Rerun idempotent user and runtime-tool provisioning for an existing VM.",
     )
+    auth_ports.add_options(run)
     run.set_defaults(func=cmd_start)
 
     create = sub.add_parser("create", help="Create and provision a sandbox without attaching.")
@@ -1758,20 +1789,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     auth_port = network_sub.add_parser(
         "auth-port",
-        help="Expose the Pi OAuth callback port from a sandbox to host localhost.",
+        help="Expose OAuth callback ports from a sandbox to host localhost.",
     )
+    auth_ports.add_options(auth_port)
     auth_port.add_argument("name", nargs="?", help="Sandbox name or ID. Defaults to [sbx].name.")
     auth_port.add_argument(
         "--guest-port",
         type=int,
-        default=1455,
-        help="Guest callback port opened by the agent (default: 1455).",
+        help="Guest callback port override (requires a single profile).",
     )
     auth_port.add_argument(
         "--host-port",
         type=int,
-        default=1455,
-        help="Host localhost port used by the browser redirect (default: 1455).",
+        help="Host localhost callback port override (requires a single profile).",
     )
     auth_port.add_argument(
         "--replace",
@@ -1782,7 +1812,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     close_auth_port = network_sub.add_parser(
         "close-auth-port",
-        help="Close the tracked Pi OAuth callback port tunnel for a sandbox.",
+        help="Close all tracked OAuth callback tunnels for a sandbox.",
     )
     close_auth_port.add_argument(
         "name", nargs="?", help="Sandbox name or ID. Defaults to [sbx].name."

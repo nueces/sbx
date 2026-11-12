@@ -77,7 +77,7 @@ Examples of command/action concerns that should generally not be required in con
 - `--force`
 - `--debug`
 
-Security and forwarding policy such as `auth_port`, `copy_host_credentials`, and `git_config` lives only in config so recreation is reproducible. `copy_host_credentials` remains false by default.
+Persistent security and forwarding policy lives in config so recreation is reproducible. `--auth-port` and `--auth-provider` override callback forwarding for one run; see [OAuth callback forwarding](auth-ports.md). `copy_host_credentials` remains false by default.
 
 ## Existing VM reuse
 

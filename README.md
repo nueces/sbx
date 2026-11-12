@@ -125,7 +125,7 @@ If you try to run with different mounts while the VM is already running, `sbx` k
 
 ### Install more tools
 
-The curated image contains neither Pi nor Specify. Install either explicitly during creation or reprovisioning:
+The curated image is agent-neutral. Install Pi, Claude, OpenCode, or Specify explicitly during creation or reprovisioning:
 
 ```toml
 [sbx]
@@ -138,19 +138,23 @@ Repeated CLI options provide the same request for one invocation:
 sbx run --runtime-install pi --runtime-install specify --no-attach
 ```
 
+Claude and OpenCode use the same provisioning path:
+
+```bash
+sbx run --runtime-install claude --agent claude
+sbx run --runtime-install opencode --agent opencode
+```
+
+These install `@anthropic-ai/claude-code` and `opencode-ai` under the runtime user's `$HOME/.local`. Their npm lifecycle scripts run as that user to prepare platform binaries. Existing executables are preserved. Installing a tool never changes the selected agent.
+
 For other tools, install directly on the sandbox disk instead of rebuilding the image:
 
 ```bash
 sbx shell
-
-# Run these inside the VM as the configured runtime user:
-npm install -g --prefix "$HOME/.local" opencode-ai
-npm install -g --prefix "$HOME/.local" @anthropic-ai/claude-code
+# Inside the VM as the configured runtime user:
 npm install -g --prefix "$HOME/.local" @openai/codex
 exit
 ```
-
-Claude Code and OpenCode require their npm postinstall scripts to prepare native binaries; do not install either with `--ignore-scripts`.
 
 Runtime installation is additive: removing a tool from `runtime_install` does not uninstall it. Installed software survives `sbx stop` and remains available on later runs:
 
@@ -158,16 +162,24 @@ Runtime installation is additive: removing a tool from `runtime_install` does no
 sbx run --agent claude
 sbx run --agent codex
 
-# OpenCode is not an sbx agent preset; launch it inside a sandbox shell.
-sbx shell
-opencode
+sbx run --agent opencode
 ```
 
 `sbx recreate` and `sbx rm` delete the sandbox disk. Add frequently used tools to the curated image if every new or recreated sandbox should contain them.
 
 ## Authentication and networking
 
-Run `/login` inside Pi when authentication is needed. `sbx run` automatically forwards the browser callback port to the VM.
+Run `/login` inside Pi when authentication is needed. After successful first provisioning, an attached `sbx run` opens OAuth callback forwarding. Later runs require `--auth-port` or an enabled `[sbx].auth_port` setting. Tunnels created by a session close when it exits; manual tunnels remain independent.
+
+```bash
+sbx run --auth-port=openai      # localhost:1455 -> VM:1455
+sbx run --auth-port=anthropic   # localhost:53692 -> VM:53692
+sbx run --auth-port=both
+sbx network auth-port --auth-port=anthropic  # persistent manual tunnel
+sbx network close-auth-port                 # close all manual/session tunnels for this VM
+```
+
+`auto` (also the bare `--auth-port` flag) uses `--auth-provider` / `[sbx].auth_provider` as a forwarding hint; otherwise Claude defaults to Anthropic, Codex to OpenAI, and Pi/OpenCode to both. The hint does not configure a model or enable forwarding on later runs by itself. These are named port profiles, not guarantees about every client's login implementation. See [OAuth callback forwarding](docs/auth-ports.md) for configuration, numeric overrides, and lifecycle details.
 
 Temporarily expose a VM service to the host until Ctrl-C:
 
