@@ -181,14 +181,18 @@ func fakeSOCKSServer(listener net.Listener, key []byte, result chan<- error) {
 	if err == nil {
 		_, err = io.ReadFull(conn, password)
 	}
-	parts := strings.Split(string(username), "|")
-	if err != nil || len(parts) != 10 {
+	parts := strings.Split(string(password), "|")
+	if err != nil || len(parts) != 8 {
 		result <- io.ErrUnexpectedEOF
 		return
 	}
-	port, _ := strconv.ParseUint(parts[9], 10, 16)
+	port, err := strconv.ParseUint(parts[6], 10, 16)
+	if err != nil {
+		result <- err
+		return
+	}
 	verifier, _ := capability.New(key, "vm1", "worker1")
-	if _, err = verifier.Verify(string(username), string(password), parts[8], uint16(port)); err != nil {
+	if _, err = verifier.Verify(string(username), string(password), string(username), uint16(port)); err != nil {
 		result <- err
 		return
 	}
@@ -199,7 +203,7 @@ func fakeSOCKSServer(listener net.Listener, key []byte, result chan<- error) {
 		return
 	}
 	destination := make([]byte, int(request[4])+2)
-	if _, err = io.ReadFull(conn, destination); err != nil || string(destination[:len(destination)-2]) != parts[8] {
+	if _, err = io.ReadFull(conn, destination); err != nil || string(destination[:len(destination)-2]) != string(username) {
 		result <- io.ErrUnexpectedEOF
 		return
 	}

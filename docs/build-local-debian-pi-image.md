@@ -319,7 +319,7 @@ Restart manually if needed:
 sudo SBX_DOCKER_USER="$(id -un)" /usr/local/bin/sbx-start-rootless-docker
 ```
 
-The helper preserves the resolver installed by DHCP. In gateway mode, `/etc/resolv.conf` must contain only `nameserver 192.0.2.1`; rebuild the curated image if it contains a Docker, host, fallback, or public resolver.
+The helper preserves the gateway resolver; outside gateway mode it installs the standard SLIRP/public resolver list. In gateway mode, `/etc/resolv.conf` must contain only `nameserver 192.0.2.1`; rebuild the curated image if it contains a Docker, host, fallback, or public resolver.
 
 ### Rootful Docker troubleshooting
 

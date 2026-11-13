@@ -103,7 +103,7 @@ def fake_smolvm_sdk(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str
 
     monkeypatch.setattr(smolvm, "SmolVM", FakeSmolVM)
     monkeypatch.setattr(smolvm, "VMConfig", fake_vm_config)
-    monkeypatch.setattr(smolvm.utils, "ensure_ssh_key", lambda: (private_key, public_key))
+    monkeypatch.setattr(smolvm.utils, "ensure_ssh_key", lambda *_args: (private_key, public_key))
 
     def start_vm(vm_id, **kwargs):
         captured["started"] = True

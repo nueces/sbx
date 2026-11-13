@@ -780,7 +780,7 @@ def test_merged_toml_precedence_applies_to_network(
     local.write_text("[network.quotas]\ntcp_flows = 200\n", encoding="utf-8")
     explicit.write_text("[network.quotas]\ntcp_flows = 100\n", encoding="utf-8")
     monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATHS", (default,))
-    monkeypatch.setattr(cli, "LOCAL_CONFIG_PATHS", (local,))
+    monkeypatch.setattr(cli, "_find_project_config", lambda: local)
 
     parsed = gateway.parse_config(cli.load_config(str(explicit)), platform="linux")
 
@@ -1084,3 +1084,27 @@ def test_network_diagnostics_reports_disabled_without_touching_smolvm(
 
     assert cli.main(["network", "diagnostics", "vm-1"]) == 0
     assert capsys.readouterr().out == "Gateway: disabled\n"
+
+
+def test_gateway_accepts_literal_and_renamed_forwarded_environment() -> None:
+    assert (
+        gateway.parse_config(
+            {
+                "sbx": {"env": ["LITERAL=hello", "ALIAS=${TOKEN_TOKEN}"]},
+                "network": {"policy": [_policy()], "credential": [_command_credential()]},
+            }
+        )
+        is not None
+    )
+
+
+@pytest.mark.parametrize("name", ["TOKEN_TOKEN", "SBX_NETWORK_CREDENTIAL_NAMES"])
+@pytest.mark.parametrize("suffix", ["", "=literal", "=${HOST_KEY}"])
+def test_gateway_environment_collisions_use_destination_names(name, suffix) -> None:
+    with pytest.raises(ConfigError, match="collides"):
+        gateway.parse_config(
+            {
+                "sbx": {"env": [name + suffix]},
+                "network": {"policy": [_policy()], "credential": [_command_credential()]},
+            }
+        )

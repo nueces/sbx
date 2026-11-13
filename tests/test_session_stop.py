@@ -42,6 +42,10 @@ def stopping(tmp_path, monkeypatch):
     class Manager:
         data_dir = tmp_path
 
+        def __init__(self):
+            self._process_handles = {}
+            self._log_files = {}
+
         def stop(self, name):
             state.events.append("stop")
             state.on_stop()
@@ -217,3 +221,47 @@ def test_session_lock_rejects_symlink_without_modifying_target(stopping, tmp_pat
     with pytest.raises(ConfigError, match="lock file"), session_state.session_lock():
         pytest.fail("symlinked coordination file must be rejected")
     assert target.read_text() == "untouched"
+
+
+def test_external_vm_process_ownership_survives_facade_close(stopping, tmp_path):
+    process, log = object(), object()
+    sdk = SimpleNamespace(_process_handles={123: process}, _log_files={"qemu:vm1": log})
+    guest_setup.retain_started_vm(SimpleNamespace(vm_id="vm1", _sdk=sdk))
+    assert sdk._process_handles == {} and sdk._log_files == {}
+    owner = guest_setup._STARTED[(tmp_path, "vm1")]
+    assert owner._process_handles == {123: process}
+    assert owner._log_files == {"qemu:vm1": log}
+    assert guest_setup.stop_if_owned("vm1") == 0
+    assert stopping.events == ["close", "stop", "close"]
+    assert guest_setup._STARTED == {}
+
+
+@pytest.mark.parametrize("join_during_flush", [False, True])
+@pytest.mark.parametrize("fail_stop", [False, True])
+def test_gateway_shutdown_preserves_flush_and_session_admission(
+    stopping, monkeypatch, join_during_flush, fail_stop
+):
+    stopping.fail_stop = fail_stop
+    if join_during_flush:
+        stopping.on_sync = lambda: session_state.register_session("vm1", "shell")
+
+    def drain(_name):
+        with (
+            pytest.raises(ConfigError, match="session"),
+            session_state.session_lock(blocking=False),
+        ):
+            pytest.fail("gateway drain must exclude session admission")
+        stopping.events.append("drain")
+
+    monkeypatch.setattr(cli.gateway, "drain", drain)
+    monkeypatch.setattr(cli.gateway, "stop", lambda _name: stopping.events.append("gateway-stop"))
+    assert cli._stop_gateway("vm1", only_if_idle=True) == (
+        int(fail_stop) if not join_during_flush else 0
+    )
+    if join_during_flush:
+        assert stopping.events == ["ready", "sync"]
+    else:
+        expected = ["ready", "sync", "drain", "stop", "close"]
+        if not fail_stop:
+            expected.append("gateway-stop")
+        assert stopping.events == expected

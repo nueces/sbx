@@ -292,11 +292,11 @@ func normalizeHost(value string) (string, error) {
 	if wildcard {
 		host = strings.TrimPrefix(host, "*.")
 	}
-	if host == "" || strings.ContainsAny(host, "/:@") || strings.Contains(host, "..") {
+	if host == "" || len(host) > 253 || strings.ContainsAny(host, "/:@") || strings.Contains(host, "..") {
 		return "", errors.New("invalid host")
 	}
 	for _, label := range strings.Split(host, ".") {
-		if label == "" || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+		if label == "" || len(label) > 63 || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
 			return "", errors.New("invalid host")
 		}
 		for _, ch := range label {

@@ -104,6 +104,45 @@ def capture_preset(
     monkeypatch.setattr(cli.smolvm_preset, "create_preset", fake_create)
 
 
+def test_preset_gateway_preserves_provider_environment_without_guest_exposure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    install_fake_smolvm(monkeypatch, tmp_path)
+    host_home = tmp_path / "real-home"
+    monkeypatch.setenv("HOME", str(host_home))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-provider-key")
+    monkeypatch.setenv("AWS_PROFILE", "review-profile")
+    config = tmp_path / "gateway.toml"
+    config.write_text(
+        "[sbx]\ngit_config = false\n[network]\n"
+        '[[network.credential]]\nid = "token"\nenvironment = "GATEWAY_TOKEN"\n'
+        'method = "command"\n[network.credential.options]\nargv = ["get-token"]\n'
+        'inherit_environment = ["ANTHROPIC_API_KEY", "AWS_PROFILE"]\n'
+    )
+    captured = {}
+
+    def start(vm, gateway_config, boot_timeout, holder, *, provider_environment):
+        assert os.environ["HOME"] != str(host_home)
+        assert "ANTHROPIC_API_KEY" not in os.environ
+        captured.update(provider_environment)
+
+    def create(_preset, **kwargs):
+        vm = SimpleNamespace(vm_id="vm1", close=lambda: None)
+        kwargs["before_provision"]("vm1")
+        with cli.smolvm_preset._environment(kwargs["host_env"]):
+            kwargs["start_vm"](vm)
+            assert "ANTHROPIC_API_KEY" not in os.environ
+            assert os.environ["HOME"] != str(host_home)
+        return vm
+
+    monkeypatch.setattr(cli, "_start_gateway_vm", start)
+    monkeypatch.setattr(cli.smolvm_preset, "create_preset", create)
+    assert cli.main(["--config", str(config), "create", "vm1", "--keep-running"]) == 0
+    assert captured["HOME"] == str(host_home)
+    assert captured["ANTHROPIC_API_KEY"] == "fake-provider-key"
+    assert captured["AWS_PROFILE"] == "review-profile"
+
+
 def test_cli_forwarded_environment_cannot_replace_credential_placeholder(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

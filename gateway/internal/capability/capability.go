@@ -31,7 +31,7 @@ type Issuer struct {
 	incarnation string
 	now         func() time.Time
 	mu          sync.Mutex
-	used        map[string]struct{}
+	used        map[string]time.Time
 }
 
 func GenerateKey() ([]byte, error) {
@@ -57,7 +57,7 @@ func New(key []byte, vmID, incarnation string) (*Issuer, error) {
 	if !validField(vmID) || !validField(incarnation) {
 		return nil, errors.New("invalid capability identity")
 	}
-	return &Issuer{key: append([]byte(nil), key...), vmID: vmID, incarnation: incarnation, now: time.Now, used: make(map[string]struct{})}, nil
+	return &Issuer{key: append([]byte(nil), key...), vmID: vmID, incarnation: incarnation, now: time.Now, used: make(map[string]time.Time)}, nil
 }
 
 func (i *Issuer) Issue(meta Metadata) (string, string, error) {
@@ -75,7 +75,7 @@ func (i *Issuer) Issue(meta Metadata) (string, string, error) {
 		return "", "", errors.New("invalid capability metadata")
 	}
 	host := strings.ToLower(strings.TrimSuffix(meta.Host, "."))
-	if !validField(host) {
+	if !validField(host) || len(host) > 255 {
 		return "", "", errors.New("invalid capability destination")
 	}
 	var nonce [12]byte
@@ -83,31 +83,32 @@ func (i *Issuer) Issue(meta Metadata) (string, string, error) {
 		return "", "", err
 	}
 	fields := []string{
-		"1", meta.VMID, meta.Incarnation, meta.FlowID, meta.RuleID,
+		"2", meta.FlowID, meta.RuleID,
 		strconv.FormatInt(meta.Issued.Unix(), 10), strconv.FormatInt(meta.Expires.Unix(), 10),
-		base64.RawURLEncoding.EncodeToString(nonce[:]), host, strconv.Itoa(int(meta.Port)),
+		base64.RawURLEncoding.EncodeToString(nonce[:]), strconv.Itoa(int(meta.Port)),
 	}
-	username := strings.Join(fields, "|")
-	if len(username) > 255 {
-		return "", "", errors.New("capability username exceeds RFC 1929 limit")
+	payload := strings.Join(fields, "|")
+	password := payload + "|" + i.mac(host, payload)
+	if len(password) > 255 {
+		return "", "", errors.New("capability password exceeds RFC 1929 limit")
 	}
-	return username, i.mac(username), nil
+	return host, password, nil
 }
 
 func (i *Issuer) Verify(username, password, host string, port uint16) (Metadata, error) {
-	parts := strings.Split(username, "|")
-	if len(parts) != 10 || parts[0] != "1" || len(username) > 255 || parts[1] != i.vmID || parts[2] != i.incarnation {
+	parts := strings.Split(password, "|")
+	if len(parts) != 8 || parts[0] != "2" || len(username) > 255 || len(password) > 255 || !validField(parts[1]) || !validField(parts[2]) {
 		return Metadata{}, errors.New("invalid capability")
 	}
-	issuedUnix, issuedErr := strconv.ParseInt(parts[5], 10, 64)
-	expiresUnix, expiresErr := strconv.ParseInt(parts[6], 10, 64)
-	nonce, nonceErr := base64.RawURLEncoding.DecodeString(parts[7])
-	claimedPort, portErr := strconv.ParseUint(parts[9], 10, 16)
+	issuedUnix, issuedErr := strconv.ParseInt(parts[3], 10, 64)
+	expiresUnix, expiresErr := strconv.ParseInt(parts[4], 10, 64)
+	nonce, nonceErr := base64.RawURLEncoding.DecodeString(parts[5])
+	claimedPort, portErr := strconv.ParseUint(parts[6], 10, 16)
 	normalizedHost := strings.ToLower(strings.TrimSuffix(host, "."))
-	if issuedErr != nil || expiresErr != nil || nonceErr != nil || len(nonce) != 12 || portErr != nil || !validField(normalizedHost) || parts[8] != normalizedHost || uint16(claimedPort) != port {
+	if issuedErr != nil || expiresErr != nil || nonceErr != nil || len(nonce) != 12 || portErr != nil || !validField(normalizedHost) || username != normalizedHost || uint16(claimedPort) != port {
 		return Metadata{}, errors.New("invalid capability destination")
 	}
-	if !hmac.Equal([]byte(i.mac(username)), []byte(password)) {
+	if !hmac.Equal([]byte(i.mac(username, strings.Join(parts[:7], "|"))), []byte(parts[7])) {
 		return Metadata{}, errors.New("invalid capability")
 	}
 	now := i.now()
@@ -117,18 +118,16 @@ func (i *Issuer) Verify(username, password, host string, port uint16) (Metadata,
 	}
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	for token := range i.used {
-		fields := strings.Split(token, "|")
-		old, _ := strconv.ParseInt(fields[6], 10, 64)
-		if old < now.Unix() {
+	for token, expiry := range i.used {
+		if !expiry.After(now) {
 			delete(i.used, token)
 		}
 	}
-	if _, replay := i.used[username]; replay {
+	if _, replay := i.used[password]; replay {
 		return Metadata{}, errors.New("replayed capability")
 	}
-	i.used[username] = struct{}{}
-	return Metadata{VMID: parts[1], Incarnation: parts[2], FlowID: parts[3], RuleID: parts[4], Host: normalizedHost, Port: port, Issued: issued, Expires: expiry}, nil
+	i.used[password] = expiry
+	return Metadata{VMID: i.vmID, Incarnation: i.incarnation, FlowID: parts[1], RuleID: parts[2], Host: normalizedHost, Port: port, Issued: issued, Expires: expiry}, nil
 }
 
 func validField(value string) bool {
@@ -136,15 +135,15 @@ func validField(value string) bool {
 		return false
 	}
 	for _, ch := range value {
-		if ch < 33 || ch == 127 {
+		if ch < 33 || ch >= 127 {
 			return false
 		}
 	}
 	return true
 }
 
-func (i *Issuer) mac(username string) string {
+func (i *Issuer) mac(host, payload string) string {
 	mac := hmac.New(sha256.New, i.key)
-	fmt.Fprint(mac, username)
+	fmt.Fprintf(mac, "%s|%s|%s|%s", i.vmID, i.incarnation, host, payload)
 	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
