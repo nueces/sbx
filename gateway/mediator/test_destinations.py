@@ -147,6 +147,50 @@ def test_invalid_resolver_address_fails_loudly_and_stays_denied(monkeypatch):
     asyncio.run(check())
 
 
+def test_reconnect_revalidates_and_repins_the_logical_destination(monkeypatch):
+    async def check():
+        calls = []
+
+        async def resolve(host, port, **kwargs):
+            assert (host, port) == ("allowed.example", 443)
+            calls.append(host)
+            address = "93.184.216.34" if len(calls) == 1 else "8.8.8.8"
+            return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (address, port))]
+
+        monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", resolve)
+        addon, data = admitted_connection()
+        await addon.server_connect(data)
+        await addon.server_connect(data)
+        assert data.server.error is None
+        assert data.server.address == ("8.8.8.8", 443)
+        assert data.server.sni == "allowed.example"
+        assert len(calls) == 2
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("tamper", [False, True])
+def test_reconnect_does_not_trust_changed_or_rebound_addresses(monkeypatch, tamper):
+    async def check():
+        calls = []
+
+        async def resolve(*args, **kwargs):
+            calls.append(args)
+            address = "93.184.216.34" if len(calls) == 1 else "127.0.0.1"
+            return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (address, 443))]
+
+        monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", resolve)
+        addon, data = admitted_connection()
+        await addon.server_connect(data)
+        if tamper:
+            data.server.address = ("8.8.8.8", 443)
+        await addon.server_connect(data)
+        assert data.server.error == ("destination_denied" if tamper else "destination_ip_denied")
+        assert len(calls) == (1 if tamper else 2)
+
+    asyncio.run(check())
+
+
 def test_existing_connection_error_is_not_cleared():
     addon, data = admitted_connection()
     data.server.error = "previous_denial"
@@ -175,14 +219,15 @@ def test_production_launcher_blocks_loopback_without_fixture_exception(tmp_path)
         fixture.close()
 
 
-def test_wrong_destination_is_denied_before_dns(monkeypatch):
+@pytest.mark.parametrize("host", ["other.example", "93.184.216.34"])
+def test_wrong_destination_is_denied_before_dns(monkeypatch, host):
     async def check():
         async def unexpected_resolution(*args, **kwargs):
             pytest.fail("unauthorized destination reached DNS")
 
         monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", unexpected_resolution)
         addon, data = admitted_connection()
-        data.server.address = ("other.example", 443)
+        data.server.address = (host, 443)
         await addon.server_connect(data)
         assert data.server.error == "destination_denied"
 

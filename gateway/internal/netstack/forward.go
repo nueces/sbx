@@ -336,9 +336,18 @@ func relay(guest, upstream net.Conn) (uint64, uint64) {
 func relayIdle(guest, upstream net.Conn, idle time.Duration) (uint64, uint64) {
 	var wg sync.WaitGroup
 	var uploaded, downloaded uint64
+	var activity sync.Mutex
+	touch := func() {
+		activity.Lock()
+		defer activity.Unlock()
+		deadline := time.Now().Add(idle)
+		_ = guest.SetReadDeadline(deadline)
+		_ = upstream.SetReadDeadline(deadline)
+	}
+	touch()
 	copyOne := func(dst, src net.Conn, count *uint64) {
 		defer wg.Done()
-		*count, _ = copyIdle(dst, src, idle)
+		*count, _ = copyIdle(dst, src, touch)
 		if closer, ok := dst.(closeWriter); ok {
 			_ = closer.CloseWrite()
 		}
@@ -352,13 +361,13 @@ func relayIdle(guest, upstream net.Conn, idle time.Duration) (uint64, uint64) {
 	return uploaded, downloaded
 }
 
-func copyIdle(dst, src net.Conn, idle time.Duration) (uint64, error) {
+func copyIdle(dst, src net.Conn, touch func()) (uint64, error) {
 	buffer := make([]byte, pendingWriteBytes)
 	var copied uint64
 	for {
-		_ = src.SetReadDeadline(time.Now().Add(idle))
 		n, err := src.Read(buffer)
 		if n != 0 {
+			touch()
 			_ = dst.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if _, writeErr := io.CopyN(dst, bytes.NewReader(buffer[:n]), int64(n)); writeErr != nil {
 				return copied, writeErr

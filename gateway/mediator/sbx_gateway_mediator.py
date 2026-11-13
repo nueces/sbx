@@ -420,6 +420,9 @@ class GatewayAddon:
             return
         admission = self._admissions.get(data.client.id)
         address = data.server.address
+        pinned = getattr(data.server, "sbx_pinned_destination", None)
+        if pinned is not None and address == pinned[1]:
+            address = pinned[0]
         # Addon exceptions alone do not stop mitmproxy from connecting.
         data.server.error = "destination_denied"
         if (
@@ -446,7 +449,9 @@ class GatewayAddon:
         # Keep TLS identity logical while the connector receives only a validated numeric IP.
         data.server.sni = data.server.sni or admission.host
         selected = min(answers, key=lambda answer: answer[0] != socket.AF_INET)
-        data.server.address = (selected[4][0], admission.port)
+        endpoint = (selected[4][0], admission.port)
+        data.server.sbx_pinned_destination = ((admission.host, admission.port), endpoint)
+        data.server.address = endpoint
         data.server.error = None
 
     def tls_clienthello(self, data: tls.ClientHelloData) -> None:

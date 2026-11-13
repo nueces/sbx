@@ -39,6 +39,12 @@ func New() (*Network, error) {
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, arp.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 	})
+	// Forwarded virtual tuples have no listener to reopen TIME_WAIT; host sockets keep normal TCP lifetimes.
+	timeWait := tcpip.TCPTimeWaitTimeoutOption(0)
+	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &timeWait); err != nil {
+		s.Destroy()
+		return nil, errors.New(err.String())
+	}
 	link := channel.New(maxQEMUTransmitBytes/(MTU+ethernetFrameOverhead), MTU+header.EthernetMinimumSize, GatewayMAC)
 	if err := s.CreateNIC(NICID, ethernet.New(link)); err != nil {
 		s.Destroy()
