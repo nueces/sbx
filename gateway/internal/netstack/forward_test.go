@@ -73,6 +73,61 @@ func TestRelayStreamsAndHalfCloses(t *testing.T) {
 	upstreamApp.Close()
 }
 
+func TestRelayIdleTracksBothDirections(t *testing.T) {
+	guestApp, guestRelay := tcpPair(t)
+	upstreamRelay, upstreamApp := tcpPair(t)
+	defer guestApp.Close()
+	defer upstreamApp.Close()
+	result := make(chan [2]uint64, 1)
+	go func() {
+		up, down := relayIdle(guestRelay, upstreamRelay, 200*time.Millisecond)
+		result <- [2]uint64{up, down}
+	}()
+	_ = guestApp.SetDeadline(time.Now().Add(3 * time.Second))
+	_ = upstreamApp.SetDeadline(time.Now().Add(3 * time.Second))
+	for range 20 {
+		if _, err := upstreamApp.Write([]byte("x")); err != nil {
+			t.Fatal(err)
+		}
+		var data [1]byte
+		if _, err := io.ReadFull(guestApp, data[:]); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := guestApp.Write([]byte("late")); err != nil {
+		t.Fatal(err)
+	}
+	var upload [4]byte
+	if _, err := io.ReadFull(upstreamApp, upload[:]); err != nil || string(upload[:]) != "late" {
+		t.Fatalf("active one-way traffic lost its reverse direction: %q, %v", upload, err)
+	}
+	_ = guestApp.CloseWrite()
+	_ = upstreamApp.CloseWrite()
+	select {
+	case counts := <-result:
+		if counts != [2]uint64{4, 20} {
+			t.Fatalf("counts %v", counts)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("completed relay did not stop")
+	}
+}
+
+func TestRelayIdleStillExpiresQuietConnections(t *testing.T) {
+	guestApp, guestRelay := tcpPair(t)
+	upstreamRelay, upstreamApp := tcpPair(t)
+	defer guestApp.Close()
+	defer upstreamApp.Close()
+	done := make(chan struct{})
+	go func() { relayIdle(guestRelay, upstreamRelay, 20*time.Millisecond); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("quiet relay exceeded its idle deadline")
+	}
+}
+
 func TestDialRejectsForbiddenAddressUnlessExplicit(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
