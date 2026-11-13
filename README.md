@@ -45,6 +45,8 @@ sbx image build --name sbx-nested-kvm --nested-kvm
 
 Nested KVM increases the kernel and QEMU attack surface and is never enabled in the default image. See the [image guide](docs/build-local-debian-pi-image.md#nested-kvm-images) for host checks, verification, and cleanup.
 
+Every curated image kernel, default and nested, includes Landlock. See [Landlock](docs/build-local-debian-pi-image.md#landlock) for verification and host requirements.
+
 Check the result with:
 
 ```bash

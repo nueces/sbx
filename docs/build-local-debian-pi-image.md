@@ -249,6 +249,38 @@ If startup reports that `/dev/kvm` is unavailable, fix physical-host nesting and
 
 Access to `/dev/kvm` exposes the KVM ioctl interface to the configured runtime user and exercises virtualization code in both guest and physical-host kernels. Keep the host kernel, guest image, QEMU, and CPU microcode patched. Bound inner VM CPU, memory, and disk; avoid mounting credentials, Docker sockets, broad home directories, or sensitive outer-guest paths; and delete disposable inner/outer VMs and test state after use.
 
+## Landlock
+
+Every curated image kernel (default and `--nested-kvm`, amd64 and arm64) is built with `CONFIG_SECURITY_LANDLOCK=y`. The build fails, keeping any existing kernel, unless the final resolved config also lists `landlock` in `CONFIG_LSM`. Kernel support does not sandbox anything by itself; applications must opt in.
+
+Landlock confines processes running on the kernel that handles their system calls:
+
+| Deployment | Kernel that must expose Landlock |
+| --- | --- |
+| `sbx` and its gateway run directly on a Linux machine | That machine's kernel |
+| `sbx` runs inside a container | The container host's kernel, subject to container policy |
+| `sbx` runs inside a curated sbx VM and starts an inner sandbox | The curated VM's kernel |
+| Gateway runs outside a sandbox guest | Adding Landlock to that guest does not confine the external gateway |
+
+Existing images and VMs keep their old kernel: rebuild with `sbx image build`, then `sbx recreate --force`. Verify inside the guest:
+
+```bash
+grep -w landlock /sys/kernel/security/lsm
+```
+
+Before accepting an image release, boot it on each architecture (amd64 and arm64) with the opt-in test. KVM is not required. A skipped test does not pass this gate:
+
+```bash
+SBX_LANDLOCK_TEST_IMAGE=~/.smolvm/images/sbx uv run --extra dev pytest tests/test_landlock_image.py --no-cov
+```
+
+The LSM listing proves kernel support only; enforcement is verified by the gateway hardening tests.
+
+External hosts are not changed by sbx: it never alters host boot parameters, the host kernel, or host security policy. To use Landlock there, the host needs:
+
+- a kernel with `CONFIG_SECURITY_LANDLOCK=y` and `landlock` listed in `/sys/kernel/security/lsm` (add it to the `lsm=` boot parameter if the distribution omits it);
+- for containers, a seccomp profile that allows `landlock_create_ruleset`, `landlock_add_rule`, and `landlock_restrict_self`. Do not use `--privileged` or `--security-opt seccomp=unconfined` as the fix.
+
 ## Docker guest usage
 
 ### Host
