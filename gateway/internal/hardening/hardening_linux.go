@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -244,7 +245,7 @@ func landlock(ports []uint16) (bool, error) {
 			}
 		}
 	}
-	_, _, syscallErr = unix.Syscall6(unix.SYS_LANDLOCK_RESTRICT_SELF, ruleset, 0, 0, 0, 0, 0)
+	_, _, syscallErr = syscall.AllThreadsSyscall(unix.SYS_LANDLOCK_RESTRICT_SELF, ruleset, 0, 0)
 	if syscallErr != 0 {
 		return false, syscallErr
 	}
@@ -258,8 +259,9 @@ func Apply(openFiles int, ports []uint16) (Status, error) {
 	if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
 		return Status{}, fmt.Errorf("disable dumps: %w", err)
 	}
-	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
-		return Status{}, fmt.Errorf("no_new_privs: %w", err)
+	// Go already has OS threads; both restrictions must cover them and their future children.
+	if _, _, err := syscall.AllThreadsSyscall6(unix.SYS_PRCTL, unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0, 0); err != 0 {
+		return Status{}, fmt.Errorf("all-thread no_new_privs: %w", err)
 	}
 	landlocked, err := landlock(ports)
 	if err != nil {

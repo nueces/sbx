@@ -9,6 +9,8 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 
@@ -154,17 +156,25 @@ def test_shipped_codeartifact_description_fetch_cache_and_environment(tmp_path) 
         "#!/bin/sh\n"
         "set -eu\n"
         'test "$AWS_ACCESS_KEY_ID" = fake-source\n'
+        'test "$AWS_PROFILE" = review-profile\n'
+        'IFS= read -r profile < "$HOME/.aws/config"\n'
+        'test "$profile" = "[profile review-profile]"\n'
         "printf x >> calls\n"
         'printf \'%s\\n\' \'{"authorizationToken":"fake-token","expiration":1200}\'\n'
     )
     aws.chmod(aws.stat().st_mode | stat.S_IXUSR)
     now = [1000.0]
+    (tmp_path / ".aws").mkdir()
+    (tmp_path / ".aws" / "config").write_text("[profile review-profile]\n")
     config = credential_config()
+    credential = gateway.replace(
+        config.credentials[0], inherit_environment=("AWS_ACCESS_KEY_ID", "AWS_PROFILE")
+    )
     broker = gateway_supervisor.CredentialBroker(
-        config.credentials,
+        (credential,),
         {
             "baseline": {"HOME": str(tmp_path), "PATH": str(tmp_path), "TZ": "UTC"},
-            "inherited": {"AWS_ACCESS_KEY_ID": "fake-source"},
+            "inherited": {"AWS_ACCESS_KEY_ID": "fake-source", "AWS_PROFILE": "review-profile"},
         },
         tmp_path,
         clock=lambda: now[0],
@@ -203,27 +213,19 @@ def test_rootless_environment_drops_stale_sudo_identity(monkeypatch) -> None:
 
 def test_guest_placeholder_manifest_removes_stale_names(monkeypatch) -> None:
     captured: dict[str, object] = {}
-    monkeypatch.setattr(
-        guest_setup,
-        "sync_forwarded_env_direct_ssh",
-        lambda vm_id, values, missing, **kwargs: captured.update(
-            vm_id=vm_id, values=values, missing=missing
+    vm = SimpleNamespace(
+        info=SimpleNamespace(
+            config=SimpleNamespace(
+                env_vars={"OLD_TOKEN": "old", "SBX_NETWORK_CREDENTIAL_NAMES": "OLD_TOKEN"}
+            )
         ),
+        set_env_vars=lambda values: captured.update(values=values),
+        unset_env_vars=lambda missing: captured.update(missing=missing),
     )
-    guest_setup.sync_network_credentials(
-        "vm1",
-        {"NEW_TOKEN": "opaque"},
-        run_capture=lambda _argv: subprocess.CompletedProcess(
-            [], 0, "export OLD_TOKEN=old\nexport SBX_NETWORK_CREDENTIAL_NAMES=OLD_TOKEN\n", ""
-        ),
-        ssh=lambda _vm_id: ["ssh"],
-    )
+    monkeypatch.setattr(guest_setup, "open_guest", lambda vm_id: nullcontext(vm))
+    guest_setup.sync_network_credentials("vm1", {"NEW_TOKEN": "opaque"})
     assert captured == {
-        "vm_id": "vm1",
-        "values": {
-            "NEW_TOKEN": "opaque",
-            "SBX_NETWORK_CREDENTIAL_NAMES": "NEW_TOKEN",
-        },
+        "values": {"NEW_TOKEN": "opaque", "SBX_NETWORK_CREDENTIAL_NAMES": "NEW_TOKEN"},
         "missing": ["OLD_TOKEN"],
     }
 

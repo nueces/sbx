@@ -12,7 +12,7 @@ import sys
 import tempfile
 import threading
 import time
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -1095,7 +1095,8 @@ class FakeVM:
 
     def __init__(self, events: list[str]) -> None:
         self.events = events
-        config = type("Config", (), {"workspace_mounts": ()})()
+        # Boot-scoped provisioning, not gateway startup, must mount workspaces.
+        config = type("Config", (), {"workspace_mounts": ("/workspace",)})()
         network = type("Network", (), {"ssh_host_port": 2200})()
         self._info = type("Info", (), {"config": config, "network": network})()
 
@@ -1116,7 +1117,8 @@ class FakeController:
     def __init__(self, _config: object, _vm_id: str, events: list[str]) -> None:
         self.events = events
 
-    def prepare(self) -> None:
+    def prepare(self, *, provider_environment: dict[str, str] | None = None) -> None:
+        self.provider_environment = provider_environment
         self.events.append("prepare")
 
     def vm_network_ready(self, _pid: int) -> None:
@@ -1172,6 +1174,7 @@ def test_cli_startup_order_and_every_post_worker_failure_rolls_back(
     monkeypatch.setattr(cli.smolvm_network, "start_vm", start_vm)
     monkeypatch.setattr(cli.gateway_ca, "finalize_ca_state", finalize)
     monkeypatch.setattr(cli.gateway_ca, "install_guest_ca", install)
+    monkeypatch.setattr(cli.guest_setup, "retain_started_vm", lambda _vm: events.append("retain"))
     monkeypatch.setattr(
         cli.guest_setup,
         "sync_network_credentials",
@@ -1179,7 +1182,11 @@ def test_cli_startup_order_and_every_post_worker_failure_rolls_back(
     )
 
     if failure is None:
-        cli._start_gateway_vm(vm, lifecycle_config, 1, holder)  # type: ignore[arg-type]
+        provider_environment = {"HOME": "/real-host-home", "API_KEY": "fake-key"}
+        cli._start_gateway_vm(
+            vm, lifecycle_config, 1, holder, provider_environment=provider_environment
+        )  # type: ignore[arg-type]
+        assert fake.provider_environment == provider_environment
         assert events == [
             "prepare",
             "qemu",
@@ -1189,6 +1196,7 @@ def test_cli_startup_order_and_every_post_worker_failure_rolls_back(
             "ca",
             "install",
             "check",
+            "retain",
         ]
         assert holder == [fake]
     else:
@@ -1215,7 +1223,16 @@ def test_existing_gateway_start_uses_lifecycle_without_smolvm_slirp_command(
         def close(self) -> None:
             events.append("close")
 
-    monkeypatch.setattr(cli.smolvm.SmolVM, "from_id", lambda _name: ExistingVM())
+    @contextmanager
+    def opened(name):
+        assert name == "vm1"
+        vm = ExistingVM()
+        try:
+            yield vm
+        finally:
+            vm.close()
+
+    monkeypatch.setattr(cli.guest_setup, "open_guest", opened)
     monkeypatch.setattr(
         cli,
         "_start_gateway_vm",
@@ -1236,10 +1253,36 @@ def test_existing_gateway_start_uses_lifecycle_without_smolvm_slirp_command(
     assert events == ["gateway-start", "close"]
 
 
+def test_paused_gateway_vm_resumes_without_replacing_its_data_plane(lifecycle_config, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        cli.gateway,
+        "control_request",
+        lambda *_args: {
+            "status": "ready",
+            "generation": "generation1",
+            "config_digest": lifecycle_config.digest("vm1", "generation1"),
+        },
+    )
+    monkeypatch.setattr(cli.vm_state, "existing_vm_start_config", lambda _name: None)
+    monkeypatch.setattr(
+        cli.guest_setup, "start_vm", lambda *args, **kwargs: calls.append((args, kwargs))
+    )
+    monkeypatch.setattr(
+        cli, "_start_gateway_vm", lambda *_args: pytest.fail("must resume, not reboot")
+    )
+    assert (
+        cli._start_existing_vm_if_needed("vm1", "paused", 1, gateway_config=lifecycle_config) == 0
+    )
+    assert calls == [(("vm1",), {"boot_timeout": 1, "status": "paused"})]
+
+
+@pytest.mark.parametrize("status", ["running", "paused"])
 def test_running_vm_without_live_gateway_is_rejected_without_fallback(
     lifecycle_config: gateway.GatewayConfig,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    status: str,
 ) -> None:
     monkeypatch.setattr(
         cli.gateway,
@@ -1252,10 +1295,8 @@ def test_running_vm_without_live_gateway_is_rejected_without_fallback(
         lambda _argv: (_ for _ in ()).throw(AssertionError("fallback must not run")),
     )
 
-    assert (
-        cli._start_existing_vm_if_needed("vm1", "running", 1, gateway_config=lifecycle_config) == 1
-    )
-    assert "running without its configured gateway" in capsys.readouterr().err
+    assert cli._start_existing_vm_if_needed("vm1", status, 1, gateway_config=lifecycle_config) == 1
+    assert f"{status} without its configured gateway" in capsys.readouterr().err
 
 
 def test_running_vm_rejects_live_configuration_drift(
@@ -1294,25 +1335,47 @@ def test_explicit_stop_cleans_gateway_after_vm_and_on_interrupt(
     events: list[str] = []
     monkeypatch.setattr(cli.gateway, "drain", lambda name: events.append(f"drain:{name}"))
     monkeypatch.setattr(cli.gateway, "stop", lambda name: events.append(f"gateway:{name}"))
-    monkeypatch.setattr(
-        cli.runtime,
-        "run_smolvm",
-        lambda argv, **kwargs: events.append(f"vm:{argv[-1]}:{kwargs['timeout']}") or 0,
-    )
+
+    def stop(name, *, only_if_idle=False, before_stop):
+        before_stop()
+        events.append(f"vm:{name}")
+        return 0
+
+    monkeypatch.setattr(cli.guest_setup, "stop_vm", stop)
 
     assert cli._stop_gateway("vm1") == 0
-    assert events == ["drain:vm1", "vm:vm1:30", "gateway:vm1"]
+    assert events == ["drain:vm1", "vm:vm1", "gateway:vm1"]
 
     events.clear()
 
-    def interrupted(_argv: list[str], **_kwargs: object) -> int:
+    def interrupted(_name, *, before_stop, **_kwargs):
+        before_stop()
         events.append("interrupt")
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(cli.runtime, "run_smolvm", interrupted)
+    monkeypatch.setattr(cli.guest_setup, "stop_vm", interrupted)
     with pytest.raises(KeyboardInterrupt):
         cli._stop_gateway("vm1")
     assert events == ["drain:vm1", "interrupt", "gateway:vm1"]
+
+
+def test_missing_vm_removal_still_cleans_its_gateway(monkeypatch):
+    events = []
+    monkeypatch.setattr(cli.guest_setup, "stop_if_owned", lambda _name: 0)
+    monkeypatch.setattr(cli.gateway, "drain", lambda name: events.append(("drain", name)))
+    monkeypatch.setattr(cli.gateway, "remove", lambda name: events.append(("remove", name)))
+    monkeypatch.setattr(
+        cli.vm_metadata, "remove_vm", lambda name: events.append(("metadata", name))
+    )
+    monkeypatch.setattr(
+        cli.runtime,
+        "run_smolvm_capture",
+        lambda _argv: subprocess.CompletedProcess(
+            [], 1, json.dumps({"data": {"failed": [{"error": "VM 'vm1' not found"}]}}), ""
+        ),
+    )
+    assert cli._delete_vm("vm1") == 0
+    assert events == [("drain", "vm1"), ("remove", "vm1"), ("metadata", "vm1")]
 
 
 MEDIATOR = """
@@ -1827,10 +1890,14 @@ def test_supervisor_run_rejects_invalid_inherited_payload(tmp_path: Path) -> Non
         os.close(lock_fd)
 
 
+@pytest.mark.parametrize("sanitized", [False, True])
 def test_persistent_bootstrap_uses_fresh_subprocess_and_inherited_provider_fd(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sanitized: bool
 ) -> None:
     monkeypatch.setenv("TASK33_TOKEN", "task33-source-value")
+    monkeypatch.setenv("HOME", str(tmp_path / "real-home"))
+    monkeypatch.setenv("AWS_PROFILE", "review-profile")
+    provider_environment = dict(os.environ)
     config = gateway.parse_config(
         {
             "network": {
@@ -1842,7 +1909,10 @@ def test_persistent_bootstrap_uses_fresh_subprocess_and_inherited_provider_fd(
                         "id": "token",
                         "environment": "TOKEN",
                         "method": "command",
-                        "options": {"argv": ["get-token"], "inherit_environment": ["TASK33_TOKEN"]},
+                        "options": {
+                            "argv": ["get-token"],
+                            "inherit_environment": ["TASK33_TOKEN", "AWS_PROFILE"],
+                        },
                         "bindings": [
                             {"policies": ["web"], "header": "Authorization: Bearer {placeholder}"}
                         ],
@@ -1893,8 +1963,18 @@ def test_persistent_bootstrap_uses_fresh_subprocess_and_inherited_provider_fd(
         runner=runner,
         timeout=0.2,
     )
-    instance.prepare()
+    if sanitized:
+        with cli.smolvm_preset._environment({"HOME": "/credential-free", "PATH": os.defpath}):
+            instance.prepare(provider_environment=provider_environment)
+    else:
+        instance.prepare()
     try:
+        provider = json.loads(captured["provider"])
+        assert provider["baseline"]["HOME"] == str(tmp_path / "real-home")
+        assert provider["inherited"] == {
+            "TASK33_TOKEN": "task33-source-value",
+            "AWS_PROFILE": "review-profile",
+        }
         assert captured["argv"][:3] == [sys.executable, "-m", "sbx.gateway_supervisor"]
         assert b"task33-source-value" not in captured["config"]
         assert b"task33-source-value" in captured["provider"]
@@ -1903,7 +1983,7 @@ def test_persistent_bootstrap_uses_fresh_subprocess_and_inherited_provider_fd(
         assert captured["env"] == {
             "HOME": str(instance.directory),
             "LANG": "C.UTF-8",
-            "PATH": os.environ.get("PATH", os.defpath),
+            "PATH": os.defpath if sanitized else os.environ.get("PATH", os.defpath),
             "TZ": "UTC",
         }
         assert not hasattr(os, "fork") or "fork" not in " ".join(captured["argv"])

@@ -35,7 +35,7 @@ func TestCapabilityBindingAndReplay(t *testing.T) {
 	}
 	for name, other := range map[string]*Issuer{
 		"cross VM":          testIssuer(t, "a", "vm2", "worker1", now),
-		"prior incarnation": testIssuer(t, "b", "vm1", "worker0", now),
+		"prior incarnation": testIssuer(t, "a", "vm1", "worker0", now),
 	} {
 		if _, err := other.Verify(user, pass, "example.com", 443); err == nil {
 			t.Fatalf("accepted %s capability", name)
@@ -54,7 +54,7 @@ func TestCapabilityRejectsAlterationAndExpiry(t *testing.T) {
 	}{
 		{user, pass, "other.example", 443},
 		{user, pass, "example.com", 80},
-		{strings.Replace(user, "flow1", "flow2", 1), pass, "example.com", 443},
+		{user, strings.Replace(pass, "flow1", "flow2", 1), "example.com", 443},
 		{user, pass + "x", "example.com", 443},
 	} {
 		if _, err := issuer.Verify(credential.user, credential.pass, credential.host, credential.port); err == nil {
@@ -68,8 +68,46 @@ func TestCapabilityRejectsAlterationAndExpiry(t *testing.T) {
 	}
 }
 
+func TestCapabilityFitsSOCKSWithMaximumConfiguredIdentities(t *testing.T) {
+	now := time.Unix(8_000_000_000_000_000_000, 0)
+	vm := strings.Repeat("v", 128)
+	incarnation := strings.Repeat("i", 32)
+	issuer := testIssuer(t, "k", vm, incarnation, now)
+	host := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 61)
+	meta := Metadata{VMID: vm, Incarnation: incarnation, FlowID: strings.Repeat("f", 16), RuleID: strings.Repeat("r", 128), Host: host, Port: 65535}
+	username, password, err := issuer.Issue(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(username) != 253 || len(password) != 254 {
+		t.Fatalf("unexpected SOCKS field sizes: %d, %d", len(username), len(password))
+	}
+	got, err := issuer.Verify(username, password, host, meta.Port)
+	if err != nil || got.VMID != vm || got.Incarnation != incarnation || got.RuleID != meta.RuleID {
+		t.Fatalf("long identity verification: %+v, %v", got, err)
+	}
+	meta.Host = strings.Repeat("a", 256)
+	if _, _, err := issuer.Issue(meta); err == nil {
+		t.Fatal("accepted oversized SOCKS username")
+	}
+	meta.Host = "example.com"
+	meta.FlowID = strings.Repeat("f", 256)
+	if _, _, err := issuer.Issue(meta); err == nil {
+		t.Fatal("accepted oversized SOCKS password")
+	}
+}
+
+func TestCapabilitySharedWireVector(t *testing.T) {
+	issuer := testIssuer(t, "k", "vm1", "worker1", time.Unix(1, 0))
+	password := "2|flow|rule|1|2|AAAAAAAAAAAAAAAA|443|YN4z6lDpiLR6OwJjKV9kCrFsNCB0FUgdf55fpxWTrqc"
+	meta, err := issuer.Verify("example.com", password, "example.com", 443)
+	if err != nil || meta.FlowID != "flow" || meta.RuleID != "rule" {
+		t.Fatalf("shared mediator wire vector: %+v, %v", meta, err)
+	}
+}
+
 func FuzzVerify(f *testing.F) {
-	f.Add("1|vm1|worker1|flow|rule|1|2|AAAAAAAAAAAAAAAA|example.com|443", "password", "example.com", uint16(443))
+	f.Add("example.com", "2|flow|rule|1|2|AAAAAAAAAAAAAAAA|443|signature", "example.com", uint16(443))
 	f.Fuzz(func(t *testing.T, username, password, host string, port uint16) {
 		if len(username) > 1024 || len(password) > 1024 || len(host) > 1024 {
 			return

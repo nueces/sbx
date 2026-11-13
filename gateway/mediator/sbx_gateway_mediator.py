@@ -109,42 +109,49 @@ class CapabilityVerifier:
 
     def verify(self, username: str, password: str, now: int | None = None) -> Admission | None:
         now = int(time.time()) if now is None else now
-        fields = username.split("|")
-        if len(username) > 255 or len(fields) != 10 or fields[0] != "1":
+        fields = password.split("|")
+        if (
+            len(username) > 255
+            or len(password) > 255
+            or not password.isascii()
+            or len(fields) != 8
+            or fields[0] != "2"
+        ):
             return None
         try:
-            issued = int(fields[5])
-            expires = int(fields[6])
-            padding = "=" * (-len(fields[7]) % 4)
-            nonce = base64.b64decode(fields[7] + padding, altchars=b"-_", validate=True)
-            port = int(fields[9])
+            issued = int(fields[3])
+            expires = int(fields[4])
+            padding = "=" * (-len(fields[5]) % 4)
+            nonce = base64.b64decode(fields[5] + padding, altchars=b"-_", validate=True)
+            port = int(fields[6])
         except (ValueError, TypeError, binascii.Error):
+            # Malformed untrusted SOCKS credentials are an authentication denial, not a recovery.
             return None
-        host = _normalize_host(fields[8])
+        host = _normalize_host(username)
         if (
             len(nonce) != 12
             or not 0 < port <= 65535
             or issued > now + 2
             or not max(now, issued) < expires <= issued + 30
-            or fields[1] != self._vm_id
-            or fields[2] != self._incarnation
-            or not _valid_field(fields[3])
-            or not _valid_field(fields[4])
-            or host != fields[8]
+            or not _valid_field(fields[1])
+            or not _valid_field(fields[2])
+            or host != username
         ):
             return None
+        payload = "|".join(fields[:7])
+        signed = f"{self._vm_id}|{self._incarnation}|{username}|{payload}"
         expected = (
-            base64.urlsafe_b64encode(
-                hmac.new(self._key, username.encode(), hashlib.sha256).digest()
-            )
+            base64.urlsafe_b64encode(hmac.new(self._key, signed.encode(), hashlib.sha256).digest())
             .rstrip(b"=")
             .decode()
         )
-        if not hmac.compare_digest(expected, password) or username in self._used:
+        if not hmac.compare_digest(expected, fields[7]) or password in self._used:
             return None
         self._used = {token: expiry for token, expiry in self._used.items() if expiry >= now}
-        self._used[username] = expires
-        return Admission(fields[1], fields[2], fields[3], fields[4], host, port, issued, expires)
+        self._used[password] = expires
+        return Admission(
+            self._vm_id, self._incarnation, fields[1], fields[2], host, port, issued, expires
+        )
 
 
 class HookContext(NamedTuple):

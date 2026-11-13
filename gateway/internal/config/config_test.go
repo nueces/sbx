@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"net/netip"
+	"strings"
 	"testing"
 )
 
@@ -27,6 +28,28 @@ func validConfig() Config {
 	return Config{
 		Version: Version, VMID: "vm-1", Generation: "gen-1", Quotas: DefaultQuotas(),
 		Rules: []Rule{{ID: "web", Protocol: "HTTP", Host: "Example.COM.", Ports: []uint16{443}}},
+	}
+}
+
+func TestDNSHostLengthBoundaries(t *testing.T) {
+	maximum := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 61)
+	for _, test := range []struct {
+		host  string
+		valid bool
+	}{{maximum, true}, {maximum + "x", false}, {strings.Repeat("a", 64) + ".example.com", false}} {
+		cfg := validConfig()
+		cfg.Rules[0].Host = test.host
+		if err := cfg.normalize(); (err == nil) != test.valid {
+			t.Fatalf("host length %d: %v", len(test.host), err)
+		}
+	}
+	cfg := validConfig()
+	cfg.Rules[0].Host = "*.example.com"
+	if err := cfg.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.AllowsHost(strings.Repeat("a", 63)+".example.com") || cfg.AllowsHost(strings.Repeat("a", 64)+".example.com") {
+		t.Fatal("wildcard admitted an invalid DNS label or denied the boundary")
 	}
 }
 

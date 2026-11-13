@@ -81,10 +81,11 @@ def credential(
     issued = int(time.time()) if issued is None else issued
     expires = issued + 30 if expires is None else expires
     nonce = base64.urlsafe_b64encode(os.urandom(12)).rstrip(b"=").decode()
-    username = f"1|{vm}|{incarnation}|{flow}|{rule}|{issued}|{expires}|{nonce}|{host}|{port}"
-    digest = hmac.new(key, username.encode(), hashlib.sha256).digest()
-    password = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
-    return username, password
+    payload = f"2|{flow}|{rule}|{issued}|{expires}|{nonce}|{port}"
+    signed = f"{vm}|{incarnation}|{host}|{payload}"
+    digest = hmac.new(key, signed.encode(), hashlib.sha256).digest()
+    signature = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+    return host, f"{payload}|{signature}"
 
 
 class SocketReader:
@@ -498,6 +499,43 @@ class MediatorProcess:
 
 
 class CapabilityTests(unittest.TestCase):
+    def test_maximum_identity_and_hostname_fit_both_socks_fields(self) -> None:
+        vm, incarnation = "v" * 128, "i" * 32
+        host = ".".join(["a" * 63, "b" * 63, "c" * 63, "d" * 61])
+        now = 8_000_000_000_000_000_000
+        username, password = credential(
+            vm=vm,
+            incarnation=incarnation,
+            flow="f" * 16,
+            rule="r" * 128,
+            host=host,
+            port=65535,
+            issued=now,
+        )
+        self.assertEqual((len(username.encode()), len(password.encode())), (253, 254))
+        admission = CapabilityVerifier(KEY, vm, incarnation).verify(username, password, now=now)
+        self.assertIsNotNone(admission)
+        self.assertEqual(
+            (admission.vm_id, admission.incarnation, admission.rule_id),
+            (vm, incarnation, "r" * 128),
+        )
+        self.assertIsNone(
+            CapabilityVerifier(KEY, vm, incarnation).verify(username + "aaa", password, now=now)
+        )
+        self.assertIsNone(
+            CapabilityVerifier(KEY, vm, incarnation).verify(username, password + "aa", now=now)
+        )
+        self.assertIsNone(
+            CapabilityVerifier(KEY, vm, incarnation).verify(username, password + "é", now=now)
+        )
+
+    def test_shared_go_wire_vector(self) -> None:
+        password = (
+            "2|flow|rule|1|2|AAAAAAAAAAAAAAAA|443|YN4z6lDpiLR6OwJjKV9kCrFsNCB0FUgdf55fpxWTrqc"
+        )
+        admission = CapabilityVerifier(KEY, "vm1", "worker1").verify("example.com", password, now=1)
+        self.assertEqual((admission.flow_id, admission.rule_id), ("flow", "rule"))
+
     def test_exactly_once_and_identity_bound(self) -> None:
         verifier = CapabilityVerifier(KEY, "vm1", "worker1")
         username, password = credential(host="example.com")
@@ -511,7 +549,7 @@ class CapabilityTests(unittest.TestCase):
         self.assertIsNone(
             verifier.verify(username.replace("example.com", "other.example"), password)
         )
-        self.assertIsNone(verifier.verify(username.removesuffix("443") + "80", password))
+        self.assertIsNone(verifier.verify(username, password.replace("|443|", "|80|")))
 
     def test_replacement_rejects_every_old_worker_capability(self) -> None:
         username, password = credential(key=KEY, incarnation="worker1", flow="old-flow")
@@ -527,9 +565,9 @@ class CapabilityTests(unittest.TestCase):
         username, password = credential(issued=now)
         invalid = [
             (username, password + "x"),
-            (username.replace("rule1", "rule2"), password),
+            (username, password.replace("rule1", "rule2")),
             (username.replace("localhost", "LOCALHOST"), password),
-            (username.replace(username.split("|")[7], "!"), password),
+            (username, password.replace(password.split("|")[5], "!")),
         ]
         for user, secret in invalid:
             self.assertIsNone(verifier.verify(user, secret, now=now))

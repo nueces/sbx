@@ -294,6 +294,16 @@ def start_vm(vm_id: str, *, boot_timeout: float, status: str = "stopped") -> Non
     _STARTED[key] = manager
 
 
+def retain_started_vm(vm) -> None:
+    # Reap external QEMU children even after their short-lived facade closes.
+    manager, key = _manager_for(str(vm.vm_id))
+    manager._process_handles.update(vm._sdk._process_handles)
+    vm._sdk._process_handles.clear()
+    manager._log_files.update(vm._sdk._log_files)
+    vm._sdk._log_files.clear()
+    _STARTED[key] = manager
+
+
 def _stop_manager(vm_id, manager, key) -> int:
     try:
         manager.stop(vm_id)
@@ -318,7 +328,9 @@ def stop_if_owned(vm_id: str) -> int:
     return _stop_manager(vm_id, manager, key)
 
 
-def stop_vm(vm_id: str, *, only_if_idle: bool = False) -> int:
+def stop_vm(
+    vm_id: str, *, only_if_idle: bool = False, before_stop: Callable[[], None] | None = None
+) -> int:
     with vm_metadata.Lifecycle() as operation:
         operation.lock(vm_id)
         if only_if_idle:
@@ -340,6 +352,8 @@ def stop_vm(vm_id: str, *, only_if_idle: bool = False) -> int:
             if only_if_idle and session_state.active_sessions(vm_id):
                 runtime.debug(f"not stopping {vm_id}: a session joined during flushing")
                 return 0
+            if before_stop is not None:
+                before_stop()
             manager, key = _manager_for(vm_id)
             return _stop_manager(vm_id, manager, key)
 

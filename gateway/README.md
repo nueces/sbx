@@ -21,6 +21,20 @@ QEMU framing deadlines bound partial headers/payloads and blocked writes, not or
 between-frame inactivity. Fast framing tests use short transfer deadlines rather than
 waiting ten minutes to exercise this behavior.
 
+Linux workers must be built with `CGO_ENABLED=0`: `no_new_privs` and Landlock are
+applied using Go's all-thread syscall barrier, covering existing OS threads and
+future threads through inheritance. A cgo-linked worker fails startup instead of
+claiming process-wide confinement. Kernels without Landlock still report it unavailable.
+
+SOCKS capability version 2 places the logical hostname in the username and signed
+flow/rule/time/nonce/port metadata in the password. Both fields fit RFC 1929's
+255-byte limit, including the largest accepted DNS name and rule ID. VM and worker
+identities remain bound into the signature without being repeated on the wire.
+
+Preset creation captures the original host provider environment before sanitizing
+guest provisioning. Only baseline HOME/PATH/TZ and explicitly inherited variables
+reach the supervisor through its private provider descriptor; guest sanitization stays unchanged.
+
 ```sh
 GOTOOLCHAIN=local go mod verify
 GOTOOLCHAIN=local go test ./...

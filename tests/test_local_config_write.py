@@ -21,6 +21,7 @@ def local_project(tmp_path, monkeypatch):
     monkeypatch.setattr(guest_setup, "host_git_config", lambda *args: None)
     monkeypatch.setattr(guest_setup, "host_username", lambda: "agent")
     monkeypatch.setattr(guest_setup, "credential_free_env", lambda *args, **kwargs: {})
+    monkeypatch.setattr(guest_setup, "sync_network_credentials", lambda *args, **kwargs: None)
     statuses, calls, creations, updates = {}, [], [], []
     monkeypatch.setattr(cli, "_get_existing_vm_status", lambda name: statuses.get(name))
     monkeypatch.setattr(cli, "_warn_running_mount_drift", lambda *a, **kw: None)

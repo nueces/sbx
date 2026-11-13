@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.parse import unquote
 
+from sbx import guest_setup
 from sbx.constants import GATEWAY_UNIX_SOCKET_PATH_MAX_BYTES, SBX_STATE_DIR
 from sbx.runtime import ConfigError, pid_is_alive
 
@@ -731,17 +732,15 @@ def parse_config(config: Mapping[str, Any], *, platform: str | None = None) -> G
     )
     if isinstance(forwarded, str):
         forwarded = [forwarded]
-    if (
-        not isinstance(forwarded, list)
-        or not all(isinstance(name, str) and _ENV_RE.fullmatch(name) for name in forwarded)
-        or len(set(forwarded)) != len(forwarded)
-    ):
-        raise ConfigError("[sbx].env must contain unique environment names")
-    collisions = set(environments) & set(forwarded)
+    if not isinstance(forwarded, list) or not all(isinstance(entry, str) for entry in forwarded):
+        raise ConfigError("[sbx].env must contain environment selections")
+    guest_setup.validate_env_entries(forwarded)
+    forwarded_names = {entry.partition("=")[0] for entry in forwarded}
+    collisions = set(environments) & forwarded_names
     if (
         collisions
         or "SBX_NETWORK_CREDENTIAL_NAMES" in environments
-        or "SBX_NETWORK_CREDENTIAL_NAMES" in forwarded
+        or "SBX_NETWORK_CREDENTIAL_NAMES" in forwarded_names
     ):
         raise ConfigError(
             "network credential environment collides with forwarded or reserved names"
@@ -2825,9 +2824,10 @@ class PersistentGatewayController:
         stream.seek(0)
         return stream
 
-    def prepare(self) -> None:
+    def prepare(self, *, provider_environment: Mapping[str, str] | None = None) -> None:
         if self.directory is not None:
             raise GatewayLifecycleError("gateway is already prepared")
+        environment = os.environ if provider_environment is None else provider_environment
         self._lock_fd = self._acquire_lock()
         staging = GatewayController(
             self.config,
@@ -2844,7 +2844,7 @@ class PersistentGatewayController:
                 for credential in self.config.credentials
                 for name in credential.inherit_environment
             }
-            missing = sorted(inherited_names - os.environ.keys())
+            missing = sorted(inherited_names - environment.keys())
             if missing:
                 raise GatewayLifecycleError(
                     f"credential provider requires missing host environment {missing[0]!r}"
@@ -2852,11 +2852,11 @@ class PersistentGatewayController:
             provider_payload = _compact_json(
                 {
                     "baseline": {
-                        "HOME": os.environ.get("HOME", str(Path.home())),
-                        "PATH": os.environ.get("PATH", os.defpath),
-                        "TZ": os.environ.get("TZ", "UTC"),
+                        "HOME": environment.get("HOME", str(Path.home())),
+                        "PATH": environment.get("PATH", os.defpath),
+                        "TZ": environment.get("TZ", "UTC"),
                     },
-                    "inherited": {name: os.environ[name] for name in inherited_names},
+                    "inherited": {name: environment[name] for name in inherited_names},
                 }
             )
             self.runtime_directory = _create_runtime_directory(
