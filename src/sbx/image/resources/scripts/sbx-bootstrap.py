@@ -199,7 +199,7 @@ class Runtime:
         if self.phase == "tools":
             tools, timeout = self.args["tools"], self.args["install_timeout"]
             if not isinstance(tools, list) or any(
-                tool not in ("pi", "specify", "claude", "opencode") for tool in tools
+                tool not in ("pi", "specify", "claude", "opencode", "codex") for tool in tools
             ):
                 raise ValueError("unsupported runtime installer")
             if type(timeout) is not int or timeout <= 0:
@@ -611,11 +611,12 @@ class Runtime:
                 continue
             if found.stderr.strip():
                 raise ValueError(self.redact(found.stderr.strip()))
-            if tool in ("pi", "claude", "opencode"):
+            if tool in ("pi", "claude", "opencode", "codex"):
                 package = {
                     "pi": "@earendil-works/pi-coding-agent",
                     "claude": "@anthropic-ai/claude-code",
                     "opencode": "opencode-ai",
+                    "codex": "@openai/codex",
                 }[tool]
                 policy = "--ignore-scripts" if tool == "pi" else "--ignore-scripts=false"
                 command = (
@@ -640,7 +641,7 @@ class Runtime:
                 user=True,
                 timeout=timeout + 15,
             )
-            if tool in ("claude", "opencode"):
+            if tool in ("claude", "opencode", "codex"):
                 verified = self.run(
                     [
                         "bash",

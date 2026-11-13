@@ -2081,6 +2081,7 @@ def test_runtime_install_is_strict_and_cli_replaces_config() -> None:
     assert cli._runtime_install(SimpleNamespace(runtime_install=["specify"]), configured) == [
         "specify"
     ]
+    assert cli._runtime_install(SimpleNamespace(runtime_install=["codex"]), {}) == ["codex"]
     assert cli._cfg_agent({"sbx": {"agent": "codex", "runtime_install": ["specify"]}}) == "codex"
 
     for value in ("pi", ["pi", "pi"], ["specify", "specify"], ["unknown"]):

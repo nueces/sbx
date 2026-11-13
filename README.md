@@ -138,21 +138,22 @@ Repeated CLI options provide the same request for one invocation:
 sbx run --runtime-install pi --runtime-install specify --no-attach
 ```
 
-Claude and OpenCode use the same provisioning path:
+Claude, OpenCode, and Codex use the same provisioning path:
 
 ```bash
 sbx run --runtime-install claude --agent claude
 sbx run --runtime-install opencode --agent opencode
+sbx run --runtime-install codex --agent codex
 ```
 
-These install `@anthropic-ai/claude-code` and `opencode-ai` under the runtime user's `$HOME/.local`. Their npm lifecycle scripts run as that user to prepare platform binaries. Existing executables are preserved. Installing a tool never changes the selected agent.
+These install `@anthropic-ai/claude-code`, `opencode-ai`, and `@openai/codex` under the runtime user's `$HOME/.local`. Their npm lifecycle scripts run as that user to prepare platform binaries. Existing executables are preserved. Installing a tool never changes the selected agent.
 
 For other tools, install directly on the sandbox disk instead of rebuilding the image:
 
 ```bash
 sbx shell
 # Inside the VM as the configured runtime user:
-npm install -g --prefix "$HOME/.local" @openai/codex
+npm install -g --prefix "$HOME/.local" <package>
 exit
 ```
 

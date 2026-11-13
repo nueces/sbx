@@ -18,7 +18,7 @@ COMMANDS = (
 NETWORK_COMMANDS = ("forward", "auth-port", "close-auth-port", "status")
 IMAGE_COMMANDS = ("build", "list", "ls")
 AGENTS = ("pi", "claude", "codex", "opencode")
-INSTALLERS = ("pi", "specify", "claude", "opencode")
+INSTALLERS = ("pi", "specify", "claude", "opencode", "codex")
 AUTH_PROFILES = ("auto", "openai", "anthropic", "both", "none")
 AUTH_PROVIDERS = ("openai", "anthropic")
 
