@@ -2,7 +2,8 @@
 agent = "pi"
 runtime_install = ["pi"]
 # Add "specify" to install the Specify CLI with uv during provisioning.
-# runtime_install = ["pi", "specify"]
+# runtime_install = ["pi", "specify", "claude", "opencode"]
+# Installation is independent from launch choice: agent = "opencode" is also supported.
 name = "pi"
 image = "~/.smolvm/images/debian-sbx"
 memory = 2048
@@ -26,6 +27,16 @@ copy_host_credentials = false
 # env = ["OPENAI_API_KEY", "APP_MODE=development", "SERVICE_TOKEN=${HOST_TOKEN}"]
 env = []
 git_config = true
+
+# Omitted: forward callbacks only after first successful attached provisioning.
+# Explicit "auto": enable on every attached run; "none": disable.
+# Profiles: "auto", "openai" (1455), "anthropic" (53692), "both", "none".
+# auth_port = "auto"
+# Forwarding hint only; does not configure an agent model or enable later forwarding alone.
+# auth_provider = "anthropic"
+# Numeric overrides require a single resolved profile, not "both".
+# auth_host_port = 53692
+# auth_guest_port = 53692
 
 # Optional host-to-guest TCP forwards, applied when the VM starts.
 # port_forwards = ["3000", "8080:3000", "0.0.0.0:3000:3000"]

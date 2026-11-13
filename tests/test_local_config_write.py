@@ -140,6 +140,92 @@ def test_cli_values_override_inherited_defaults_in_new_local_file(local_project)
     assert config["env"] == ["SBX_TEST_ABSENT"]
 
 
+@pytest.mark.parametrize("action", ["create", "recreate"])
+def test_headless_creation_does_not_persist_auth_suppression(local_project, monkeypatch, action):
+    project = local_project
+    project.source.unlink()
+    flags = ["--force", "--write-config"] if action == "recreate" else []
+    assert cli.main([action, "local-vm", *flags]) == 0
+    assert "auth_port" not in cli.load_config()["sbx"]
+
+    forwarded = []
+    monkeypatch.setattr(
+        cli.network,
+        "expose_auth_ports",
+        lambda name, ports, **kwargs: forwarded.append((name, ports)) or (0, []),
+    )
+    assert cli.main(["network", "auth-port"]) == 0
+    assert forwarded == [("local-vm", [(1455, 1455), (53692, 53692)])]
+
+
+@pytest.mark.parametrize("action", ["create", "recreate"])
+@pytest.mark.parametrize(
+    "policy,ports",
+    [
+        ("auto", [(1455, 1455), (53692, 53692)]),
+        ("openai", [(1455, 1455)]),
+        ("anthropic", [(53692, 53692)]),
+        ("both", [(1455, 1455), (53692, 53692)]),
+    ],
+)
+def test_headless_write_config_preserves_inherited_auth_policy(
+    local_project,
+    monkeypatch,
+    action,
+    policy,
+    ports,
+):
+    project = local_project
+    original = project.source.read_text() + "auth_port=" + cli._toml_value(policy) + "\n"
+    project.source.write_text(original)
+    flags = ["--force"] if action == "recreate" else []
+    assert cli.main([action, "local-vm", "--write-config", *flags]) == 0
+    assert cli.load_config()["sbx"]["auth_port"] == policy
+    assert project.source.read_text() == original
+
+    forwarded = []
+    monkeypatch.setattr(
+        cli.network,
+        "expose_auth_ports",
+        lambda name, ports, **kwargs: forwarded.append((name, ports)) or (0, []),
+    )
+    assert cli.main(["network", "auth-port"]) == 0
+    assert forwarded == [("local-vm", ports)]
+
+
+@pytest.mark.parametrize("action", ["run", "network"])
+@pytest.mark.parametrize(
+    "invalid,profile,ports",
+    [
+        (False, "both", [(1455, 1455), (53692, 53692)]),
+        (True, "none", []),
+    ],
+)
+def test_explicit_cli_profile_overrides_invalid_config_without_rewriting(
+    local_project,
+    monkeypatch,
+    action,
+    invalid,
+    profile,
+    ports,
+):
+    project = local_project
+    original = project.source.read_text() + "auth_port=" + cli._toml_value(invalid) + "\n"
+    project.source.write_text(original)
+    forwarded = []
+    monkeypatch.setattr(
+        cli.network,
+        "expose_auth_ports",
+        lambda name, ports, **kwargs: forwarded.append(ports) or (0, []),
+    )
+    command = ["run", "local-vm", "--no-attach"] if action == "run" else ["network", "auth-port"]
+    assert cli.main([*command, f"--auth-port={profile}"]) == 0
+    if action == "network":
+        assert forwarded == [ports]
+    assert project.source.read_text() == original
+    assert not (project.child / ".sbx.toml").exists()
+
+
 def test_existing_local_config_symlink_keeps_canonical_identity(local_project):
     project = local_project
     (project.child / ".sbx.toml").symlink_to(project.source)
@@ -165,7 +251,10 @@ def test_existing_local_config_still_adds_only_missing_values(local_project):
 @pytest.mark.parametrize("action", ["run", "create", "recreate"])
 @pytest.mark.parametrize("entries", ["TOKEN=${SOURCE}", ["TOKEN=${SOURCE}", "X=a\nb\rc", "EMPTY="]])
 def test_inherited_env_entries_are_saved_without_resolving_references(
-    local_project, monkeypatch, action, entries,
+    local_project,
+    monkeypatch,
+    action,
+    entries,
 ):
     project = local_project
     monkeypatch.setenv("SOURCE", "RESOLVED_SECRET_SENTINEL")

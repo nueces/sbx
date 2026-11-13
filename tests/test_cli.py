@@ -725,7 +725,7 @@ def test_run_user_from_config_starts_then_attaches_as_user(
         captured["attach"] = (vm_id, kwargs.get("user"), launch_command, kwargs.get("cwd"))
         return 0
 
-    monkeypatch.setattr(cli.network, "expose_auth_port", lambda vm_id, host_port, guest_port: 0)
+    monkeypatch.setattr(cli.network, "expose_auth_ports", lambda *args: (0, []))
     monkeypatch.setattr(guest_setup, "prepare_run_user", fake_prepare)
     monkeypatch.setattr(guest_setup, "attach", fake_attach)
     config = tmp_path / "config.toml"
@@ -782,7 +782,7 @@ def test_git_config_defaults_on_for_managed_run(
     monkeypatch.setattr(
         guest_setup, "host_git_config", lambda project_root=None: "[user]\n\tname = Test\n"
     )
-    monkeypatch.setattr(cli.network, "expose_auth_port", lambda vm_id, host_port, guest_port: 0)
+    monkeypatch.setattr(cli.network, "expose_auth_ports", lambda *args: (0, []))
     monkeypatch.setattr(
         guest_setup,
         "install_git_config",
@@ -806,7 +806,7 @@ def test_config_disables_git_forwarding(
     monkeypatch.setattr(
         guest_setup, "host_git_config", lambda project_root=None: "[user]\n\tname = Test\n"
     )
-    monkeypatch.setattr(cli.network, "expose_auth_port", lambda vm_id, host_port, guest_port: 0)
+    monkeypatch.setattr(cli.network, "expose_auth_ports", lambda *args: (0, []))
     monkeypatch.setattr(
         guest_setup,
         "install_git_config",
@@ -1127,7 +1127,7 @@ def test_run_with_project_path_attaches_from_mounted_project_cwd(
         return 0
 
     monkeypatch.setattr(guest_setup, "attach", fake_attach)
-    monkeypatch.setattr(cli.network, "expose_auth_port", lambda *args: 0)
+    monkeypatch.setattr(cli.network, "expose_auth_ports", lambda *args: (0, []))
 
     rc = cli.main(["run", "--project-path", str(project)])
 
@@ -1144,26 +1144,26 @@ def test_run_uses_configured_auth_ports_before_attach(
 ) -> None:
     install_fake_smolvm(monkeypatch, tmp_path)
     (tmp_path / ".sbx.toml").write_text(
-        "[sbx]\nauth_port = true\nauth_host_port = 1555\nauth_guest_port = 1666\n",
+        '[sbx]\nauth_port = "openai"\nauth_host_port = 1555\nauth_guest_port = 1666\n',
         encoding="utf-8",
     )
     captured: dict[str, object] = {}
     capture_preset(monkeypatch, captured)
 
-    def fake_expose(vm_id: str, host_port: int, guest_port: int) -> int:
-        captured["expose"] = (vm_id, host_port, guest_port)
-        return 0
+    def fake_expose(vm_id, ports):
+        captured["expose"] = (vm_id, ports)
+        return 0, []
 
     def fake_attach(vm_id: str, launch_command: str, **kwargs: object) -> int:
         captured["attach"] = (vm_id, launch_command, kwargs.get("cwd"))
         return 0
 
-    monkeypatch.setattr(cli.network, "expose_auth_port", fake_expose)
+    monkeypatch.setattr(cli.network, "expose_auth_ports", fake_expose)
     monkeypatch.setattr(guest_setup, "attach", fake_attach)
 
     assert cli.main(["run"]) == 0
     assert captured["preset_closed"] is True
-    assert captured["expose"] == ("vm1", 1555, 1666)
+    assert captured["expose"] == ("vm1", [(1555, 1666)])
     assert captured["attach"] == ("vm1", "pi", None)
 
 
@@ -1210,7 +1210,7 @@ def test_run_existing_vm_starts_without_creating(
     )
     monkeypatch.setattr(guest_setup, "sync_guest_clock", lambda vm_id, **kwargs: None)
     monkeypatch.setattr(guest_setup, "prepare_run_user", lambda *args, **kwargs: None)
-    monkeypatch.setattr(cli.network, "expose_auth_port", lambda vm_id, host_port, guest_port: 0)
+    monkeypatch.setattr(cli.network, "expose_auth_ports", lambda *args: (0, []))
     monkeypatch.setattr(
         guest_setup,
         "attach",
@@ -1342,7 +1342,7 @@ def test_run_positional_name_creates_missing_vm(
     install_fake_smolvm(monkeypatch, tmp_path)
     captured: dict[str, object] = {}
     capture_preset(monkeypatch, captured, vm_id="pi-sbx")
-    monkeypatch.setattr(cli.network, "expose_auth_port", lambda *args: 0)
+    monkeypatch.setattr(cli.network, "expose_auth_ports", lambda *args: (0, []))
 
     assert cli.main(["run", "pi-sbx"]) == 0
     preset_name, preset_kwargs = captured["preset"]
@@ -1358,7 +1358,7 @@ def test_run_missing_vm_creates_it(
     install_fake_smolvm(monkeypatch, tmp_path)
     captured: dict[str, object] = {}
     capture_preset(monkeypatch, captured)
-    monkeypatch.setattr(cli.network, "expose_auth_port", lambda *args: 0)
+    monkeypatch.setattr(cli.network, "expose_auth_ports", lambda *args: (0, []))
 
     assert cli.main(["run", "vm1", "--no-attach"]) == 0
     _, preset_kwargs = captured["preset"]
@@ -1510,16 +1510,16 @@ def test_auth_port_exposes_pi_callback_port(
     install_fake_smolvm(monkeypatch, tmp_path)
     captured: dict[str, object] = {}
 
-    def fake_expose(vm_id: str, host_port: int, guest_port: int, *, replace: bool = False) -> int:
-        captured["expose"] = (vm_id, host_port, guest_port, replace)
-        return 0
+    def fake_expose(vm_id, ports, *, replace=False):
+        captured["expose"] = (vm_id, ports, replace)
+        return 0, []
 
-    monkeypatch.setattr(cli.network, "expose_auth_port", fake_expose)
+    monkeypatch.setattr(cli.network, "expose_auth_ports", fake_expose)
 
     rc = cli.main(["network", "auth-port", "vm1"])
 
     assert rc == 0
-    assert captured["expose"] == ("vm1", 1455, 1455, False)
+    assert captured["expose"] == ("vm1", [(1455, 1455), (53692, 53692)], False)
 
 
 def test_network_forward_defaults_to_configured_name(
@@ -1621,9 +1621,9 @@ def test_network_commands_default_to_configured_name(
     captured: dict[str, object] = {}
     monkeypatch.setattr(
         cli.network,
-        "expose_auth_port",
-        lambda vm_id, host_port, guest_port, *, replace=False: (
-            captured.setdefault("expose", (vm_id, host_port, guest_port, replace)) and 0
+        "expose_auth_ports",
+        lambda vm_id, ports, *, replace=False: (
+            captured.setdefault("expose", (vm_id, ports, replace)) and (0, [])
         ),
     )
 
@@ -1631,7 +1631,7 @@ def test_network_commands_default_to_configured_name(
         captured["close"] = vm_id
         return False
 
-    monkeypatch.setattr(cli.network, "_close_tracked_auth_tunnel", fake_close_auth_tunnel)
+    monkeypatch.setattr(cli.network, "close_auth_ports", fake_close_auth_tunnel)
     monkeypatch.setattr(cli.network, "_tracked_auth_tunnel", lambda vm_id: None)
     monkeypatch.setattr(cli.network, "_localhost_port_is_listening", lambda port: False)
 
@@ -1652,7 +1652,7 @@ def test_network_commands_default_to_configured_name(
     assert cli.main(["network", "close-auth-port"]) == 0
     assert cli.main(["network", "status"]) == 0
 
-    assert captured["expose"] == ("vm1", 1455, 1455, False)
+    assert captured["expose"] == ("vm1", [(1455, 1455), (53692, 53692)], False)
     assert captured["close"] == "vm1"
     assert captured["status"] == ["sandbox", "info", "vm1", "--json"]
     assert "No tracked auth port tunnel for 'vm1'." in capfd.readouterr().out
@@ -1682,7 +1682,7 @@ def test_network_status_json(
         "guest_ip": "10.0.2.15",
         "ssh_port": 2201,
         "port_forwards": [],
-        "auth_callback": {"status": "inactive", "detail": None},
+        "auth_callback": {"status": "inactive", "detail": None, "tunnels": []},
     }
 
 

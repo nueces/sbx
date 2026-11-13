@@ -61,7 +61,7 @@ Auth callback: busy/untracked
 
 ### `sbx network auth-port NAME`
 
-Opens the OAuth callback tunnel for an already-running sandbox:
+Opens persistent OAuth callback tunnels for an already-running sandbox. Select `--auth-port=openai|anthropic|both|auto|none`; defaults follow the configured provider hint or agent (`auto`). For example, the OpenAI profile forwards:
 
 ```text
 host localhost:1455 -> guest localhost:1455
@@ -79,7 +79,7 @@ If the host port is already listening but not tracked, `sbx` treats the port as 
 
 ### `sbx network close-auth-port NAME`
 
-Closes the tracked OAuth callback tunnel for a sandbox.
+Closes all tracked OAuth callback tunnels for a sandbox. See [OAuth callback forwarding](auth-ports.md) for profiles, overrides, session ownership, and legacy-state compatibility.
 
 This command only closes tunnels tracked by `sbx`. It intentionally does not kill arbitrary processes listening on the same port.
 

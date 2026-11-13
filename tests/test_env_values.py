@@ -111,7 +111,7 @@ def project(tmp_path, monkeypatch, fake_guest_lifecycle):
 
     def configure(entries, extra=""):
         state.config.write_text(
-            '[sbx]\nname="vm1"\nrun_user="root"\nauth_port=false\n'
+            '[sbx]\nname="vm1"\nrun_user="root"\nauth_port="none"\n'
             + "env="
             + cli._toml_value(entries)
             + "\n"

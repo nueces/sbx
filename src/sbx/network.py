@@ -1,4 +1,5 @@
 import argparse
+import fcntl
 import json
 import os
 import signal
@@ -7,9 +8,10 @@ import subprocess
 import sys
 import time
 from collections.abc import Mapping, Sequence
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from typing import Any
 
+from sbx import auth_ports
 from sbx.constants import SBX_STATE_DIR, TUNNELS_FILE
 from sbx.runtime import (
     ConfigError,
@@ -59,40 +61,80 @@ def port_forwards_from_specs(specs: Sequence[str]) -> list[dict[str, Any]]:
     ]
 
 
+@contextmanager
+def tunnel_lock():
+    SBX_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with TUNNELS_FILE.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
 def _load_tunnels() -> dict[str, Any]:
-    return read_json_object(TUNNELS_FILE)
+    data = read_json_object(TUNNELS_FILE)
+    for vm_id, vm in list(data.items()):
+        if not isinstance(vm, dict):
+            data.pop(vm_id)
+            continue
+        ports = vm.get("auth_ports")
+        if not isinstance(ports, dict):
+            ports = {}
+        legacy = vm.pop("auth_port", None)
+        if isinstance(legacy, dict) and type(legacy.get("host_port")) is int:
+            ports.setdefault(str(legacy["host_port"]), legacy)
+        vm["auth_ports"] = ports
+    return data
 
 
 def _save_tunnels(data: Mapping[str, Any]) -> None:
     write_json_object(TUNNELS_FILE, data, state_dir=SBX_STATE_DIR)
 
 
-def _tracked_auth_tunnel(vm_id: str) -> dict[str, Any] | None:
-    tunnel = _load_tunnels().get(vm_id, {}).get("auth_port")
-    if not isinstance(tunnel, dict):
-        return None
-    pid = tunnel.get("pid")
-    if not isinstance(pid, int) or not pid_is_alive(pid):
-        return None
-    return tunnel
+def _live_auth_tunnel(tunnel: object) -> bool:
+    return (
+        isinstance(tunnel, dict)
+        and type(tunnel.get("pid")) is int
+        and tunnel["pid"] > 0
+        and type(tunnel.get("host_port")) is int
+        and 1 <= tunnel["host_port"] <= 65535
+        and type(tunnel.get("guest_port")) is int
+        and 1 <= tunnel["guest_port"] <= 65535
+        and pid_is_alive(tunnel["pid"])
+    )
+
+
+def _tracked_auth_tunnels(vm_id: str) -> list[dict[str, Any]]:
+    return [
+        tunnel
+        for tunnel in _load_tunnels().get(vm_id, {}).get("auth_ports", {}).values()
+        if _live_auth_tunnel(tunnel)
+    ]
+
+
+def _tracked_auth_tunnel(vm_id: str, host_port: int | None = None) -> dict[str, Any] | None:
+    return next(
+        (
+            t
+            for t in _tracked_auth_tunnels(vm_id)
+            if host_port is None or t["host_port"] == host_port
+        ),
+        None,
+    )
 
 
 def _tracked_auth_tunnel_for_host_port(host_port: int) -> tuple[str, dict[str, Any]] | None:
-    for vm_id, vm_data in _load_tunnels().items():
-        if not isinstance(vm_data, dict):
-            continue
-        tunnel = vm_data.get("auth_port")
-        if not isinstance(tunnel, dict) or tunnel.get("host_port") != host_port:
-            continue
-        pid = tunnel.get("pid")
-        if isinstance(pid, int) and pid_is_alive(pid):
-            return str(vm_id), tunnel
+    for vm_id in _load_tunnels():
+        tunnel = _tracked_auth_tunnel(vm_id, host_port)
+        if tunnel is not None:
+            return vm_id, tunnel
     return None
 
 
 def _record_auth_tunnel(vm_id: str, *, pid: int, host_port: int, guest_port: int) -> None:
     data = _load_tunnels()
-    data.setdefault(vm_id, {})["auth_port"] = {
+    data.setdefault(vm_id, {}).setdefault("auth_ports", {})[str(host_port)] = {
         "pid": pid,
         "host_port": host_port,
         "guest_port": guest_port,
@@ -100,11 +142,17 @@ def _record_auth_tunnel(vm_id: str, *, pid: int, host_port: int, guest_port: int
     _save_tunnels(data)
 
 
-def _remove_auth_tunnel_record(vm_id: str) -> None:
+def _remove_auth_tunnel_record(vm_id: str, host_port: int | None = None) -> None:
     data = _load_tunnels()
     vm_data = data.get(vm_id)
     if isinstance(vm_data, dict):
-        vm_data.pop("auth_port", None)
+        ports = vm_data.get("auth_ports", {})
+        if host_port is None:
+            ports.clear()
+        else:
+            ports.pop(str(host_port), None)
+        if not ports:
+            vm_data.pop("auth_ports", None)
         if not vm_data:
             data.pop(vm_id, None)
     _save_tunnels(data)
@@ -116,10 +164,10 @@ def _localhost_port_is_listening(port: int) -> bool:
         return sock.connect_ex(("127.0.0.1", port)) == 0
 
 
-def _close_tracked_auth_tunnel(vm_id: str) -> bool:
-    tracked = _tracked_auth_tunnel(vm_id)
+def _close_tracked_auth_tunnel(vm_id: str, host_port: int | None = None) -> bool:
+    tracked = _tracked_auth_tunnel(vm_id, host_port)
     if tracked is None:
-        _remove_auth_tunnel_record(vm_id)
+        _remove_auth_tunnel_record(vm_id, host_port)
         return False
 
     pid = int(tracked["pid"])
@@ -131,13 +179,62 @@ def _close_tracked_auth_tunnel(vm_id: str) -> bool:
     if pid_is_alive(pid):
         with suppress(ProcessLookupError, PermissionError, OSError):
             os.killpg(pid, signal.SIGKILL)
-    _remove_auth_tunnel_record(vm_id)
+    _remove_auth_tunnel_record(vm_id, tracked["host_port"])
     return True
 
 
+def close_session_auth_ports(vm_id: str, created: Sequence[Mapping[str, Any]]) -> None:
+    with tunnel_lock():
+        _close_session_auth_ports(vm_id, created)
+
+
+def _close_session_auth_ports(vm_id: str, created: Sequence[Mapping[str, Any]]) -> None:
+    for tunnel in created:
+        current = _load_tunnels().get(vm_id, {}).get("auth_ports", {}).get(str(tunnel["host_port"]))
+        if current == tunnel:
+            _close_tracked_auth_tunnel(vm_id, tunnel["host_port"])
+
+
+def close_auth_ports(vm_id: str) -> bool:
+    with tunnel_lock():
+        tunnels = _tracked_auth_tunnels(vm_id)
+        for tunnel in tunnels:
+            _close_tracked_auth_tunnel(vm_id, tunnel["host_port"])
+        _remove_auth_tunnel_record(vm_id)
+        return bool(tunnels)
+
+
+def expose_auth_ports(
+    vm_id: str,
+    ports: Sequence[tuple[int, int]],
+    *,
+    replace: bool = False,
+) -> tuple[int, list[dict[str, Any]]]:
+    created: list[dict[str, Any]] = []
+    with tunnel_lock():
+        try:
+            for host, guest in ports:
+                before = _tracked_auth_tunnel(vm_id, host)
+                rc = _expose_auth_port(vm_id, host, guest, replace=replace)
+                after = _tracked_auth_tunnel(vm_id, host)
+                if after is not None and after != before:
+                    created.append(after)
+                if rc != 0:
+                    _close_session_auth_ports(vm_id, created)
+                    return rc, []
+        except BaseException:
+            _close_session_auth_ports(vm_id, created)
+            raise
+    return 0, created
+
+
 def expose_auth_port(vm_id: str, host_port: int, guest_port: int, *, replace: bool = False) -> int:
+    return expose_auth_ports(vm_id, [(host_port, guest_port)], replace=replace)[0]
+
+
+def _expose_auth_port(vm_id: str, host_port: int, guest_port: int, *, replace: bool = False) -> int:
     debug(f"expose auth port: vm={vm_id}, host_port={host_port}, guest_port={guest_port}")
-    tracked = _tracked_auth_tunnel(vm_id)
+    tracked = _tracked_auth_tunnel(vm_id, host_port)
     if (
         tracked
         and tracked.get("host_port") == host_port
@@ -145,8 +242,8 @@ def expose_auth_port(vm_id: str, host_port: int, guest_port: int, *, replace: bo
     ):
         debug(f"auth host port {host_port} already tracked with pid {tracked['pid']}")
         return 0
-    if _localhost_port_is_listening(host_port):
-        owner = _tracked_auth_tunnel_for_host_port(host_port)
+    owner = _tracked_auth_tunnel_for_host_port(host_port)
+    if owner is not None or _localhost_port_is_listening(host_port):
         if owner is not None:
             owner_vm, _owner_tunnel = owner
             if replace:
@@ -155,7 +252,7 @@ def expose_auth_port(vm_id: str, host_port: int, guest_port: int, *, replace: bo
                     f"VM '{owner_vm}' -> VM '{vm_id}'.",
                     file=sys.stderr,
                 )
-                _close_tracked_auth_tunnel(owner_vm)
+                _close_tracked_auth_tunnel(owner_vm, host_port)
             else:
                 print(
                     f"sbx: warning: localhost:{host_port} is already used by the auth "
@@ -198,22 +295,32 @@ def expose_auth_port(vm_id: str, host_port: int, guest_port: int, *, replace: bo
         print(f"sbx: failed to start auth port tunnel: {exc}", file=sys.stderr)
         return 1
 
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            stderr = proc.stderr.read().strip() if proc.stderr is not None else ""
-            print(f"sbx: auth port tunnel exited before becoming ready: {stderr}", file=sys.stderr)
-            return proc.returncode or 1
-        if _localhost_port_is_listening(host_port):
-            _record_auth_tunnel(vm_id, pid=proc.pid, host_port=host_port, guest_port=guest_port)
-            debug(f"auth port tunnel ready with pid {proc.pid}")
-            return 0
-        time.sleep(0.1)
-
-    with suppress(ProcessLookupError, PermissionError, OSError):
-        os.killpg(proc.pid, signal.SIGTERM)
-    print(f"sbx: auth port tunnel did not become ready on localhost:{host_port}", file=sys.stderr)
-    return 1
+    ready = False
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                stderr = proc.stderr.read().strip() if proc.stderr is not None else ""
+                print(
+                    f"sbx: auth port tunnel exited before becoming ready: {stderr}", file=sys.stderr
+                )
+                return proc.returncode or 1
+            if _localhost_port_is_listening(host_port):
+                _record_auth_tunnel(vm_id, pid=proc.pid, host_port=host_port, guest_port=guest_port)
+                ready = True
+                debug(f"auth port tunnel ready with pid {proc.pid}")
+                return 0
+            time.sleep(0.1)
+        print(
+            f"sbx: auth port tunnel did not become ready on localhost:{host_port}", file=sys.stderr
+        )
+        return 1
+    finally:
+        if not ready:
+            with suppress(ProcessLookupError, PermissionError, OSError):
+                os.killpg(proc.pid, signal.SIGTERM)
+        if proc.stderr is not None:
+            proc.stderr.close()
 
 
 def _foreground_port_forward(vm_id: str, forwards: Sequence[tuple[str, int, int]]) -> int:
@@ -246,9 +353,10 @@ def cmd_auth_port(args: argparse.Namespace) -> int:
     name = vm_name_from_arg_or_config(args, getattr(args, "config_data", None), "network auth-port")
     if name is None:
         return 2
-    return expose_auth_port(
-        name, args.host_port, args.guest_port, replace=bool(getattr(args, "replace", False))
-    )
+    config = getattr(args, "config_data", {})
+    agent = config.get("sbx", {}).get("agent", "pi")
+    _enabled, ports = auth_ports.resolve(args, config, agent)
+    return expose_auth_ports(name, ports, replace=bool(getattr(args, "replace", False)))[0]
 
 
 def cmd_close_auth_port(args: argparse.Namespace) -> int:
@@ -257,7 +365,7 @@ def cmd_close_auth_port(args: argparse.Namespace) -> int:
     )
     if name is None:
         return 2
-    if not _close_tracked_auth_tunnel(name):
+    if not close_auth_ports(name):
         print(f"No tracked auth port tunnel for '{name}'.")
         return 0
     print(f"Closed auth port tunnel for '{name}'.")
@@ -304,14 +412,15 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     payload = json.loads(completed.stdout)
     vm = payload["data"]["vm"]
-    tracked = _tracked_auth_tunnel(name)
+    tunnels = _tracked_auth_tunnels(name)
     auth_status = "inactive"
     auth_detail = "-"
-    if tracked is not None:
+    if tunnels:
         auth_status = "active"
-        auth_detail = (
+        auth_detail = "; ".join(
             f"pid {tracked['pid']}, localhost:{tracked['host_port']} -> "
             f"guest:{tracked['guest_port']}"
+            for tracked in tunnels
         )
     elif _localhost_port_is_listening(args.host_port):
         auth_status = "busy/untracked"
@@ -327,6 +436,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         "port_forwards": port_forwards,
         "auth_callback": {
             "status": auth_status,
+            "tunnels": tunnels,
             "detail": None if auth_detail == "-" else auth_detail,
         },
     }

@@ -885,7 +885,7 @@ def test_post_start_actions_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     project = {"project_root": "/project", "config_path": "/project/.sbx.toml"}
     vm_metadata.claim_vm("vm1", project, "agent", created=True)
     monkeypatch.setattr(
-        cli.network, "expose_auth_port", lambda *args: calls.append(("port", args)) or 0
+        cli.network, "expose_auth_ports", lambda *args: calls.append(("port", args)) or (0, [])
     )
     monkeypatch.setattr(
         session_state, "register_session", lambda *args: calls.append(("register", args))
@@ -952,11 +952,11 @@ def test_post_start_actions_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     assert [name for name, _ in calls] == [
         "prepare",
         "clock",
-        "port",
         "kvm",
         "install",
         "git",
         "docker",
+        "port",
         "register",
         "user",
         "unregister",
@@ -1020,11 +1020,11 @@ def test_expose_auth_port_error_paths(
     monkeypatch.setattr(
         cli.network,
         "_tracked_auth_tunnel",
-        lambda vm_id: {"pid": 123, "host_port": 1, "guest_port": 2},
+        lambda vm_id, host_port=None: {"pid": 123, "host_port": 1, "guest_port": 2},
     )
     assert cli.network.expose_auth_port("vm1", 1, 2) == 0
 
-    monkeypatch.setattr(cli.network, "_tracked_auth_tunnel", lambda vm_id: None)
+    monkeypatch.setattr(cli.network, "_tracked_auth_tunnel", lambda *args: None)
     monkeypatch.setattr(cli.network, "_tracked_auth_tunnel_for_host_port", lambda port: ("vm2", {}))
     monkeypatch.setattr(cli.network, "_localhost_port_is_listening", lambda port: True)
     assert cli.network.expose_auth_port("vm1", 1, 2) == 0
@@ -1467,7 +1467,7 @@ def test_main_config_error(
 def test_expose_auth_port_missing_ssh_oserror_and_timeout(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr(cli.network, "_tracked_auth_tunnel", lambda vm_id: None)
+    monkeypatch.setattr(cli.network, "_tracked_auth_tunnel", lambda *args: None)
     monkeypatch.setattr(cli.network, "_localhost_port_is_listening", lambda port: False)
     monkeypatch.setattr(cli.network, "ssh_command", lambda vm_id: ["ssh", "root@host"])
     monkeypatch.setattr(
@@ -1507,10 +1507,12 @@ def test_expose_auth_port_missing_ssh_oserror_and_timeout(
 def test_close_auth_port_kills_tracked_tunnel(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr(cli.network, "_tracked_auth_tunnel", lambda name: {"pid": 123})
-    removed: list[str] = []
+    tunnel = {"pid": 123, "host_port": 1455, "guest_port": 1455}
+    monkeypatch.setattr(cli.network, "_tracked_auth_tunnel", lambda *args: tunnel)
+    monkeypatch.setattr(cli.network, "_tracked_auth_tunnels", lambda name: [tunnel])
+    removed = []
     monkeypatch.setattr(
-        cli.network, "_remove_auth_tunnel_record", lambda name: removed.append(name)
+        cli.network, "_remove_auth_tunnel_record", lambda *args: removed.append(args)
     )
     states = iter([True, False, False])
     monkeypatch.setattr(cli.network, "pid_is_alive", lambda pid: next(states))
@@ -1521,7 +1523,7 @@ def test_close_auth_port_kills_tracked_tunnel(
 
     assert cli.network.cmd_close_auth_port(type("Args", (), {"name": "vm1"})()) == 0
     assert killed == [(123, cli.network.signal.SIGTERM)]
-    assert removed == ["vm1"]
+    assert removed == [("vm1", 1455), ("vm1",)]
     assert "Closed auth port" in capsys.readouterr().out
 
 
@@ -1602,10 +1604,10 @@ def test_read_toml_oserror_and_create_alias(
 
     captured: dict[str, object] = {}
     monkeypatch.setattr(cli, "cmd_start", lambda args: captured.update(vars(args)) or 0)
-    args = type("Args", (), {"attach": True, "auth_port": None})()
+    args = SimpleNamespace(attach=True, auth_port=None)
     assert cli.cmd_create(args) == 0
     assert captured["attach"] is False
-    assert captured["auth_port"] is False
+    assert captured["auth_port"] is None
 
 
 def test_post_start_actions_auth_port_failure_skips_attach(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1619,7 +1621,10 @@ def test_post_start_actions_auth_port_failure_skips_attach(monkeypatch: pytest.M
     monkeypatch.setattr(
         guest_setup, "sync_guest_clock", lambda vm_id, **kwargs: calls.append("clock")
     )
-    monkeypatch.setattr(cli.network, "expose_auth_port", lambda *args: calls.append("port") or 9)
+    vm_metadata.mark_provisioned("vm1")
+    monkeypatch.setattr(
+        cli.network, "expose_auth_ports", lambda *args: calls.append("port") or (9, [])
+    )
     monkeypatch.setattr(guest_setup, "attach", lambda *args, **kwargs: calls.append("attach") or 0)
 
     assert (
@@ -1640,7 +1645,9 @@ def test_post_start_actions_auth_port_failure_skips_attach(monkeypatch: pytest.M
 
 
 def test_close_auth_port_escalates_to_sigkill(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(cli.network, "_tracked_auth_tunnel", lambda name: {"pid": 123})
+    tunnel = {"pid": 123, "host_port": 1455, "guest_port": 1455}
+    monkeypatch.setattr(cli.network, "_tracked_auth_tunnel", lambda *args: tunnel)
+    monkeypatch.setattr(cli.network, "_tracked_auth_tunnels", lambda name: [tunnel])
     monkeypatch.setattr(cli.network, "_remove_auth_tunnel_record", lambda *args, **kwargs: None)
     monkeypatch.setattr(cli.network.time, "sleep", lambda seconds: None)
     times = iter([0.0, 4.0])
@@ -1910,7 +1917,7 @@ def test_recreate_success_deletes_then_starts(monkeypatch: pytest.MonkeyPatch) -
     assert cli.cmd_recreate(args) == 0
     assert calls == [("delete", "vm1"), ("start", "vm1")]
     assert args.attach is False
-    assert args.auth_port is False
+    assert args.auth_port is None
 
 
 def test_start_existing_vm_if_needed_variants(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1979,7 +1986,7 @@ def test_non_timeout_start_failure_is_not_reported_as_ssh_timeout(monkeypatch, c
 def test_auth_tunnel_success_records_when_port_becomes_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(cli.network, "_tracked_auth_tunnel", lambda vm_id: None)
+    monkeypatch.setattr(cli.network, "_tracked_auth_tunnel", lambda *args: None)
     readiness = iter([False, True])
     monkeypatch.setattr(cli.network, "_localhost_port_is_listening", lambda port: next(readiness))
     monkeypatch.setattr(cli.network, "ssh_command", lambda vm_id: ["ssh", "root@host"])
@@ -1994,6 +2001,7 @@ def test_auth_tunnel_success_records_when_port_becomes_ready(
 
     class RunningProcess:
         pid = 321
+        stderr = None
 
         def poll(self) -> None:
             return None
@@ -2027,11 +2035,11 @@ def test_unregister_session_keeps_other_active_sessions(monkeypatch: pytest.Monk
 def test_network_auth_port_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         cli.network,
-        "expose_auth_port",
-        lambda name, host, guest, *, replace=False: (name, host, guest, replace),
+        "expose_auth_ports",
+        lambda name, ports, *, replace=False: ((name, ports, replace), []),
     )
-    args = type("Args", (), {"name": "vm1", "host_port": 1, "guest_port": 2, "replace": True})()
-    assert cli.network.cmd_auth_port(args) == ("vm1", 1, 2, True)
+    args = SimpleNamespace(name="vm1", host_port=1, guest_port=2, replace=True, auth_port="openai")
+    assert cli.network.cmd_auth_port(args) == ("vm1", [(1, 2)], True)
 
 
 def test_vm_metadata_claim_is_per_vm_atomic_and_immutable(tmp_path: Path) -> None:
@@ -2173,7 +2181,7 @@ def test_failed_reprovision_preserves_success_and_prints_guidance(
 def boot_flow(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespace:
     config = tmp_path / ".sbx.toml"
     config.write_text(
-        '[sbx]\nname = "vm1"\nrun_user = "agent"\nauth_port = false\n'
+        '[sbx]\nname = "vm1"\nrun_user = "agent"\nauth_port = "none"\n'
         'stop_on_exit = false\nruntime_install = ["pi"]\n',
         encoding="utf-8",
     )
@@ -2358,7 +2366,8 @@ def test_boot_creation_paths_share_setup(
     for name, arguments, _ in boot_flow.events:
         if name == "env":
             assert arguments == (
-                expected_name, {"X": "literal", "TOKEN": "alias-secret", "EMPTY": ""}
+                expected_name,
+                {"X": "literal", "TOKEN": "alias-secret", "EMPTY": ""},
             )
     assert json.loads(capsys.readouterr().out)["vm"]["name"] == expected_name
 
@@ -2600,7 +2609,7 @@ def test_boot_root_provisioning_is_not_diagnostic(
     metadata["run_user"] = "root"
     vm_metadata.metadata_path("vm1").write_text(json.dumps(metadata), encoding="utf-8")
     boot_flow.config.write_text(
-        '[sbx]\nname = "vm1"\nrun_user = "root"\nauth_port = false\n',
+        '[sbx]\nname = "vm1"\nrun_user = "root"\nauth_port = "none"\n',
         encoding="utf-8",
     )
     boot_flow.fail = "clock" if fail_clock else None
@@ -2617,14 +2626,14 @@ def test_boot_running_session_keeps_environment_tunnel_and_cleanup(
 ) -> None:
     boot_flow.status = "running"
     boot_flow.config.write_text(
-        '[sbx]\nname = "vm1"\nrun_user = "agent"\nauth_port = true\n'
+        '[sbx]\nname = "vm1"\nrun_user = "agent"\nauth_port = "auto"\n'
         'stop_on_exit = true\nenv = ["OLLAMA_HOST"]\n',
         encoding="utf-8",
     )
     monkeypatch.setattr(
         cli.network,
-        "expose_auth_port",
-        lambda *args: boot_flow.events.append(("port", args, {})) or 0,
+        "expose_auth_ports",
+        lambda *args: boot_flow.events.append(("port", args, {})) or (0, []),
     )
     stopped = []
     monkeypatch.setenv("OLLAMA_HOST", "http://localhost:11434")
@@ -2641,7 +2650,7 @@ def test_missing_agent_launch_preserves_setup_and_cleans_session(
     boot_flow, monkeypatch, keep_running, capsys
 ):
     boot_flow.config.write_text(
-        '[sbx]\nname = "vm1"\nrun_user = "agent"\nauth_port = false\nstop_on_exit = true\n'
+        '[sbx]\nname = "vm1"\nrun_user = "agent"\nauth_port = "none"\nstop_on_exit = true\n'
     )
     metadata = vm_metadata.load_vm("vm1")
     metadata["provisioned"] = False
@@ -2658,9 +2667,9 @@ def test_missing_agent_launch_preserves_setup_and_cleans_session(
         return 127
 
     monkeypatch.setattr(guest_setup, "attach", attach)
-    assert boot_flow.run(
-        "run", "--reprovision", *(["--keep-running"] if keep_running else [])
-    ) == 127
+    assert (
+        boot_flow.run("run", "--reprovision", *(["--keep-running"] if keep_running else [])) == 127
+    )
     assert boot_flow.names().index("mark") < boot_flow.names().index("attach")
     assert vm_metadata.load_vm("vm1")["provisioned"] is True
     assert session_state.active_sessions("vm1") == []
@@ -2762,15 +2771,20 @@ def test_authorization_failure_prevents_agent_and_provision_mark(
 
 
 @pytest.mark.parametrize("status", ["running", "stopped", "paused"])
-@pytest.mark.parametrize("options", [
-    ["run"], ["run", "--no-attach"], ["run", "--reprovision", "--no-attach"],
-    ["shell"], ["shell", "--root"],
-])
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["run"],
+        ["run", "--no-attach"],
+        ["run", "--reprovision", "--no-attach"],
+        ["shell"],
+        ["shell", "--root"],
+    ],
+)
 def test_resolved_env_reaches_every_existing_vm_path(boot_flow, monkeypatch, status, options):
     boot_flow.status = status
     boot_flow.config.write_text(
-        boot_flow.config.read_text()
-        + 'env=["X=literal", "TOKEN=${SOURCE}", "EMPTY=", "MISSING"]\n'
+        boot_flow.config.read_text() + 'env=["X=literal", "TOKEN=${SOURCE}", "EMPTY=", "MISSING"]\n'
     )
     monkeypatch.setenv("SOURCE", "alias-secret")
     monkeypatch.delenv("MISSING", raising=False)
@@ -2779,14 +2793,24 @@ def test_resolved_env_reaches_every_existing_vm_path(boot_flow, monkeypatch, sta
     if "--root" in options:
         assert env_calls == []
     else:
-        assert env_calls == [("vm1", {
-            "X": "literal", "TOKEN": "alias-secret", "EMPTY": "", "MISSING": None,
-        })]
+        assert env_calls == [
+            (
+                "vm1",
+                {
+                    "X": "literal",
+                    "TOKEN": "alias-secret",
+                    "EMPTY": "",
+                    "MISSING": None,
+                },
+            )
+        ]
 
 
 @pytest.mark.parametrize("entries", [["EMPTY="], ["MISSING"]])
 def test_running_empty_or_unset_selection_still_takes_lifecycle_lock(
-    boot_flow, monkeypatch, entries,
+    boot_flow,
+    monkeypatch,
+    entries,
 ):
     boot_flow.status = "running"
     boot_flow.config.write_text(boot_flow.config.read_text() + "env=" + json.dumps(entries) + "\n")

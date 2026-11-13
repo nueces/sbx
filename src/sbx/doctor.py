@@ -55,25 +55,25 @@ def doctor_sessions(*, fix: bool) -> None:
 
 
 def doctor_tunnels(*, fix: bool) -> None:
-    data = network._load_tunnels()
-    changed = False
-    for vm_id, vm_data in list(data.items()):
-        if not isinstance(vm_data, dict):
-            data.pop(vm_id, None)
-            changed = True
-            continue
-        tunnel = vm_data.get("auth_port")
-        pid = tunnel.get("pid") if isinstance(tunnel, dict) else None
-        if not isinstance(pid, int) or not session_state.pid_is_alive(pid):
-            print(f"sbx tunnels: {vm_id}: stale auth tunnel record")
-            if fix:
-                vm_data.pop("auth_port", None)
-                if not vm_data:
-                    data.pop(vm_id, None)
-                changed = True
-    if changed and fix:
-        network._save_tunnels(data)
-        print("  fixed: removed stale tunnel record(s)")
+    with network.tunnel_lock():
+        data = network._load_tunnels()
+        changed = False
+        for vm_id, vm_data in list(data.items()):
+            ports = vm_data.get("auth_ports", {})
+            for port, tunnel in list(ports.items()):
+                if not network._live_auth_tunnel(tunnel):
+                    print(f"sbx tunnels: {vm_id}: stale auth tunnel record on {port}")
+                    if fix:
+                        ports.pop(port)
+                        changed = True
+            if not ports:
+                vm_data.pop("auth_ports", None)
+            if not vm_data:
+                data.pop(vm_id)
+        if fix:
+            network._save_tunnels(data)
+            if changed:
+                print("  fixed: removed stale tunnel record(s)")
 
 
 def doctor_error_vms(*, fix: bool) -> None:

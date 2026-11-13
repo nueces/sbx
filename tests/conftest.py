@@ -3,7 +3,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from sbx import guest_setup, runtime, session_state
+from sbx import guest_setup, network, runtime, session_state
+
+
+@pytest.fixture(autouse=True)
+def isolated_tunnel_state(monkeypatch, tmp_path):
+    monkeypatch.setattr(network, "SBX_STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(network, "TUNNELS_FILE", tmp_path / "state" / "tunnels.json")
 
 
 @pytest.fixture

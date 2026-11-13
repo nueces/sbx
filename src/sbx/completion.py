@@ -17,7 +17,10 @@ COMMANDS = (
 )
 NETWORK_COMMANDS = ("forward", "auth-port", "close-auth-port", "status")
 IMAGE_COMMANDS = ("build", "list", "ls")
-AGENTS = ("pi", "claude", "codex")
+AGENTS = ("pi", "claude", "codex", "opencode")
+INSTALLERS = ("pi", "specify", "claude", "opencode")
+AUTH_PROFILES = ("auto", "openai", "anthropic", "both", "none")
+AUTH_PROVIDERS = ("openai", "anthropic")
 
 GLOBAL_OPTIONS = ("--config", "--debug", "--help")
 START_OPTIONS = (
@@ -46,9 +49,16 @@ LS_OPTIONS = ("--running", "--json", "--help")
 RM_OPTIONS = ("--force", "--help")
 DOCTOR_OPTIONS = ("--fix", "--help")
 STOP_OPTIONS = ("--help",)
-RUN_OPTIONS = (*START_OPTIONS, "--reprovision")
+RUN_OPTIONS = (*START_OPTIONS, "--reprovision", "--auth-port", "--auth-provider")
 FORWARD_OPTIONS = ("--name", "--help")
-AUTH_PORT_OPTIONS = ("--guest-port", "--host-port", "--replace", "--help")
+AUTH_PORT_OPTIONS = (
+    "--auth-port",
+    "--auth-provider",
+    "--guest-port",
+    "--host-port",
+    "--replace",
+    "--help",
+)
 NETWORK_STATUS_OPTIONS = ("--host-port", "--json", "--help")
 IMAGE_BUILD_OPTIONS = (
     "--name",
@@ -125,7 +135,15 @@ _sbx_complete() {{
             return 0
             ;;
         --runtime-install)
-            COMPREPLY=( $(compgen -W "pi specify" -- "$cur") )
+            COMPREPLY=( $(compgen -W "{_words(INSTALLERS)}" -- "$cur") )
+            return 0
+            ;;
+        --auth-port)
+            COMPREPLY=( $(compgen -W "{_words(AUTH_PROFILES)}" -- "$cur") )
+            return 0
+            ;;
+        --auth-provider)
+            COMPREPLY=( $(compgen -W "{_words(AUTH_PROVIDERS)}" -- "$cur") )
             return 0
             ;;
         --config|--image|--mount|--project-path)
@@ -260,6 +278,13 @@ _sbx() {{
   image_ls_options=({image_ls_options})
   shells=({shells})
 
+  case $words[CURRENT-1] in
+    --agent) _values 'agent' {_words(AGENTS)}; return ;;
+    --runtime-install) _values 'installer' {_words(INSTALLERS)}; return ;;
+    --auth-port) _values 'profile' {_words(AUTH_PROFILES)}; return ;;
+    --auth-provider) _values 'provider' {_words(AUTH_PROVIDERS)}; return ;;
+  esac
+
   case $CURRENT in
     2)
       _describe 'command' commands
@@ -361,6 +386,14 @@ def fish_completion() -> str:
             )
     for agent in AGENTS:
         lines.append(f"complete -c sbx -f -n '__fish_seen_argument -l agent' -a {agent}")
+    for option, values in (
+        ("runtime-install", INSTALLERS),
+        ("auth-port", AUTH_PROFILES),
+        ("auth-provider", AUTH_PROVIDERS),
+    ):
+        lines.append(
+            f"complete -c sbx -f -n '__fish_seen_argument -l {option}' -a '{_words(values)}'"
+        )
     network_subcommands = _words(NETWORK_COMMANDS)
     for command in NETWORK_COMMANDS:
         lines.append(

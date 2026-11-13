@@ -198,7 +198,9 @@ class Runtime:
             raise ValueError("invalid Git configuration")
         if self.phase == "tools":
             tools, timeout = self.args["tools"], self.args["install_timeout"]
-            if not isinstance(tools, list) or any(tool not in ("pi", "specify") for tool in tools):
+            if not isinstance(tools, list) or any(
+                tool not in ("pi", "specify", "claude", "opencode") for tool in tools
+            ):
                 raise ValueError("unsupported runtime installer")
             if type(timeout) is not int or timeout <= 0:
                 raise ValueError("invalid installer deadline")
@@ -609,13 +611,19 @@ class Runtime:
                 continue
             if found.stderr.strip():
                 raise ValueError(self.redact(found.stderr.strip()))
-            if tool == "pi":
+            if tool in ("pi", "claude", "opencode"):
+                package = {
+                    "pi": "@earendil-works/pi-coding-agent",
+                    "claude": "@anthropic-ai/claude-code",
+                    "opencode": "opencode-ai",
+                }[tool]
+                policy = "--ignore-scripts" if tool == "pi" else "--ignore-scripts=false"
                 command = (
                     "export NPM_CONFIG_USERCONFIG=/dev/stdin NPM_CONFIG_GLOBALCONFIG=/dev/null\n"
                     "if [ -r /etc/profile.d/smolvm_env.sh ]; then "
                     ". /etc/profile.d/smolvm_env.sh; fi\n"
-                    'exec npm install --global --prefix "$HOME/.local" --ignore-scripts '
-                    "@earendil-works/pi-coding-agent </dev/null"
+                    f'exec npm install --global --prefix "$HOME/.local" {policy} '
+                    f"{package} </dev/null"
                 )
             else:
                 command = "exec uv tool install specify-cli --from git+https://github.com/github/spec-kit.git"
@@ -632,6 +640,22 @@ class Runtime:
                 user=True,
                 timeout=timeout + 15,
             )
+            if tool in ("claude", "opencode"):
+                verified = self.run(
+                    [
+                        "bash",
+                        "-lc",
+                        'export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"; '
+                        f"command -v {tool}",
+                    ],
+                    user=True,
+                    check=False,
+                )
+                if verified.returncode != 0:
+                    raise ValueError(
+                        f"installed {tool}, but its executable is not on the runtime user's PATH; "
+                        "inspect the npm install and retry provisioning"
+                    )
 
     def execute(self):
         if self.phase == "mounts":

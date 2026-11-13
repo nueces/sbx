@@ -392,7 +392,7 @@ def test_guest_git_preserves_existing_file(guest_script, account_home):
     assert "replacement" not in (home / ".gitconfig").read_text()
 
 
-@pytest.mark.parametrize("tool", ["pi", "specify"])
+@pytest.mark.parametrize("tool", ["pi", "specify", "claude", "opencode"])
 def test_guest_tools_preserve_existing_commands(guest_script, account_home, tool):
     guest = guest_script.module.Runtime(
         data(phase="tools", arguments=dict(tools=[tool], install_timeout=123))
@@ -402,7 +402,7 @@ def test_guest_tools_preserve_existing_commands(guest_script, account_home, tool
     assert "command -v" in guest_script.commands[0][0][-1]
 
 
-@pytest.mark.parametrize("tool", ["pi", "specify"])
+@pytest.mark.parametrize("tool", ["pi", "specify", "claude", "opencode"])
 def test_guest_tools_keep_installer_security_context_and_deadline(
     guest_script, account_home, monkeypatch, tool
 ):
@@ -425,8 +425,18 @@ def test_guest_tools_keep_installer_security_context_and_deadline(
     assert options["env"]["HOME"] == str(home)
     assert options["pass_fds"] == (42,)
     assert options["timeout"] == 138
-    if tool == "pi":
-        assert 'npm install --global --prefix "$HOME/.local" --ignore-scripts' in argv[-1]
+    if tool in ("pi", "claude", "opencode"):
+        policy = "--ignore-scripts" if tool == "pi" else "--ignore-scripts=false"
+        assert f'npm install --global --prefix "$HOME/.local" {policy}' in argv[-1]
+        package = {
+            "pi": "@earendil-works/pi-coding-agent",
+            "claude": "@anthropic-ai/claude-code",
+            "opencode": "opencode-ai",
+        }[tool]
+        assert package in argv[-1]
+        if tool != "pi":
+            assert len(calls) == 3
+            assert f"command -v {tool}" in calls[2][0][-1]
         assert "NPM_CONFIG_USERCONFIG=/dev/stdin" in argv[-1]
         assert "NPM_CONFIG_GLOBALCONFIG=/dev/null" in argv[-1]
         assert "</dev/null" in argv[-1]
@@ -436,6 +446,28 @@ def test_guest_tools_keep_installer_security_context_and_deadline(
             "uv tool install specify-cli --from git+https://github.com/github/spec-kit.git"
             in argv[-1]
         )
+
+
+@pytest.mark.parametrize("tool", ["claude", "opencode"])
+@pytest.mark.parametrize("failure", ["install", "verify"])
+def test_new_runtime_installer_failures(guest_script, account_home, monkeypatch, tool, failure):
+    results = iter(
+        [
+            SimpleNamespace(returncode=127, stdout="", stderr=""),
+            SimpleNamespace(
+                returncode=1 if failure == "install" else 0,
+                stdout="",
+                stderr="npm failed" if failure == "install" else "",
+            ),
+            SimpleNamespace(returncode=127, stdout="", stderr=""),
+        ]
+    )
+    monkeypatch.setattr(guest_script.module.subprocess, "run", lambda *a, **kw: next(results))
+    guest = guest_script.module.Runtime(
+        data(phase="tools", arguments=dict(tools=[tool], install_timeout=123))
+    )
+    with pytest.raises(ValueError, match="npm failed" if failure == "install" else "not on.*PATH"):
+        guest.tools()
 
 
 @pytest.mark.parametrize("reverse", [False, True])
