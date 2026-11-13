@@ -40,7 +40,7 @@ from sbx.image import build_debian
 from sbx.runtime import ConfigError
 
 AGENTS = ("pi", "claude", "codex", "opencode")
-RUNTIME_INSTALLERS = ("pi", "specify", "claude", "opencode")
+RUNTIME_INSTALLERS = ("pi", "specify", "claude", "opencode", "codex")
 MIB = 1024 * 1024
 LAUNCH_COMMANDS = {agent: agent for agent in AGENTS}
 DEFAULT_CONFIG_PATHS = (Path.home() / ".config" / "sbx" / "config.toml",)

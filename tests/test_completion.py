@@ -23,7 +23,7 @@ def test_bash_completion_includes_agent_and_runtime_install_values() -> None:
     assert "--agent" in script
     assert "pi claude codex" in script
     assert "--runtime-install" in script
-    assert "pi specify" in script
+    assert "pi specify claude opencode codex" in script
 
 
 def test_completion_scripts_include_all_command_option_groups() -> None:

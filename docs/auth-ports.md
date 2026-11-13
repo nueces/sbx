@@ -75,6 +75,6 @@ Tunnel state in `~/.local/state/sbx/tunnels.json` supports multiple forwards per
 
 ## Runtime installers
 
-`runtime_install` accepts `pi`, `specify`, `claude`, and `opencode`. Claude and OpenCode install their documented npm packages as the runtime user under `$HOME/.local`, allowing package lifecycle scripts for native binaries and verifying executable discovery afterward. This executes third-party code as that user. Existing executables are skipped; list removal never uninstalls tools. Installation runs only during initial or explicitly requested provisioning.
+`runtime_install` accepts `pi`, `specify`, `claude`, `opencode`, and `codex`. Claude, OpenCode, and Codex install their documented npm packages as the runtime user under `$HOME/.local`, allowing package lifecycle scripts for native binaries and verifying executable discovery afterward. This executes third-party code as that user. Existing executables are skipped; list removal never uninstalls tools. Installation runs only during initial or explicitly requested provisioning.
 
-Use `--agent opencode` or `--agent claude` to select the launch command independently of installation. No Codex installer or additional host credential copying is introduced.
+Use `--agent opencode`, `--agent claude`, or `--agent codex` to select the launch command independently of installation. No additional host credential copying is introduced.

@@ -392,7 +392,7 @@ def test_guest_git_preserves_existing_file(guest_script, account_home):
     assert "replacement" not in (home / ".gitconfig").read_text()
 
 
-@pytest.mark.parametrize("tool", ["pi", "specify", "claude", "opencode"])
+@pytest.mark.parametrize("tool", ["pi", "specify", "claude", "opencode", "codex"])
 def test_guest_tools_preserve_existing_commands(guest_script, account_home, tool):
     guest = guest_script.module.Runtime(
         data(phase="tools", arguments=dict(tools=[tool], install_timeout=123))
@@ -402,7 +402,7 @@ def test_guest_tools_preserve_existing_commands(guest_script, account_home, tool
     assert "command -v" in guest_script.commands[0][0][-1]
 
 
-@pytest.mark.parametrize("tool", ["pi", "specify", "claude", "opencode"])
+@pytest.mark.parametrize("tool", ["pi", "specify", "claude", "opencode", "codex"])
 def test_guest_tools_keep_installer_security_context_and_deadline(
     guest_script, account_home, monkeypatch, tool
 ):
@@ -425,13 +425,14 @@ def test_guest_tools_keep_installer_security_context_and_deadline(
     assert options["env"]["HOME"] == str(home)
     assert options["pass_fds"] == (42,)
     assert options["timeout"] == 138
-    if tool in ("pi", "claude", "opencode"):
+    if tool in ("pi", "claude", "opencode", "codex"):
         policy = "--ignore-scripts" if tool == "pi" else "--ignore-scripts=false"
         assert f'npm install --global --prefix "$HOME/.local" {policy}' in argv[-1]
         package = {
             "pi": "@earendil-works/pi-coding-agent",
             "claude": "@anthropic-ai/claude-code",
             "opencode": "opencode-ai",
+            "codex": "@openai/codex",
         }[tool]
         assert package in argv[-1]
         if tool != "pi":
@@ -448,7 +449,7 @@ def test_guest_tools_keep_installer_security_context_and_deadline(
         )
 
 
-@pytest.mark.parametrize("tool", ["claude", "opencode"])
+@pytest.mark.parametrize("tool", ["claude", "opencode", "codex"])
 @pytest.mark.parametrize("failure", ["install", "verify"])
 def test_new_runtime_installer_failures(guest_script, account_home, monkeypatch, tool, failure):
     results = iter(
