@@ -29,15 +29,61 @@ def test_auto_resolution(agent, provider, ports):
     assert forwards == [(port, port) for port in ports]
 
 
-@pytest.mark.parametrize("value,enabled", [(True, True), (False, False), ("none", False)])
-def test_boolean_compatibility(value, enabled):
-    actual, ports = auth_ports.resolve(SimpleNamespace(), {"sbx": {"auth_port": value}}, "pi")
-    assert actual is enabled
-    assert bool(ports) is enabled
+@pytest.mark.parametrize("value", [True, False])
+def test_boolean_config_is_invalid(value):
+    with pytest.raises(
+        ConfigError, match="auth_port must be one of: auto, openai, anthropic, both, none"
+    ):
+        auth_ports.resolve(SimpleNamespace(), {"sbx": {"auth_port": value}}, "pi")
+
+
+@pytest.mark.parametrize(
+    "profile,enabled,ports",
+    [
+        ("auto", True, [(1455, 1455), (53692, 53692)]),
+        ("openai", True, [(1455, 1455)]),
+        ("anthropic", True, [(53692, 53692)]),
+        ("both", True, [(1455, 1455), (53692, 53692)]),
+        ("none", False, []),
+    ],
+)
+def test_named_config_profiles(profile, enabled, ports):
+    assert auth_ports.resolve(SimpleNamespace(), {"sbx": {"auth_port": profile}}, "pi") == (
+        enabled,
+        ports,
+    )
+
+
+@pytest.mark.parametrize("action", [["run", "vm1"], ["network", "auth-port", "vm1"]])
+@pytest.mark.parametrize("value", ["true", "false"])
+def test_boolean_config_fails_before_vm_or_tunnel_work(
+    monkeypatch,
+    tmp_path,
+    capsys,
+    action,
+    value,
+):
+    config = tmp_path / "config.toml"
+    original = f"[sbx]\nauth_port={value}\n"
+    config.write_text(original)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATHS", ())
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("invalid auth configuration must fail before VM or tunnel work")
+
+    monkeypatch.setattr(cli, "_get_existing_vm_status", unexpected)
+    monkeypatch.setattr(network, "expose_auth_ports", unexpected)
+    assert cli.main(["--config", str(config), *action]) == 2
+    assert (
+        "auth_port must be one of: auto, openai, anthropic, both, none" in capsys.readouterr().err
+    )
+    assert config.read_text() == original
+    assert not (tmp_path / ".sbx.toml").exists()
 
 
 def test_cli_precedence_and_numeric_defaults():
-    config = {"sbx": {"auth_port": False, "auth_provider": "openai", "auth_guest_port": 7000}}
+    config = {"sbx": {"auth_port": "none", "auth_provider": "openai", "auth_guest_port": 7000}}
     args = SimpleNamespace(auth_port="auto", auth_provider="anthropic", host_port=8000)
     assert auth_ports.resolve(args, config, "pi") == (True, [(8000, 7000)])
     assert auth_ports.resolve(
@@ -51,6 +97,8 @@ def test_cli_precedence_and_numeric_defaults():
         {"auth_port": 1},
         {"auth_port": []},
         {"auth_port": "pi"},
+        {"auth_port": "true"},
+        {"auth_port": "false"},
         {"auth_provider": False},
         {"auth_provider": "unknown"},
         {"auth_host_port": True},

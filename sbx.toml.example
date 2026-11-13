@@ -29,7 +29,7 @@ env = []
 git_config = true
 
 # Omitted: forward callbacks only after first successful attached provisioning.
-# Explicit true/"auto": enable on every attached run; false/"none": disable.
+# Explicit "auto": enable on every attached run; "none": disable.
 # Profiles: "auto", "openai" (1455), "anthropic" (53692), "both", "none".
 # auth_port = "auto"
 # Forwarding hint only; does not configure an agent model or enable later forwarding alone.

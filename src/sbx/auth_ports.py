@@ -39,12 +39,10 @@ def resolve(
 
     profile = value("auth_port")
     enabled = None if profile is None else True
-    if isinstance(profile, bool):
-        profile = "auto" if profile else "none"
     if profile is None:
         profile = "auto"
     if not isinstance(profile, str) or profile not in PROFILES:
-        raise ConfigError("auth_port must be a boolean or one of: " + ", ".join(PROFILES))
+        raise ConfigError("auth_port must be one of: " + ", ".join(PROFILES))
     provider = value("auth_provider")
     if provider is not None:
         if not isinstance(provider, str) or provider not in PROVIDERS:

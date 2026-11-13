@@ -1593,7 +1593,6 @@ def _delete_vm(vm_id: str, extra_args: Sequence[str] | None = None, *, quiet: bo
 
 def cmd_create(args: argparse.Namespace) -> int:
     args.attach = False
-    args.auth_port = False
     return cmd_start(args)
 
 
@@ -1618,7 +1617,6 @@ def cmd_recreate(args: argparse.Namespace) -> int:
             return destroy_rc
         args.name = str(name)
         args.attach = False
-        args.auth_port = False
         return cmd_start(args, operation=operation)
 
 

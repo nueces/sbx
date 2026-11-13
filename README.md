@@ -169,6 +169,8 @@ sbx run --agent opencode
 
 ## Authentication and networking
 
+`[sbx].auth_port` accepts only the named strings `"auto"`, `"openai"`, `"anthropic"`, `"both"`, and `"none"`.
+
 Run `/login` inside Pi when authentication is needed. After successful first provisioning, an attached `sbx run` opens OAuth callback forwarding. Later runs require `--auth-port` or an enabled `[sbx].auth_port` setting. Tunnels created by a session close when it exits; manual tunnels remain independent.
 
 ```bash

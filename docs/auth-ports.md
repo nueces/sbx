@@ -41,7 +41,9 @@ auth_port = "auto"           # enable forwarding on every attached run
 auth_provider = "anthropic"  # forwarding hint, not model configuration
 ```
 
-CLI values override config. An omitted auth_port means first-provision-only behavior; existing `auth_port = true` means explicit `auto` on every attached run, and `false` disables forwarding. This intentionally changes the omitted-setting default from every-run forwarding.
+CLI values override config. An omitted auth_port means first-provision-only behavior; `auth_port = "auto"` enables forwarding on every attached run, and `auth_port = "none"` disables forwarding. This intentionally changes the omitted-setting default from every-run forwarding.
+
+Only the named string profiles are accepted, and TOML requires quotes. Other values produce a configuration error. A valid explicit CLI profile takes precedence over the config value for that invocation without changing the file.
 
 For a single profile, numeric overrides can change either side independently:
 

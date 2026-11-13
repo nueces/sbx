@@ -1604,10 +1604,10 @@ def test_read_toml_oserror_and_create_alias(
 
     captured: dict[str, object] = {}
     monkeypatch.setattr(cli, "cmd_start", lambda args: captured.update(vars(args)) or 0)
-    args = type("Args", (), {"attach": True, "auth_port": None})()
+    args = SimpleNamespace(attach=True, auth_port=None)
     assert cli.cmd_create(args) == 0
     assert captured["attach"] is False
-    assert captured["auth_port"] is False
+    assert captured["auth_port"] is None
 
 
 def test_post_start_actions_auth_port_failure_skips_attach(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1917,7 +1917,7 @@ def test_recreate_success_deletes_then_starts(monkeypatch: pytest.MonkeyPatch) -
     assert cli.cmd_recreate(args) == 0
     assert calls == [("delete", "vm1"), ("start", "vm1")]
     assert args.attach is False
-    assert args.auth_port is False
+    assert args.auth_port is None
 
 
 def test_start_existing_vm_if_needed_variants(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2181,7 +2181,7 @@ def test_failed_reprovision_preserves_success_and_prints_guidance(
 def boot_flow(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespace:
     config = tmp_path / ".sbx.toml"
     config.write_text(
-        '[sbx]\nname = "vm1"\nrun_user = "agent"\nauth_port = false\n'
+        '[sbx]\nname = "vm1"\nrun_user = "agent"\nauth_port = "none"\n'
         'stop_on_exit = false\nruntime_install = ["pi"]\n',
         encoding="utf-8",
     )
@@ -2609,7 +2609,7 @@ def test_boot_root_provisioning_is_not_diagnostic(
     metadata["run_user"] = "root"
     vm_metadata.metadata_path("vm1").write_text(json.dumps(metadata), encoding="utf-8")
     boot_flow.config.write_text(
-        '[sbx]\nname = "vm1"\nrun_user = "root"\nauth_port = false\n',
+        '[sbx]\nname = "vm1"\nrun_user = "root"\nauth_port = "none"\n',
         encoding="utf-8",
     )
     boot_flow.fail = "clock" if fail_clock else None
@@ -2626,7 +2626,7 @@ def test_boot_running_session_keeps_environment_tunnel_and_cleanup(
 ) -> None:
     boot_flow.status = "running"
     boot_flow.config.write_text(
-        '[sbx]\nname = "vm1"\nrun_user = "agent"\nauth_port = true\n'
+        '[sbx]\nname = "vm1"\nrun_user = "agent"\nauth_port = "auto"\n'
         'stop_on_exit = true\nenv = ["OLLAMA_HOST"]\n',
         encoding="utf-8",
     )
@@ -2650,7 +2650,7 @@ def test_missing_agent_launch_preserves_setup_and_cleans_session(
     boot_flow, monkeypatch, keep_running, capsys
 ):
     boot_flow.config.write_text(
-        '[sbx]\nname = "vm1"\nrun_user = "agent"\nauth_port = false\nstop_on_exit = true\n'
+        '[sbx]\nname = "vm1"\nrun_user = "agent"\nauth_port = "none"\nstop_on_exit = true\n'
     )
     metadata = vm_metadata.load_vm("vm1")
     metadata["provisioned"] = False
