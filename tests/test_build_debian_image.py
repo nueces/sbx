@@ -8,6 +8,10 @@ import pytest
 
 from sbx.image import build_debian, kernel_inputs
 
+LANDLOCK_CONFIG = (
+    'CONFIG_SECURITY=y\nCONFIG_SECURITY_LANDLOCK=y\nCONFIG_LSM="landlock,lockdown,yama"\n'
+)
+
 
 class FakeImageBuilder:
     def __init__(self, cache_dir: Path | None = None) -> None:
@@ -453,11 +457,13 @@ def test_build_docker_kernel_uses_only_verified_inputs(
             work_dir = Path(volume.split(":", 1)[0])
             assert (work_dir / "build.sh").is_file()
             assert (work_dir / "check-config.sh").is_file()
-            assert "CONFIG_VETH=y" in (work_dir / "config.fragment").read_text()
+            fragment = (work_dir / "config.fragment").read_text()
+            assert "CONFIG_VETH=y" in fragment
+            assert "CONFIG_SECURITY_LANDLOCK=y" in fragment
             out = work_dir / "out"
             out.mkdir()
             (out / "vmlinux-amd64.image").write_text("kernel", encoding="utf-8")
-            (out / "vmlinux-amd64.config").write_text("config", encoding="utf-8")
+            (out / "vmlinux-amd64.config").write_text(LANDLOCK_CONFIG, encoding="utf-8")
 
     monkeypatch.setattr(build_debian.subprocess, "run", fake_run)
     monkeypatch.setattr(
@@ -480,15 +486,56 @@ def test_nested_kvm_final_config_validation(tmp_path: Path) -> None:
         "CONFIG_VIRTUALIZATION=y\nCONFIG_KVM=y\nCONFIG_KVM_INTEL=y\n",
         encoding="utf-8",
     )
+    values = build_debian._kernel_config_values(config)
 
-    with pytest.raises(RuntimeError, match="CONFIG_KVM_AMD=y.*got unset"):
-        build_debian._verify_nested_kvm_config(config)
+    with pytest.raises(RuntimeError, match="nested KVM.*CONFIG_KVM_AMD=y.*got unset"):
+        build_debian._verify_kernel_config(values, build_debian.NESTED_KVM_CONFIG, "nested KVM")
 
-    config.write_text(
-        "\n".join(f"{name}=y" for name in build_debian.NESTED_KVM_CONFIG),
-        encoding="utf-8",
+    values = {name: "y" for name in build_debian.NESTED_KVM_CONFIG}
+    build_debian._verify_kernel_config(values, build_debian.NESTED_KVM_CONFIG, "nested KVM")
+
+
+@pytest.mark.parametrize(
+    ("config", "match"),
+    [
+        (
+            'CONFIG_SECURITY=y\nCONFIG_LSM="landlock,yama"\n',
+            "CONFIG_SECURITY_LANDLOCK=y \\(got unset\\)",
+        ),
+        (
+            'CONFIG_SECURITY=y\nCONFIG_SECURITY_LANDLOCK=y\nCONFIG_LSM="lockdown,yama"\n',
+            "CONFIG_LSM must include landlock",
+        ),
+        ("CONFIG_SECURITY=y\nCONFIG_SECURITY_LANDLOCK=y\n", "CONFIG_LSM.*'unset'"),
+    ],
+)
+def test_landlock_final_config_failure_preserves_existing_kernel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, config: str, match: str
+) -> None:
+    monkeypatch.setattr(
+        kernel_inputs,
+        "download_verified",
+        lambda source, destination: destination.write_text("# verified input\n", encoding="utf-8"),
     )
-    build_debian._verify_nested_kvm_config(config)
+    kernel = tmp_path / "vmlinux.bin"
+    kernel.write_text("old kernel", encoding="utf-8")
+
+    def fake_run(command: list[str], *, check: bool) -> None:
+        if command[:3] == ["docker", "run", "--rm"] and "bash" in command:
+            out = Path(command[command.index("-v") + 1].split(":", 1)[0]) / "out"
+            out.mkdir()
+            (out / "vmlinux-amd64.image").write_text("new kernel", encoding="utf-8")
+            (out / "vmlinux-amd64.config").write_text(config, encoding="utf-8")
+
+    monkeypatch.setattr(build_debian.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        build_debian, "_docker_bind_mount_owner", lambda: f"{os.getuid()}:{os.getgid()}"
+    )
+
+    with pytest.raises(RuntimeError, match=f"Landlock kernel config validation failed.*{match}"):
+        build_debian._build_docker_kernel(image_dir=tmp_path, arch="amd64")
+
+    assert kernel.read_text(encoding="utf-8") == "old kernel"
 
 
 def test_nested_kvm_kernel_fragment_failure_preserves_existing_kernel(
@@ -508,11 +555,12 @@ def test_nested_kvm_kernel_fragment_failure_preserves_existing_kernel(
             fragment = (work_dir / "config.fragment").read_text(encoding="utf-8")
             assert "CONFIG_KVM_INTEL=y" in fragment
             assert "CONFIG_KVM_AMD=y" in fragment
+            assert "CONFIG_SECURITY_LANDLOCK=y" in fragment
             out = work_dir / "out"
             out.mkdir()
             (out / "vmlinux-amd64.image").write_text("new kernel", encoding="utf-8")
             (out / "vmlinux-amd64.config").write_text(
-                "CONFIG_VIRTUALIZATION=y\nCONFIG_KVM=y\nCONFIG_KVM_INTEL=y\n",
+                LANDLOCK_CONFIG + "CONFIG_VIRTUALIZATION=y\nCONFIG_KVM=y\nCONFIG_KVM_INTEL=y\n",
                 encoding="utf-8",
             )
         assert check in {True, False}

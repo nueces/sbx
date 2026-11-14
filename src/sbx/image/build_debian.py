@@ -32,6 +32,7 @@ DEFAULT_NESTED_KVM_CONTAINERFILE = (
 )
 DEFAULT_DOCKER_KERNEL_FRAGMENT = Path("kernel") / "docker.config.fragment"
 DEFAULT_NESTED_KVM_KERNEL_FRAGMENT = Path("kernel") / "nested-kvm.amd64.config.fragment"
+DEFAULT_LANDLOCK_KERNEL_FRAGMENT = Path("kernel") / "landlock.config.fragment"
 DEFAULT_KERNEL_BUILDER_DOCKERFILE = Path("Containers") / "Build" / "Kernel.Containerfile"
 NESTED_KVM_CONFIG = (
     "CONFIG_VIRTUALIZATION",
@@ -39,6 +40,7 @@ NESTED_KVM_CONFIG = (
     "CONFIG_KVM_INTEL",
     "CONFIG_KVM_AMD",
 )
+LANDLOCK_CONFIG = ("CONFIG_SECURITY", "CONFIG_SECURITY_LANDLOCK")
 KERNEL_NAME = "vmlinux.bin"
 BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init"
 
@@ -234,19 +236,33 @@ def _raise_if_linux_digest_mismatch(work_dir: Path) -> None:
         )
 
 
-def _verify_nested_kvm_config(config: Path) -> None:
+def _kernel_config_values(config: Path) -> dict[str, str]:
     values = {}
     for line in config.read_text(encoding="utf-8").splitlines():
         if line.startswith("CONFIG_") and "=" in line:
             name, value = line.split("=", 1)
             values[name] = value
+    return values
+
+
+def _verify_kernel_config(values: dict[str, str], required: tuple[str, ...], label: str) -> None:
     invalid = [
         f"{name}=y (got {values.get(name, 'unset')})"
-        for name in NESTED_KVM_CONFIG
+        for name in required
         if values.get(name) != "y"
     ]
     if invalid:
-        raise RuntimeError("nested KVM kernel config validation failed: " + ", ".join(invalid))
+        raise RuntimeError(f"{label} kernel config validation failed: " + ", ".join(invalid))
+
+
+def _verify_landlock_config(values: dict[str, str]) -> None:
+    _verify_kernel_config(values, LANDLOCK_CONFIG, "Landlock")
+    lsm = values.get("CONFIG_LSM", "").strip('"')
+    if "landlock" not in lsm.split(","):
+        raise RuntimeError(
+            "Landlock kernel config validation failed: CONFIG_LSM must include landlock "
+            f"(got {values.get('CONFIG_LSM', 'unset')!r})"
+        )
 
 
 def _build_docker_kernel(
@@ -266,8 +282,9 @@ def _build_docker_kernel(
             )
 
     docker_fragment = resources_dir / DEFAULT_DOCKER_KERNEL_FRAGMENT
+    landlock_fragment = resources_dir / DEFAULT_LANDLOCK_KERNEL_FRAGMENT
     builder_dockerfile = resources_dir / DEFAULT_KERNEL_BUILDER_DOCKERFILE
-    required_resources = [docker_fragment, builder_dockerfile]
+    required_resources = [docker_fragment, landlock_fragment, builder_dockerfile]
     nested_kvm_fragment = resources_dir / DEFAULT_NESTED_KVM_KERNEL_FRAGMENT
     if nested_kvm:
         required_resources.append(nested_kvm_fragment)
@@ -284,6 +301,8 @@ def _build_docker_kernel(
             config.read_text(encoding="utf-8").rstrip()
             + "\n\n# ---- sbx Docker additions ----\n"
             + docker_fragment.read_text(encoding="utf-8").lstrip().rstrip()
+            + "\n\n# ---- sbx Landlock additions ----\n"
+            + landlock_fragment.read_text(encoding="utf-8").lstrip().rstrip()
         )
         if nested_kvm:
             additions += (
@@ -317,8 +336,10 @@ def _build_docker_kernel(
                 ],
                 check=True,
             )
+            values = _kernel_config_values(out_dir / f"vmlinux-{arch}.config")
+            _verify_landlock_config(values)
             if nested_kvm:
-                _verify_nested_kvm_config(out_dir / f"vmlinux-{arch}.config")
+                _verify_kernel_config(values, NESTED_KVM_CONFIG, "nested KVM")
         finally:
             _docker_run_kernel_builder(
                 builder_tag,

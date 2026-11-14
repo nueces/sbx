@@ -30,7 +30,7 @@ The build command:
 1. builds the combined userspace as a Docker image;
 2. adds SSH and a SmolVM-compatible init without the SmolVM guest agent;
 3. exports that userspace into `rootfs.ext4`;
-4. downloads the kernel recipe and checker from immutable commits, verifies each SHA-256, and builds a Docker-capable QEMU kernel from SHA-256-verified Linux source;
+4. downloads the kernel recipe and checker from immutable commits, verifies each SHA-256, and builds a Docker- and Landlock-capable QEMU kernel from SHA-256-verified Linux source, failing if the resolved config lacks Landlock;
 5. writes `smolvm-image.json` next to the generated kernel and rootfs.
 
 The resulting rootfs contains Node.js, npm, uv, and Docker, but no Pi or Specify package. Local-image runtime tools are installed only when explicitly requested during VM provisioning. Nested builds additionally contain inner-QEMU tools and `/usr/local/bin/sbx-prepare-kvm`, and advertise `features: ["docker", "nested-kvm"]`.
