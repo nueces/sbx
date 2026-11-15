@@ -17,6 +17,7 @@ from smolvm.exceptions import OperationTimeoutError
 
 import sbx.image.ls
 import sbx.network as network
+import sbx.smolvm_compat  # patches smolvm limits on import; keep before VM config use
 from sbx import (
     __version__,
     auth_ports,
@@ -299,6 +300,25 @@ def _warn_running_mount_drift(
         )
 
 
+def _warn_running_resource_drift(vm_name: str, *, memory: int | None, cpus: int | None) -> None:
+    current = vm_state.existing_vm_start_config(vm_name)
+    if current is None or current[0] != "running":
+        return
+    config = current[1]
+    if (memory is None or config.get("memory") == memory) and (
+        cpus is None or config.get("vcpu_count") == cpus
+    ):
+        return
+    print(
+        f"sbx: VM '{vm_name}' is running with memory/cpus that differ from current config.",
+        file=sys.stderr,
+    )
+    print(
+        f"sbx: Run `sbx stop {vm_name}` then `sbx run {vm_name}` to apply them.",
+        file=sys.stderr,
+    )
+
+
 def _sync_existing_vm_start_config(
     vm_name: str,
     mounts: Sequence[str] | None,
@@ -307,6 +327,8 @@ def _sync_existing_vm_start_config(
     port_forwards: Sequence[str],
     project: Mapping[str, str] | None = None,
     json_output: bool = False,
+    memory: int | None = None,
+    cpus: int | None = None,
 ) -> None:
     if project is not None:
         vm_metadata.validate_vm_project(vm_name, project)
@@ -329,6 +351,12 @@ def _sync_existing_vm_start_config(
         if config.get("port_forwards", []) != desired_forwards:
             config["port_forwards"] = desired_forwards
             updated.append("port forwards")
+        if memory is not None and config.get("memory") != memory:
+            config["memory"] = memory
+            updated.append("memory")
+        if cpus is not None and config.get("vcpu_count") != cpus:
+            config["vcpu_count"] = cpus
+            updated.append("cpus")
         if not updated:
             return
         conn.execute(
@@ -380,10 +408,23 @@ def _sync_forwarded_env_or_error(
 
 
 def _validate_cpus(value: Any) -> int:
-    cpus = int(value)
+    try:
+        cpus = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("[sbx].cpus must be an integer") from exc
     if not 1 <= cpus <= 32:
         raise ConfigError("[sbx].cpus must be between 1 and 32")
     return cpus
+
+
+def _validate_memory(value: Any) -> int:
+    try:
+        memory = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("[sbx].memory must be an integer") from exc
+    if not 128 <= memory <= sbx.smolvm_compat.MAX_MEMORY_MIB:
+        raise ConfigError("[sbx].memory must be between 128 and 32768")
+    return memory
 
 
 def _validate_boot_timeout(value: Any) -> float:
@@ -1004,7 +1045,7 @@ def _start_local_image(
 
     private_key, public_key = smolvm.utils.ensure_ssh_key()
     requested_name = _arg_or_config(args, "name", config, "sbx")
-    memory = int(_arg_or_config(args, "memory", config, "sbx", default=512))
+    memory = _validate_memory(_arg_or_config(args, "memory", config, "sbx", default=512))
     cpus_value = _arg_or_config(args, "cpus", config, "sbx")
     disk_size = _arg_or_config(args, "disk_size", config, "sbx")
     boot_timeout = _validate_boot_timeout(
@@ -1138,10 +1179,10 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
     disk_size_value = _arg_or_config(args, "disk_size", config, "sbx")
     install_timeout_value = _arg_or_config(args, "install_timeout", config, "sbx", default=600)
     try:
-        memory_mib = int(memory_value) if memory_value is not None else None
         disk_size_mib = int(disk_size_value) if disk_size_value is not None else None
     except (TypeError, ValueError) as exc:
-        raise ConfigError("memory and disk_size must be integers") from exc
+        raise ConfigError("disk_size must be an integer") from exc
+    memory_mib = _validate_memory(memory_value) if memory_value is not None else None
     install_timeout = _install_timeout(install_timeout_value)
     runtime_install = _runtime_install(args, config)
     reprovision = (
@@ -1238,6 +1279,8 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
                         port_forwards=port_forwards,
                         project=project_identity,
                         json_output=bool(args.json),
+                        memory=memory_mib,
+                        cpus=cpus,
                     )
                 except ConfigError as exc:
                     print(f"sbx: {exc}", file=sys.stderr)
@@ -1246,6 +1289,7 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
                 _warn_running_mount_drift(
                     str(requested_name), effective_mounts, writable_mounts=writable_mounts
                 )
+                _warn_running_resource_drift(str(requested_name), memory=memory_mib, cpus=cpus)
             start_rc = _start_existing_vm_if_needed(
                 str(requested_name),
                 existing_status,
@@ -1474,6 +1518,10 @@ def _cmd_shell(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
             _sbx_config(config).get("port_forwards"), key="[sbx].port_forwards"
         )
         network.port_forwards_from_specs(port_forwards)
+        memory_value = _cfg(config, "sbx", "memory")
+        memory = _validate_memory(memory_value) if memory_value is not None else None
+        cpus_value = _cfg(config, "sbx", "cpus")
+        cpus = _validate_cpus(cpus_value) if cpus_value is not None else None
     except ConfigError as exc:
         print(f"sbx: {exc}", file=sys.stderr)
         return 2
@@ -1499,6 +1547,8 @@ def _cmd_shell(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
                 port_forwards=port_forwards,
                 project=project_identity,
                 json_output=False,
+                memory=memory,
+                cpus=cpus,
             )
         except ConfigError as exc:
             print(f"sbx: {exc}", file=sys.stderr)
@@ -1516,6 +1566,7 @@ def _cmd_shell(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
             _warn_running_mount_drift(
                 name, effective_mounts, writable_mounts=project_path is not None
             )
+        _warn_running_resource_drift(name, memory=memory, cpus=cpus)
     start_rc = _start_existing_vm_if_needed(name, existing_status, DEFAULT_BOOT_TIMEOUT)
     if start_rc != 0:
         return start_rc

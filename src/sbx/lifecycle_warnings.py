@@ -174,8 +174,10 @@ def doctor_config_state(
         for warning in image_warnings:
             for line in warning.splitlines():
                 print(f"    {line}")
-    if mismatches:
+    if any(not m.startswith("disk_size:") for m in mismatches):
+        print(f"  Run `sbx stop {vm_name}` then `sbx run {vm_name}` to apply memory/cpus changes.")
+    if any(m.startswith("disk_size:") for m in mismatches):
         print(
-            "  Existing VMs are reused as-is. "
-            f"Run `sbx recreate {vm_name} --force` to apply config changes."
+            "  Existing VM disks are reused as-is. "
+            f"Run `sbx recreate {vm_name} --force` to apply disk_size changes."
         )
