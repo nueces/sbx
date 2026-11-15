@@ -325,6 +325,90 @@ def test_sync_existing_vm_start_config_updates_port_forwards(
     assert capsys.readouterr().out == "sbx: updated port forwards for existing VM 'vm1'\n"
 
 
+def test_sync_existing_vm_start_config_updates_memory_and_cpus(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_vm_row(
+        cli.SMOLVM_DB_PATH,
+        "vm1",
+        status="stopped",
+        config={"memory": 4096, "vcpu_count": 2, "port_forwards": []},
+    )
+
+    cli._sync_existing_vm_start_config(
+        "vm1", None, writable_mounts=False, port_forwards=[], memory=32768, cpus=12
+    )
+
+    config = _read_vm_config(cli.SMOLVM_DB_PATH, "vm1")
+    assert (config["memory"], config["vcpu_count"]) == (32768, 12)
+    assert capsys.readouterr().out == "sbx: updated memory, cpus for existing VM 'vm1'\n"
+
+
+@pytest.mark.parametrize(("memory", "cpus"), [(4096, 2), (None, None)])
+def test_sync_existing_vm_start_config_keeps_matching_or_unset_resources(
+    memory: int | None, cpus: int | None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = {"memory": 4096, "vcpu_count": 2, "port_forwards": []}
+    _write_vm_row(cli.SMOLVM_DB_PATH, "vm1", status="stopped", config=config)
+
+    cli._sync_existing_vm_start_config(
+        "vm1", None, writable_mounts=False, port_forwards=[], memory=memory, cpus=cpus
+    )
+
+    assert _read_vm_config(cli.SMOLVM_DB_PATH, "vm1") == config
+    assert capsys.readouterr().out == ""
+
+
+def test_running_vm_resource_drift_warns_without_updating(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = {"memory": 4096, "vcpu_count": 2}
+    _write_vm_row(cli.SMOLVM_DB_PATH, "vm1", status="running", config=config)
+
+    cli._sync_existing_vm_start_config(
+        "vm1", None, writable_mounts=False, port_forwards=[], memory=8192, cpus=4
+    )
+    cli._warn_running_resource_drift("vm1", memory=8192, cpus=None)
+
+    assert _read_vm_config(cli.SMOLVM_DB_PATH, "vm1") == config
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "running with memory/cpus that differ" in captured.err
+    assert "sbx stop vm1` then `sbx run vm1`" in captured.err
+
+    cli._warn_running_resource_drift("vm1", memory=4096, cpus=2)
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("value", [128, 32768, "8192"])
+def test_validate_memory_accepts_supported_range(value: object) -> None:
+    assert cli._validate_memory(value) == int(value)
+
+
+@pytest.mark.parametrize("value", [127, 32769, "abc", None])
+def test_validate_memory_rejects_invalid_values(value: object) -> None:
+    with pytest.raises(cli.ConfigError, match=r"\[sbx\]\.memory"):
+        cli._validate_memory(value)
+
+
+def test_doctor_hints_restart_for_resources_and_recreate_for_disk(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    vm = {"memory": 4096, "vcpus": 2, "disk_size": 8192}
+    config = {"sbx": {"name": "vm1", "memory": 8192, "cpus": 4}}
+
+    lifecycle_warnings.doctor_config_state(config, smolvm_info=lambda name: vm)
+    out = capsys.readouterr().out
+    assert "sbx stop vm1` then `sbx run vm1` to apply memory/cpus" in out
+    assert "recreate" not in out
+
+    config = {"sbx": {"name": "vm1", "disk_size": 16384}}
+    lifecycle_warnings.doctor_config_state(config, smolvm_info=lambda name: vm)
+    out = capsys.readouterr().out
+    assert "sbx recreate vm1 --force" in out
+    assert "memory/cpus" not in out
+
+
 def test_cmd_start_does_not_sync_running_vm_mounts(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
