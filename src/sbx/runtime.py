@@ -126,11 +126,18 @@ def run_capture(
         return None
 
 
+# The smolvm CLI runs in a child interpreter, so it must load sbx's smolvm patches
+# itself; otherwise it rejects VM configs that sbx accepts (e.g. memory > 16384 MiB).
+SMOLVM_CLI_BOOTSTRAP = (
+    "import sbx.smolvm_compat; from smolvm.cli.main import main; raise SystemExit(main())"
+)
+
+
 def smolvm_argv(args: Sequence[str]) -> list[str]:
     return [
         sys.executable,
         "-c",
-        "from smolvm.cli.main import main; raise SystemExit(main())",
+        SMOLVM_CLI_BOOTSTRAP,
         *args,
     ]
 

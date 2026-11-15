@@ -3,6 +3,7 @@ import json
 import os
 import signal
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import tomllib
@@ -434,16 +435,48 @@ def _validate_boot_timeout(value: Any) -> float:
     return timeout
 
 
+def _smolvm_error_message(completed: subprocess.CompletedProcess[str]) -> str:
+    try:
+        error = json.loads(completed.stdout)["error"]
+        message = error.get("message") if isinstance(error, Mapping) else None
+    except (KeyError, TypeError, json.JSONDecodeError):
+        message = None
+    if isinstance(message, str) and message.strip():
+        return message.strip()
+    detail = (completed.stderr or completed.stdout or "").strip()
+    return detail or f"smolvm exited with status {completed.returncode}"
+
+
 def _smolvm_info_vm(vm_id: str) -> Mapping[str, Any] | None:
+    """Return smolvm's VM record, or None only when the VM does not exist.
+
+    Any other failure raises ConfigError so callers never mistake an unreadable VM
+    for a missing one (and then try to create a duplicate).
+    """
     completed = runtime.run_smolvm_capture(["sandbox", "info", vm_id, "--json"])
-    if completed is None or completed.returncode != 0:
-        return None
+    if completed is None:
+        raise ConfigError(f"cannot inspect VM {vm_id!r}: smolvm could not be run")
+    if completed.returncode != 0:
+        message = _smolvm_error_message(completed)
+        if message == f"VM {vm_id!r} not found":
+            return None
+        raise ConfigError(f"cannot inspect VM {vm_id!r}: {message}")
     try:
         payload = json.loads(completed.stdout)
         vm = payload["data"]["vm"]
-    except (KeyError, TypeError, json.JSONDecodeError):
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"cannot inspect VM {vm_id!r}: unexpected smolvm output") from exc
+    if not isinstance(vm, Mapping):
+        raise ConfigError(f"cannot inspect VM {vm_id!r}: unexpected smolvm output")
+    return vm
+
+
+def _smolvm_info_vm_or_warn(vm_id: str) -> Mapping[str, Any] | None:
+    try:
+        return _smolvm_info_vm(vm_id)
+    except ConfigError as exc:
+        print(f"sbx: warning: {exc}", file=sys.stderr)
         return None
-    return vm if isinstance(vm, Mapping) else None
 
 
 def _get_existing_vm_status(vm_id: str) -> str | None:
@@ -526,7 +559,11 @@ def _print_boot_timeout_running_hint(vm_id: str, boot_timeout: float) -> None:
 def _maybe_print_boot_timeout_running_hint(vm_id: str | None, boot_timeout: float) -> bool:
     if not vm_id:
         return False
-    if _get_existing_vm_status(vm_id) != "running":
+    try:
+        status = _get_existing_vm_status(vm_id)
+    except ConfigError:
+        return False
+    if status != "running":
         return False
     _print_boot_timeout_running_hint(vm_id, boot_timeout)
     return True
@@ -1130,7 +1167,7 @@ def _start_local_image(
 def cmd_doctor(args: argparse.Namespace) -> int:
     rc = runtime.run_smolvm(["doctor", "--backend", DEFAULT_BACKEND])
     lifecycle_warnings.doctor_config_state(
-        getattr(args, "config_data", {}), smolvm_info=_smolvm_info_vm
+        getattr(args, "config_data", {}), smolvm_info=_smolvm_info_vm_or_warn
     )
     return rc or doctor.run_doctor_checks(fix=bool(getattr(args, "fix", False)))
 

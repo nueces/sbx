@@ -59,7 +59,16 @@ def install_fake_smolvm(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     smolvm = bin_dir / "smolvm"
-    smolvm.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\"\n", encoding="utf-8")
+    smolvm.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = sandbox ] && [ "$2" = info ]; then\n'
+        "  printf '%s\\n' "
+        '"{\\"ok\\":false,\\"error\\":{\\"message\\":\\"VM \'$3\' not found\\"}}"\n'
+        "  exit 1\n"
+        "fi\n"
+        "printf '%s\\n' \"$*\"\n",
+        encoding="utf-8",
+    )
     smolvm.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setattr(cli.runtime, "smolvm_argv", lambda args: ["smolvm", *args])
@@ -102,9 +111,64 @@ def test_smolvm_runner_does_not_need_console_script_on_path() -> None:
     assert runtime.smolvm_argv(["doctor"]) == [
         sys.executable,
         "-c",
-        "from smolvm.cli.main import main; raise SystemExit(main())",
+        "import sbx.smolvm_compat; from smolvm.cli.main import main; raise SystemExit(main())",
         "doctor",
     ]
+
+
+def _info_result(returncode: int, payload: object) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess([], returncode, stdout=json.dumps(payload), stderr="")
+
+
+def test_smolvm_info_returns_none_only_for_missing_vm(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = {"ok": False, "error": {"code": "runtime_error", "message": "VM 'demo' not found"}}
+    monkeypatch.setattr(
+        cli.runtime, "run_smolvm_capture", lambda args, **kwargs: _info_result(1, payload)
+    )
+
+    assert cli._smolvm_info_vm("demo") is None
+    assert cli._get_existing_vm_status("demo") is None
+
+
+def test_smolvm_info_raises_when_existing_vm_is_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {
+        "ok": False,
+        "error": {"code": "invalid_input", "message": "1 validation error for VMConfig"},
+    }
+    monkeypatch.setattr(
+        cli.runtime, "run_smolvm_capture", lambda args, **kwargs: _info_result(1, payload)
+    )
+
+    with pytest.raises(runtime.ConfigError, match="cannot inspect VM 'demo'.*VMConfig"):
+        cli._get_existing_vm_status("demo")
+
+
+def test_smolvm_info_raises_when_smolvm_cannot_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.runtime, "run_smolvm_capture", lambda args, **kwargs: None)
+
+    with pytest.raises(runtime.ConfigError, match="could not be run"):
+        cli._smolvm_info_vm("demo")
+
+
+def test_run_reports_unreadable_vm_instead_of_creating_duplicate(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    payload = {"ok": False, "error": {"code": "invalid_input", "message": "bad memory"}}
+    monkeypatch.setattr(
+        cli.runtime, "run_smolvm_capture", lambda args, **kwargs: _info_result(1, payload)
+    )
+    monkeypatch.setattr(
+        cli,
+        "_start_local_image",
+        lambda *args, **kwargs: pytest.fail("must not create a VM when lookup failed"),
+    )
+
+    rc = cli.main(["run", "demo", "--no-attach"])
+
+    assert rc == 2
+    assert "cannot inspect VM 'demo': bad memory" in capsys.readouterr().err
 
 
 def test_smolvm_runner_suppresses_upstream_version_notice(monkeypatch: pytest.MonkeyPatch) -> None:
