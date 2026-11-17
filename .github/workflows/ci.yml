@@ -56,6 +56,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes qemu-system-x86
+          sudo install -d -m 0755 "$RUNNER_TEMP/sbx-resource-observer"
+          sudo install -m 0444 gateway/scripts/resource_usage.py "$RUNNER_TEMP/sbx-resource-observer/observer.py"
 
       - name: Build integration-test guest
         run: gateway/scripts/build_test_guest.sh
@@ -64,7 +66,16 @@ jobs:
         timeout-minutes: 10
         env:
           SBX_GATEWAY_BIN: ${{ github.workspace }}/src/sbx/gateway_runtime/bin/sbx-gateway-linux-amd64
+          SBX_GATEWAY_RESOURCE_OBSERVER: ${{ runner.temp }}/sbx-resource-observer/observer.py
         run: uv run --python 3.12 --extra dev pytest --no-cov -s tests/integration
+
+      - name: Remove validation observer
+        if: always()
+        run: |
+          sudo rm -f "$RUNNER_TEMP/sbx-resource-observer/observer.py"
+          if [ -d "$RUNNER_TEMP/sbx-resource-observer" ]; then
+            sudo rmdir "$RUNNER_TEMP/sbx-resource-observer"
+          fi
 
       - name: Run ruff
         run: uv run --python 3.12 --extra dev ruff check .

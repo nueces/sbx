@@ -11,6 +11,7 @@ import platform
 import selectors
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -32,37 +33,15 @@ from test_gateway_tcg import (
     tool,
 )
 
+sys.path.insert(0, str(ROOT / "gateway" / "scripts"))
+from resource_usage import process_usage  # noqa: E402
+
 VM_COUNT = int(os.environ.get("SBX_GATEWAY_VM_COUNT", "2"))
 TIMEOUT = 300
 PAIR_RSS_LIMIT = 512 * 1024 * 1024
 PAIR_FD_LIMIT = 128
 PAIR_PROCESS_LIMIT = 16
 PAIR_THREAD_LIMIT = 256
-
-
-def process_usage(pids: list[int]) -> tuple[int, int, int, int]:
-    pending = list(pids)
-    seen: set[int] = set()
-    rss = descriptors = threads = 0
-    while pending:
-        pid = pending.pop()
-        if pid in seen:
-            continue
-        seen.add(pid)
-        process = Path("/proc") / str(pid)
-        status = process.joinpath("status").read_text().splitlines()
-        for line in status:
-            if line.startswith("VmRSS:"):
-                rss += int(line.split()[1]) * 1024
-            elif line.startswith("Threads:"):
-                threads += int(line.split()[1])
-        with suppress(OSError):
-            descriptors += sum(1 for _ in process.joinpath("fd").iterdir())
-        for task in process.joinpath("task").iterdir():
-            with suppress(OSError):
-                children = task.joinpath("children").read_text().split()
-                pending.extend(int(value) for value in children)
-    return rss, descriptors, len(seen), threads
 
 
 def open_file_limit(pid: int) -> int:

@@ -31,8 +31,17 @@ UV_PROJECT_ENVIRONMENT=local/test-venv uv run --python 3.12 --extra dev pytest -
 # Linux integration suite after building the worker and test guest.
 GO=go gateway/scripts/build_release_artifacts.sh
 gateway/scripts/build_test_guest.sh
+# Only the separate count-only observer is privileged; gateway processes are not.
+OBSERVER_DIR=$(mktemp -d /tmp/sbx-observer.XXXXXX)
+sudo chown root:root "$OBSERVER_DIR"
+sudo chmod 0755 "$OBSERVER_DIR"
+sudo install -m 0444 gateway/scripts/resource_usage.py "$OBSERVER_DIR/observer.py"
+export SBX_GATEWAY_RESOURCE_OBSERVER="$OBSERVER_DIR/observer.py"
 UV_PROJECT_ENVIRONMENT=local/test-venv uv run --python 3.12 --extra dev \
   pytest --no-cov -s tests/integration
+sudo rm "$OBSERVER_DIR/observer.py"
+sudo rmdir "$OBSERVER_DIR"
+unset SBX_GATEWAY_RESOURCE_OBSERVER
 
 # Mediator tests.
 UV_PROJECT_ENVIRONMENT=local/test-venv uv run --python 3.12 --extra dev \
@@ -45,6 +54,13 @@ UV_PROJECT_ENVIRONMENT=local/test-venv uv run --python 3.12 --extra dev ruff for
 
 Run the fast suite once before making changes in a fresh environment. After changing
 behavior, run the focused test, fast suite, and any affected integration suite.
+
+FD acceptance needs an observer with access to nondumpable processes (normally
+`CAP_SYS_PTRACE` in the target user namespace). The staged helper verifies process
+identity, ownership and process-tree membership, reads counts rather than descriptor
+contents, and runs through `sudo -n`. Missing permissions or incomplete samples fail
+measurement instead of being reported as zero. Fast tests need no privileged observer.
+Do not disable gateway nondumpability or grant privileges to the gateway to collect metrics.
 
 ## Gateway release checks
 
