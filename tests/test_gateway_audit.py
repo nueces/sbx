@@ -132,6 +132,43 @@ def test_admission_failure_never_acknowledges(audit_controller, monkeypatch, fai
             os.close(ack_read)
 
 
+@pytest.mark.parametrize("operation", ["append", "sync"])
+def test_audit_io_failure_reports_stage_and_errno_without_exception_payload(
+    audit_controller, monkeypatch, capsys, operation
+):
+    event = {
+        "version": 2,
+        "event": "admitted",
+        "request_id": "request-1",
+        "generation": audit_controller.generation,
+        "incarnation": audit_controller.worker_incarnation,
+    }
+
+    def fail(*args, **kwargs):
+        raise OSError(5, "private-exception-payload")
+
+    monkeypatch.setattr(
+        audit_controller, "_emit_log" if operation == "append" else "_sync_audit", fail
+    )
+    read_fd, write_fd = os.pipe()
+    ack_read, ack_write = os.pipe()
+    audit_controller._route_audit(
+        os.fdopen(read_fd, "rb", buffering=0), audit_controller._audit_stream, ack_write
+    )
+    try:
+        os.write(write_fd, (json.dumps(event) + "\n").encode())
+        os.close(write_fd)
+        for thread in audit_controller._log_threads:
+            thread.join(timeout=3)
+            assert not thread.is_alive()
+        assert os.read(ack_read, 4096) == b""
+        message = capsys.readouterr().err
+        assert f"operation={operation}" in message and "errno=5" in message
+        assert "private-exception-payload" not in message
+    finally:
+        os.close(ack_read)
+
+
 def test_ack_pipe_creation_failure_closes_unused_audit_reader(audit_controller, monkeypatch):
     pipe = os.pipe
     created = []

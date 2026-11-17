@@ -16,7 +16,11 @@ otherwise fail with SIGILL. Automatic x86 machine selection uses q35 so stopped
 VMs do not intermittently lose timer calibration on restart; saved configurations
 are not rewritten. Explicit machine selection is preserved; ARM, KVM and
 non-gateway argv are otherwise unchanged. Record the CPU profile when comparing
-performance.
+performance. Record the installed runtime's filesystem too: the validation
+workspace's shared filesystem adds seconds of Python import latency. The strict
+readiness gate is measured with a clean wheel installation on native local storage,
+not by hiding import time or using a warm process. Workspace-install failures remain
+separate evidence; this is not a universal filesystem-independent startup guarantee.
 
 Claude/OpenCode provisioning also requires a successful, bounded 15-second
 `--version` check as the configured guest user, including for an existing command.

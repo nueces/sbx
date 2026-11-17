@@ -241,6 +241,30 @@ def test_bad_acknowledgement_latches_failure_and_kills_request(monkeypatch, repl
     assert not errors
 
 
+def test_audit_failure_reports_stage_without_logging_the_record(monkeypatch, capfd):
+    audit_read, audit_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    addon = GatewayAddon(
+        CapabilityVerifier(KEY, "vm1", "worker1"),
+        audit_fd=audit_write,
+        audit_ack_fd=ack_read,
+        generation="generation",
+    )
+    monkeypatch.setattr(sys.modules[GatewayAddon.__module__].ctx, "master", None, raising=False)
+    os.close(ack_write)
+    try:
+        with pytest.raises(RuntimeError, match="audit delivery failed"):
+            addon._write_audit(b"private-audit-payload\n", {"request_id": "private-id"})
+        message = capfd.readouterr().err
+        assert "operation=acknowledgement" in message and "OSError" in message
+        assert "private-audit-payload" not in message and "private-id" not in message
+        assert addon._audit_failed
+    finally:
+        os.close(audit_read)
+        os.close(audit_write)
+        os.close(ack_read)
+
+
 def test_repeated_request_hook_does_not_duplicate_admission(monkeypatch):
     audit_read, audit_write = os.pipe()
     ack_read, ack_write = os.pipe()

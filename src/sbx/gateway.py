@@ -1765,8 +1765,13 @@ class GatewayController:
 
         def route() -> None:
             buffered = bytearray()
+            operation = "read"
             try:
-                while chunk := os.read(source.fileno(), MAX_LOG_EVENT_BYTES):
+                while True:
+                    operation = "read"
+                    chunk = os.read(source.fileno(), MAX_LOG_EVENT_BYTES)
+                    if not chunk:
+                        break
                     buffered.extend(chunk)
                     while b"\n" in buffered:
                         event, _, remainder = bytes(buffered).partition(b"\n")
@@ -1776,6 +1781,7 @@ class GatewayController:
                             raise GatewayLifecycleError(
                                 "gateway audit event exceeds transport memory limit"
                             )
+                        operation = "decode"
                         record = json.loads(event)
                         if not isinstance(record, dict) or record.get("version") not in (1, 2):
                             raise GatewayLifecycleError("invalid gateway audit record")
@@ -1794,9 +1800,12 @@ class GatewayController:
                             raise GatewayLifecycleError(
                                 "audit admission acknowledgement unavailable"
                             )
+                        operation = "append"
                         self._emit_log(destination, event, required=True)
                         if admitted:
+                            operation = "sync"
                             self._sync_audit(destination)
+                            operation = "acknowledgement"
                             ack = {
                                 key: record[key]
                                 for key in ("version", "generation", "incarnation", "request_id")
@@ -1818,7 +1827,7 @@ class GatewayController:
                     if isinstance(exc, GatewayLifecycleError)
                     else "invalid audit record encoding"
                     if isinstance(exc, ValueError)
-                    else "audit sink I/O failed"
+                    else f"audit sink I/O failed (operation={operation}, errno={exc.errno})"
                 )
                 self._audit_failure = GatewayLifecycleError(reason)
                 print(

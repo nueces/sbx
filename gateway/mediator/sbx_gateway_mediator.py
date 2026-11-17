@@ -33,7 +33,6 @@ from mitmproxy import ctx, http, tls
 from mitmproxy.net.http import url
 from mitmproxy.proxy import server_hooks
 from mitmproxy.proxy.layers.modes import Socks5AuthData
-from mitmproxy.script import concurrent
 
 MAX_HEADER_BYTES = 64 * 1024
 MAX_HEADER_FIELDS = 100
@@ -381,6 +380,7 @@ class GatewayAddon:
         self._policies = {policy.rule_id: policy for policy in policies}
         self._credentials = credentials
         self._broker = broker
+        self._provider_tasks: set[asyncio.Task[str]] = set()
         self._hooks = dict(hooks)
         self._hook_timeout = hook_timeout
         self._hook_slots = threading.BoundedSemaphore(MAX_HOOK_WORKERS)
@@ -568,7 +568,7 @@ class GatewayAddon:
             if self._authorize(flow, admission) is None:
                 self._deny(flow, 403, b"sbx gateway denied destination")
                 return
-            if not self._substitute_credentials(flow, admission):
+            if not await self._substitute_credentials(flow, admission):
                 return
             if self._authorize(flow, admission) is None or not self._headers_valid(flow.request):
                 self._deny(flow, 403, b"sbx gateway denied destination")
@@ -880,7 +880,33 @@ class GatewayAddon:
                 return None
         return output
 
-    def _substitute_credentials(self, flow: http.HTTPFlow, admission: Admission) -> bool:
+    async def _fetch_credential(self, credential: str) -> str:
+        if len(self._provider_tasks) >= MAX_ACTIVE_REQUESTS:
+            raise CredentialProviderError("credential request capacity exhausted")
+        cancelled = threading.Event()
+
+        def fetch() -> str:
+            if cancelled.is_set():
+                raise CredentialProviderError("credential request cancelled")
+            assert self._broker is not None
+            return self._broker.fetch(credential)
+
+        def finished(task: asyncio.Task[str]) -> None:
+            self._provider_tasks.discard(task)
+            if not task.cancelled():
+                task.exception()
+
+        task = asyncio.create_task(asyncio.to_thread(fetch))
+        self._provider_tasks.add(task)
+        task.add_done_callback(finished)
+        try:
+            # Cancellation must not free capacity while a blocking fetch is still alive.
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    async def _substitute_credentials(self, flow: http.HTTPFlow, admission: Admission) -> bool:
         matches = [
             binding
             for binding in self._credentials
@@ -920,10 +946,18 @@ class GatewayAddon:
             if not valid or self._broker is None or self._authorize(flow, admission) is None:
                 self._deny(flow, 403, b"sbx gateway denied credential substitution")
                 return False
+            context = self._context(flow, admission)
             try:
-                value = self._broker.fetch(binding.credential)
+                value = await self._fetch_credential(binding.credential)
             except CredentialProviderError:
                 self._deny(flow, 503, b"sbx gateway credential provider failed")
+                return False
+            if (
+                self._authorize(flow, admission) is None
+                or self._context(flow, admission) != context
+                or flow.request.headers.get_all(binding.header_name) != values
+            ):
+                self._deny(flow, 403, b"sbx gateway denied destination")
                 return False
             rendered = (
                 binding.header_value.replace("{placeholder}", value)
@@ -976,12 +1010,15 @@ class GatewayAddon:
     def _write_audit(self, encoded: bytes, acknowledgement: dict | None = None) -> None:
         if self._audit_fd is None:
             return
+        started = time.monotonic()
+        operation = "validation"
         try:
             if self._audit_failed:
                 raise OSError("audit transport failed")
             if len(encoded) > MAX_AUDIT_EVENT_BYTES:
                 raise OSError("audit event exceeds transport memory limit")
-            deadline = time.monotonic() + AUDIT_WRITE_TIMEOUT
+            deadline = started + AUDIT_WRITE_TIMEOUT
+            operation = "lock"
             if not self._audit_lock.acquire(timeout=AUDIT_WRITE_TIMEOUT):
                 raise OSError("audit transport busy")
             try:
@@ -989,6 +1026,7 @@ class GatewayAddon:
                     raise OSError("audit transport failed")
                 if acknowledgement is not None and self._audit_ack_fd is None:
                     raise OSError("audit acknowledgement unavailable")
+                operation = "write"
                 remaining = memoryview(encoded)
                 while remaining:
                     timeout = deadline - time.monotonic()
@@ -1002,6 +1040,7 @@ class GatewayAddon:
                         raise OSError("audit transport closed")
                     remaining = remaining[written:]
                 if acknowledgement is not None:
+                    operation = "acknowledgement"
                     reply = bytearray()
                     while b"\n" not in reply:
                         timeout = deadline - time.monotonic()
@@ -1030,6 +1069,13 @@ class GatewayAddon:
                 self._audit_lock.release()
         except (OSError, ValueError) as exc:
             self._audit_failed = True
+            with suppress(OSError):
+                detail = (
+                    f"sbx: audit delivery failed: operation={operation}, "
+                    f"category={type(exc).__name__}, errno={getattr(exc, 'errno', None)}, "
+                    f"elapsed={time.monotonic() - started:.6f}s; mediation stopped\n"
+                )
+                os.write(2, detail.encode())
             with suppress(OSError):
                 os.write(self._audit_fd, b'{"version":1,"audit_error":"delivery_failed"}\n')
             master = getattr(ctx, "master", None)
@@ -1501,9 +1547,6 @@ def _load() -> GatewayAddon:
         audit_ack_fd=int(audit_ack_fd) if audit_ack_fd is not None else None,
         generation=generation,
     )
-    requestheaders = concurrent(addon.requestheaders)
-    requestheaders.__name__ = "requestheaders"
-    addon.requestheaders = requestheaders  # type: ignore[method-assign]
     return addon
 
 

@@ -118,7 +118,7 @@ def test_request_capacity_is_reserved_before_blocking_work(monkeypatch, stage):
 
     if stage == "credentials":
 
-        def credentials(flow, _admission):
+        async def credentials(flow, _admission):
             blocking(flow)
             return True
 
@@ -187,8 +187,13 @@ def test_admission_denial_releases_reserved_capacity(monkeypatch, stage):
         addon._deny(flow, 403, b"sbx gateway denied destination")
         return False
 
+    async def deny_credentials(*args, **kwargs):
+        return deny(*args, **kwargs)
+
     monkeypatch.setattr(
-        addon, "_run_header_hooks" if stage == "hook" else "_substitute_credentials", deny
+        addon,
+        "_run_header_hooks" if stage == "hook" else "_substitute_credentials",
+        deny if stage == "hook" else deny_credentials,
     )
     request_headers(addon, flow)
     assert flow.response.status_code == 403
