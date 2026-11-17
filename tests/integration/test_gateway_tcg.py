@@ -624,7 +624,7 @@ def run_gateway_tcg() -> int:
             "-machine",
             "q35,accel=tcg",
             "-cpu",
-            "qemu64",
+            "max",
             "-kernel",
             str(kernel),
             "-append",

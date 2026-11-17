@@ -175,6 +175,10 @@ def create_preset(
                         replace(preset, host_env_vars=(), setup_script=""),
                         install_timeout=install_timeout,
                     )
+                    if preset_name == "claude":
+                        guest_setup.install_runtime_tools(
+                            str(vm.vm_id), run_user, [preset_name], install_timeout, guest=guest
+                        )
                 guest_setup.mount_workspaces(str(vm.vm_id), run_user, guest=guest)
         except BaseException:
             with suppress(Exception):

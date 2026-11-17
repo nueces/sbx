@@ -242,7 +242,7 @@ def run_gateway_multi_vm_tcg() -> int:
                 "-machine",
                 "q35,accel=tcg",
                 "-cpu",
-                "qemu64",
+                "max",
                 "-kernel",
                 str(kernel),
                 "-append",

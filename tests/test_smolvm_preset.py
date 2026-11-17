@@ -171,6 +171,7 @@ def test_create_preset_orders_account_environment_install_and_mounts(
         "clock",
         "env",
         "apply",
+        "tools",
         "mounts",
         "session-close",
     ]
@@ -193,6 +194,36 @@ def test_create_preset_orders_account_environment_install_and_mounts(
         mounts=["/host:/guest"],
         writable_mounts=True,
     )
+
+
+def test_claude_reuses_shared_installed_tool_check_after_sdk_install(preset_sdk, monkeypatch):
+    calls = []
+
+    def verify(*args, **kwargs):
+        assert preset_sdk.events[-1] == "apply"
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(guest_setup, "install_runtime_tools", verify)
+    create_preset(preset_name="claude", run_user="agent", install_timeout=240)
+    assert calls == [(("demo", "agent", ["claude"], 240), {"guest": preset_sdk.guest})]
+    assert preset_sdk.applied_preset.install_script == preset_sdk.preset.install_script
+    assert preset_sdk.applied_preset.host_configs == preset_sdk.preset.host_configs
+    assert (
+        preset_sdk.applied_preset.host_keychain_secrets == preset_sdk.preset.host_keychain_secrets
+    )
+
+
+def test_claude_version_failure_closes_vm_and_restores_environment(preset_sdk, monkeypatch):
+    before = dict(os.environ)
+
+    def verify(*args, **kwargs):
+        raise ValueError("claude --version failed (exit 132)")
+
+    monkeypatch.setattr(guest_setup, "install_runtime_tools", verify)
+    with pytest.raises(ValueError, match="claude --version failed"):
+        create_preset(preset_name="claude")
+    assert preset_sdk.events[-1] == "close"
+    assert "mounts" not in preset_sdk.events and dict(os.environ) == before
 
 
 def test_preset_paths_survive_temporary_home_cleanup(preset_sdk):

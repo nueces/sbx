@@ -128,7 +128,8 @@ def _use_tcg_without_kvm(argv: list[str]) -> list[str]:
         result[machine[0]] = (
             result[machine[0]].replace("pic=off", "pic=on").replace("pit=off", "pit=on")
         )
-    result[cpu[0]] = "max" if result[machine[0]].startswith("virt,") else "qemu64"
+    # Current native agent CLIs need instructions absent from the legacy qemu64 CPU.
+    result[cpu[0]] = "max"
     # ponytail: one TCG vCPU avoids microvm clock calibration stalls; revisit with SmolVM TCG.
     result[smp[0]] = "1"
     return result

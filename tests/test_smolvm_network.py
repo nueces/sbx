@@ -168,7 +168,7 @@ def test_external_network_falls_back_to_tcg_without_usable_kvm(
     )
 
     assert argv[argv.index("-machine") + 1] == "q35,accel=tcg"
-    assert argv[argv.index("-cpu") + 1] == "qemu64"
+    assert argv[argv.index("-cpu") + 1] == "max"
     assert argv[argv.index("-smp") + 1] == "1"
     assert argv[argv.index("-append") + 1].endswith("smolvm.network=guest")
 
@@ -196,7 +196,7 @@ def test_automatic_machine_uses_q35_only_for_x86_tcg_without_mutating_saved_conf
     )
     machine = argv[argv.index("-machine") + 1]
     assert machine.startswith("microvm,accel=kvm" if kvm else "q35,accel=tcg")
-    assert argv[argv.index("-cpu") + 1] == ("host" if kvm else "qemu64")
+    assert argv[argv.index("-cpu") + 1] == ("host" if kvm else "max")
     assert vm_info.config.qemu_machine == "auto" and vm_info.status == state
     if not kvm:
         assert any(value.startswith("virtio-net-pci,") for value in argv)
@@ -246,7 +246,7 @@ def test_tcg_microvm_enables_pit_for_clock_calibration() -> None:
 
     assert argv[argv.index("-machine") + 1] == "microvm,accel=tcg,pic=on,pit=on"
     assert argv[argv.index("-smp") + 1] == "1"
-    assert argv[argv.index("-cpu") + 1] == "qemu64"
+    assert argv[argv.index("-cpu") + 1] == "max"
 
 
 @pytest.mark.parametrize(
