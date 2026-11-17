@@ -167,11 +167,13 @@ def start_mediator(
     incarnation: str = "worker1",
     vm_id: str = VM_ID,
     open_files: int = 2048,
+    *,
+    policy: dict[str, Any] | None = None,
 ) -> tuple[subprocess.Popen[str], dict[str, object], Path]:
     mediator_dir = GATEWAY_DIR / "mediator"
     confdir = runtime / "mediator"
     confdir.mkdir(mode=0o700, exist_ok=True)
-    policy = {
+    default_policy = {
         "version": 2,
         "rules": [
             {
@@ -194,6 +196,7 @@ def start_mediator(
             }
         ],
     }
+    policy = default_policy if policy is None else policy
     key_read, key_write = os.pipe()
     ready_read, ready_write = os.pipe()
     policy_read, policy_write = os.pipe()

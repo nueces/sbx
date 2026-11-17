@@ -21,6 +21,11 @@ from contextlib import suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
+
+from h2.config import H2Configuration
+from h2.connection import H2Connection
+from h2.events import DataReceived, RequestReceived, StreamEnded
 
 INTEGRATION_TESTS = Path(__file__).parents[2] / "tests" / "integration"
 sys.path.insert(0, str(INTEGRATION_TESTS))
@@ -46,17 +51,123 @@ READINESS_SAMPLES = 20
 RSS_TARGET = 256 * 1024 * 1024
 RSS_CEILING = 512 * 1024 * 1024
 LARGE_BYTES = 100 * 1024 * 1024
+CONCURRENT_REQUESTS = 128
+CONCURRENT_HOLD_SECONDS = 64.5
 
 
 class BenchmarkServer(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 256
 
+    def get_request(self):
+        connection, address = super().get_request()
+        connection.settimeout(COMMAND_TIMEOUT)
+        return connection, address
+
     def __init__(self, address: tuple[str, int]) -> None:
         super().__init__(address, BenchmarkHandler)
         self.active = 0
         self.maximum_active = 0
         self.lock = threading.Lock()
+        self.bursts: dict[str, dict[str, Any]] = {}
+        self.concurrency_events: list[dict[str, Any]] = []
+
+    def begin_concurrent(self, path: str) -> dict[str, Any]:
+        run = parse_qs(urlsplit(path).query).get("run", ["default"])[0]
+        with self.lock:
+            burst = self.bursts.setdefault(run, {"arrived": 0, "ready": threading.Event()})
+            burst["arrived"] += 1
+            self.active += 1
+            self.maximum_active = max(self.maximum_active, self.active)
+            self.concurrency_events.append(
+                {
+                    "event": "start",
+                    "thread": threading.get_ident(),
+                    "run": run,
+                    "path": path,
+                    "time": time.monotonic(),
+                    "active": self.active,
+                }
+            )
+            if burst["arrived"] == CONCURRENT_REQUESTS:
+                burst["release_at"] = time.monotonic() + CONCURRENT_HOLD_SECONDS
+                burst["ready"].set()
+        return burst
+
+    def end_concurrent(self, path: str) -> None:
+        run = parse_qs(urlsplit(path).query).get("run", ["default"])[0]
+        with self.lock:
+            self.concurrency_events.append(
+                {
+                    "event": "end",
+                    "run": run,
+                    "path": path,
+                    "time": time.monotonic(),
+                    "active": self.active,
+                }
+            )
+            self.active -= 1
+
+    def hold_concurrent(self, path: str) -> None:
+        burst = self.begin_concurrent(path)
+        try:
+            require(burst["ready"].wait(120), "not all concurrent requests reached origin")
+            time.sleep(max(0, burst["release_at"] - time.monotonic()))
+        finally:
+            self.end_concurrent(path)
+
+    def finish_request(self, request, client_address):
+        if isinstance(request, ssl.SSLSocket):
+            request.do_handshake()
+            if request.selected_alpn_protocol() == "h2":
+                return self.serve_http2(request)
+        return super().finish_request(request, client_address)
+
+    def serve_http2(self, sock: ssl.SSLSocket) -> None:
+        sock.settimeout(0.1)
+        connection = H2Connection(
+            config=H2Configuration(client_side=False, header_encoding="utf-8")
+        )
+        paths: dict[int, str] = {}
+        pending_streams: dict[int, tuple[str, dict[str, Any]]] = {}
+
+        connection.initiate_connection()
+        sock.sendall(connection.data_to_send())
+        deadline = time.monotonic() + 150
+        while time.monotonic() < deadline:
+            try:
+                data = sock.recv(65536)
+            except TimeoutError:
+                data = None
+            if data == b"":
+                for path, _ in pending_streams.values():
+                    self.end_concurrent(path)
+                return
+            if data:
+                deadline = time.monotonic() + 150
+                for event in connection.receive_data(data):
+                    if isinstance(event, RequestReceived):
+                        paths[event.stream_id] = dict(event.headers)[":path"]
+                    elif isinstance(event, DataReceived):
+                        connection.acknowledge_received_data(
+                            event.flow_controlled_length, event.stream_id
+                        )
+                    elif isinstance(event, StreamEnded):
+                        path = paths.pop(event.stream_id)
+                        require(
+                            urlsplit(path).path == "/concurrent", "unexpected HTTP/2 fixture path"
+                        )
+                        pending_streams[event.stream_id] = (path, self.begin_concurrent(path))
+            for stream_id, (path, burst) in list(pending_streams.items()):
+                if time.monotonic() < burst.get("release_at", float("inf")):
+                    continue
+                self.end_concurrent(path)
+                connection.send_headers(stream_id, [(":status", "200"), ("content-length", "10")])
+                connection.send_data(stream_id, b"concurrent", end_stream=True)
+                del pending_streams[stream_id]
+            if pending := connection.data_to_send():
+                sock.sendall(pending)
+        raise TimeoutError("HTTP/2 origin idle deadline")
 
 
 class BenchmarkHandler(BaseHTTPRequestHandler):
@@ -83,24 +194,13 @@ class BenchmarkHandler(BaseHTTPRequestHandler):
         if self.path == "/latency":
             self._reply(2)
             return
-        if self.path == "/concurrent":
-            server = self.server
-            with server.lock:  # type: ignore[attr-defined]
-                server.active += 1  # type: ignore[attr-defined]
-                server.maximum_active = max(  # type: ignore[attr-defined]
-                    server.maximum_active,
-                    server.active,  # type: ignore[attr-defined]
-                )
-            try:
-                time.sleep(0.5)
-                body = b"concurrent"
-                self.send_response(200)
-                self.send_header("content-length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            finally:
-                with server.lock:  # type: ignore[attr-defined]
-                    server.active -= 1  # type: ignore[attr-defined]
+        if urlsplit(self.path).path == "/concurrent":
+            self.server.hold_concurrent(self.path)  # type: ignore[attr-defined]
+            body = b"concurrent"
+            self.send_response(200)
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
         self.send_error(404)
 
@@ -129,6 +229,22 @@ class BenchmarkHandler(BaseHTTPRequestHandler):
 def percentile(values: list[float] | list[int], fraction: float) -> float:
     ordered = sorted(values)
     return float(ordered[min(len(ordered) - 1, int(len(ordered) * fraction))])
+
+
+def concurrency_summary(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    result = {}
+    for run in sorted({row["run"] for row in events}):
+        starts = [row for row in events if row["run"] == run and row["event"] == "start"]
+        ends = [row for row in events if row["run"] == run and row["event"] == "end"]
+        result[run] = {
+            "starts": len(starts),
+            "ends": len(ends),
+            "unique_requests": len({row["path"] for row in starts}),
+            "overlap_seconds": min(row["time"] for row in ends) - max(row["time"] for row in starts)
+            if starts and ends
+            else 0,
+        }
+    return result
 
 
 def make_server(runtime: Path) -> tuple[BenchmarkServer, Path]:
@@ -160,7 +276,11 @@ def make_server(runtime: Path) -> tuple[BenchmarkServer, Path]:
     server = BenchmarkServer(("127.0.0.1", 0))
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(certificate, key)
-    server.socket = context.wrap_socket(server.socket, server_side=True)
+    context.set_alpn_protocols(["h2", "http/1.1"])
+    # Handshake in the request thread: an idle TCP peer must not block accept().
+    server.socket = context.wrap_socket(
+        server.socket, server_side=True, do_handshake_on_connect=False
+    )
     SERVERS.append(server)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, certificate
@@ -245,8 +365,30 @@ def raw_config(path: Path, port: int, ca_port: int, ingress_port: int) -> dict[s
 def start_pair(runtime: Path, gateway: Path, port: int):
     runtime.mkdir(mode=0o700)
     key = os.urandom(32)
+    upstream_ca = runtime / "upstream-ca.pem"
+    upstream_ca.write_bytes((runtime.parent / "benchmark-ca.pem").read_bytes())
     mediator, mediator_ready, confdir = start_mediator(
-        runtime, runtime.parent / "benchmark-ca.pem", port, key, "task19-worker", "task19"
+        runtime,
+        upstream_ca,
+        port,
+        key,
+        "task19-worker",
+        "task19",
+        policy={
+            "version": 2,
+            "rules": [
+                {
+                    "id": f"benchmark-{name}",
+                    "host": f"{name}.localhost",
+                    "ports": [port],
+                    "methods": [],
+                    "paths": [],
+                    "hooks": [],
+                }
+                for name in ("a", "b")
+            ],
+            "credentials": [],
+        },
     )
     ca_listener = socket.socket()
     ca_listener.bind(("127.0.0.1", 0))
@@ -474,6 +616,37 @@ def environment(qemu: str, manifest_path: Path) -> dict[str, Any]:
     }
 
 
+def boot_ready(
+    command: list[str], artifacts: Path, pair_pids: list[int]
+) -> tuple[float, int | None]:
+    process = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True
+    )
+    PROCESSES.append(process)
+    assert process.stdout is not None
+    transcript = bytearray()
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    try:
+        deadline = time.monotonic() + VM_TIMEOUT
+        while time.monotonic() < deadline:
+            require(process.poll() is None, "readiness QEMU exited")
+            for key, _ in selector.select(0.1):
+                data = os.read(key.fileobj.fileno(), 65536)
+                require(bool(data), "readiness QEMU EOF")
+                transcript.extend(data)
+                require(len(transcript) <= MAX_TRANSCRIPT_BYTES, "readiness transcript too large")
+                if b"TASK19_INGRESS_READY" in transcript:
+                    ready_at = time.perf_counter()
+                    rss = process_usage(pair_pids)[0] if pair_pids else None
+                    return ready_at, rss
+        raise RuntimeError("actual guest network readiness timed out")
+    finally:
+        selector.close()
+        artifacts.write_bytes(transcript)
+        terminate(process)
+
+
 def main() -> int:
     require(platform.system() == "Linux", "Task 19 gate requires Linux")
     tcg_helpers.COMMAND_TIMEOUT = COMMAND_TIMEOUT
@@ -511,28 +684,75 @@ def main() -> int:
         ca_port = ca_listener.getsockname()[1]
         output["direct"] = direct_benchmark(server, certificate)
 
-        readiness, rss = [], []
+        readiness, rss, boot_samples = [], [], []
         for index in range(READINESS_SAMPLES):
-            sample_runtime = runtime / f"readiness-{index}"
-            started = time.perf_counter()
-            (
-                worker,
-                mediator,
-                _,
-                qemu_listener,
-                ingress_listener,
-                pair_ca_listener,
-                pair_ca_stop,
-                _,
-            ) = start_pair(sample_runtime, gateway, server.server_port)
-            readiness.append(time.perf_counter() - started)
-            rss.append(process_usage([worker.pid, mediator.pid])[0])
-            terminate(worker)
-            terminate(mediator)
-            qemu_listener.close()
-            ingress_listener.close()
-            pair_ca_stop.set()
-            pair_ca_listener.close()
+            times = {}
+            order = ("gateway", "slirp") if index % 2 == 0 else ("slirp", "gateway")
+            for mode in order:
+                started = time.perf_counter()
+                if mode == "slirp":
+                    command = qemu_command(
+                        qemu,
+                        manifest,
+                        manifest_path,
+                        "slirp",
+                        server.server_port,
+                        ca_port,
+                        slirp_ingress=free_port(),
+                    )
+                    ready_at, _ = boot_ready(command, artifact_dir / f"boot-{index}-slirp.log", [])
+                    times[mode] = ready_at - started
+                    continue
+                sample_runtime = runtime / f"readiness-{index}"
+                (
+                    worker,
+                    mediator,
+                    qemu_socket,
+                    qemu_listener,
+                    ingress_listener,
+                    pair_ca_listener,
+                    pair_ca_stop,
+                    pair_ca_port,
+                ) = start_pair(sample_runtime, gateway, server.server_port)
+                try:
+                    command = qemu_command(
+                        qemu,
+                        manifest,
+                        manifest_path,
+                        "gateway",
+                        server.server_port,
+                        pair_ca_port,
+                        qemu_socket=qemu_socket,
+                    )
+                    ready_at, sampled_rss = boot_ready(
+                        command,
+                        artifact_dir / f"boot-{index}-gateway.log",
+                        [worker.pid, mediator.pid],
+                    )
+                    times[mode] = ready_at - started
+                    assert sampled_rss is not None
+                    rss.append(sampled_rss)
+                finally:
+                    terminate(worker)
+                    terminate(mediator)
+                    qemu_listener.close()
+                    ingress_listener.close()
+                    pair_ca_stop.set()
+                    pair_ca_listener.close()
+            readiness.append(times["gateway"] - times["slirp"])
+            boot_samples.append(times)
+            (artifact_dir / "readiness-checkpoint.json").write_text(
+                json.dumps(
+                    {
+                        "boot_samples": boot_samples,
+                        "added_seconds": readiness,
+                        "idle_rss_bytes": rss,
+                    },
+                    indent=2,
+                )
+            )
+        output["boot_readiness_samples"] = boot_samples
+        output["readiness_metric"] = "added actual guest network readiness vs matched SLIRP"
         output["readiness_seconds"] = readiness
         output["idle_rss_bytes"] = rss
 
@@ -565,6 +785,7 @@ def main() -> int:
         )
         gateway_usage = process_usage([worker.pid, mediator.pid])
         output["gateway_upstream_maximum_concurrency"] = server.maximum_active
+        output["gateway_concurrency"] = concurrency_summary(server.concurrency_events)
         terminate(gateway_qemu)
         terminate(worker)
         terminate(mediator)
@@ -607,6 +828,7 @@ def main() -> int:
         output["slirp_ingress"] = slirp_ingress_result
         output["slirp_log_bytes"] = len(slirp_log)
         output["slirp_upstream_maximum_concurrency"] = server.maximum_active
+        output["concurrency_events"] = server.concurrency_events
         ca_stop.set()
         ca_listener.close()
 
@@ -626,6 +848,12 @@ def main() -> int:
         "added_latency_p95_at_most_10ms": added_latency <= 10,
         "concurrency_128": gateway_result["concurrent_requests"] == 128,
         "concurrency_reached_upstream": output["gateway_upstream_maximum_concurrency"] >= 128,
+        "three_sustained_128_request_runs": len(output["gateway_concurrency"]) == 3
+        and all(
+            row["starts"] == row["ends"] == row["unique_requests"] == 128
+            and row["overlap_seconds"] >= 64
+            for row in output["gateway_concurrency"].values()
+        ),
         "backpressure_completed": all(
             gateway_result["backpressure"][name] == 8 * 1024 * 1024
             for name in ("upload_bytes", "download_bytes")

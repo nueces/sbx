@@ -40,6 +40,10 @@ import sys
 import threading
 import time
 
+from h2.config import H2Configuration
+from h2.connection import H2Connection
+from h2.events import DataReceived, ResponseReceived, StreamEnded, StreamReset, ConnectionTerminated
+
 mode, port, ca_port = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 hosts = ("a.localhost", "b.localhost")
 if mode == "slirp":
@@ -128,7 +132,9 @@ results = {"mode": mode}
 for size in (1024 * 1024, 100 * 1024 * 1024, 32 * 1024 * 1024):
     started = time.perf_counter()
     subprocess.run(
-        ["curl", "--fail", "--silent", "--show-error", "--cacert", "/run/task19-ca.pem",
+        ["curl", "--http1.1", "--fail", "--silent", "--show-error", "--cacert", "/run/task19-ca.pem",
+         # curl resolves .localhost internally instead of using the guest resolver.
+         "--resolve", f"{hosts[0]}:{port}:{socket.gethostbyname(hosts[0])}",
          "--output", "/dev/null", f"https://{hosts[0]}:{port}/bytes/{size}"],
         check=True,
         timeout=180,
@@ -156,16 +162,50 @@ for index in range(100):
     dns_query(hosts[index % 2])
 results["dns_lookups_per_second"] = 100 / (time.perf_counter() - started)
 
-barrier = threading.Barrier(128)
-def concurrent_request(index):
-    barrier.wait(timeout=30)
-    body, _ = request(hosts[index % 2], "/concurrent", timeout=60)
-    return body
+def concurrent_requests(client_index, run):
+    host = hosts[client_index]
+    tls = ssl.create_default_context(cafile="/run/task19-ca.pem")
+    tls.set_alpn_protocols(["h2"])
+    with tls.wrap_socket(socket.create_connection((host, port), timeout=20), server_hostname=host) as sock:
+        sock.settimeout(150)
+        assert sock.selected_alpn_protocol() == "h2"
+        connection = H2Connection(config=H2Configuration(header_encoding="utf-8"))
+        connection.initiate_connection()
+        pending = set(range(1, 128, 2))
+        bodies = {stream: bytearray() for stream in pending}
+        statuses = {}
+        for stream in pending:
+            connection.send_headers(stream, [
+                (":method", "GET"), (":scheme", "https"), (":authority", f"{host}:{port}"),
+                (":path", f"/concurrent?run={run}&client={client_index}&stream={stream}"),
+            ], end_stream=True)
+        sock.sendall(connection.data_to_send())
+        while pending:
+            data = sock.recv(65536)
+            assert data, "EOF during sustained concurrency"
+            for event in connection.receive_data(data):
+                if isinstance(event, ResponseReceived):
+                    statuses[event.stream_id] = dict(event.headers)[":status"]
+                elif isinstance(event, DataReceived):
+                    bodies[event.stream_id].extend(event.data)
+                    connection.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
+                elif isinstance(event, StreamEnded):
+                    assert statuses[event.stream_id] == "200"
+                    assert bytes(bodies[event.stream_id]) == b"concurrent"
+                    pending.remove(event.stream_id)
+                elif isinstance(event, (StreamReset, ConnectionTerminated)):
+                    raise AssertionError(str(event))
+            if outgoing := connection.data_to_send():
+                sock.sendall(outgoing)
+        return len(bodies)
 
-with concurrent.futures.ThreadPoolExecutor(max_workers=128) as executor:
-    bodies = list(executor.map(concurrent_request, range(128)))
-assert bodies == [b"concurrent"] * 128
-results["concurrent_requests"] = len(bodies)
+results["concurrency_rounds"] = []
+for run in range(3):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        completed = sum(executor.map(lambda client: concurrent_requests(client, f"{mode}-{run}"), range(2)))
+    assert completed == 128
+    results["concurrency_rounds"].append(completed)
+results["concurrent_requests"] = 128
 
 upload = b"u" * (8 * 1024 * 1024)
 body, upload_seconds = request(hosts[0], "/slow-read", "POST", upload, timeout=180)
