@@ -22,13 +22,12 @@ Exit: use a public SmolVM rootfs-only API that accepts caller-owned Dockerfile/c
 Used by `src/sbx/smolvm_preset.py`:
 
 ```python
-from smolvm.facade import _build_auto_config
-channel = vm._ensure_ssh_for_env()
+from smolvm.facade import _resolve_vm_name
 ```
 
-Why: SmolVM 0.0.28 has public VM lifecycle and preset application APIs, but no public operation that creates a named auto-configured VM with sbx's CPU/port-forward settings and supplies the communication channel required by `apply_preset()`. The preset API also reads `os.environ`, so sbx temporarily activates its credential-filtered environment during provisioning.
+Why: sbx uses SmolVM's naming helper to retain preset-generated VM names. VM configuration now comes from the prepared Debian `sbx` image, not SmolVM's stock-image auto-configuration. Preset application uses sbx's bootstrap session, skips OS-package setup already supplied by the base, and still temporarily activates the credential-filtered environment because the preset API reads `os.environ`.
 
-Fragility: both methods are private and may change. The SmolVM dependency remains pinned to `smolvm==0.0.28`, and all preset-specific private access is contained in `smolvm_preset.py`.
+Fragility: the naming helper is private and may change. All preset-specific private access remains contained in `smolvm_preset.py`.
 
 Exit: replace this module with an upstream public preset creation API that accepts explicit VM resources, mounts, port forwards, timeouts, and host credential/environment inputs; then remove this entry and the adjacent `ponytail:` comment.
 

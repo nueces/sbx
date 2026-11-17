@@ -1373,7 +1373,7 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
         bool(getattr(args, "reprovision", False))
         or getattr(args, "runtime_install", None) is not None
     )
-    requested_os = str(_arg_or_config(args, "os", config, "sbx", default="ubuntu"))
+    requested_os = str(_arg_or_config(args, "os", config, "sbx", default="debian"))
     boot_timeout = _validate_boot_timeout(
         _arg_or_config(args, "boot_timeout", config, "sbx", default=DEFAULT_BOOT_TIMEOUT)
     )

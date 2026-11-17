@@ -37,6 +37,8 @@ sbx image build
 
 The image is written to `~/.smolvm/images/sbx`. The first build compiles a QEMU kernel and can take a while. Later builds reuse Docker layers.
 
+New agent presets without `--image` also use this prepared Debian image from SmolVM's image cache; they no longer download a stock Ubuntu image. Build it first with `sbx image build`. The base includes `sudo`/`visudo`, Node.js and OS prerequisites, so presets install only their agent, without rerunning the stock OS-package setup. Existing VMs and explicit `--image` selections are unchanged. Remove any old `[sbx].os` setting or change it to `"debian"`.
+
 On a Linux x86_64 host with nested virtualization enabled, build a separate image for running KVM-accelerated inner VMs:
 
 ```bash

@@ -748,7 +748,7 @@ memory = 8192
 disk_size = 32768
 cpus = 4
 backend = "qemu"
-os = "ubuntu"
+os = "debian"
 mount = ["{extra_mount}", ".:/workspace"]
 project_path = "{project}"
 writable_mounts = false
@@ -771,7 +771,7 @@ port_forwards = ["8080:80"]
     assert preset_kwargs["memory_mib"] == 8192
     assert preset_kwargs["disk_size_mib"] == 32768
     assert preset_kwargs["cpus"] == 4
-    assert preset_kwargs["guest_os"] == "ubuntu"
+    assert preset_kwargs["guest_os"] == "debian"
     assert preset_kwargs["install_timeout"] == 900
     assert preset_kwargs["boot_timeout"] == 75
     assert preset_kwargs["mounts"] == [
