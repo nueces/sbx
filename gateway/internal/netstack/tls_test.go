@@ -77,8 +77,12 @@ func TestExactTLSPassthroughPreservesPinnedMTLSAndPayload(t *testing.T) {
 			return
 		}
 		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 		body := make([]byte, len(payload))
-		_, _ = io.ReadFull(conn, body)
+		if _, err := io.ReadFull(conn, body); err != nil {
+			seen <- []byte(err.Error())
+			return
+		}
 		seen <- body
 		_, _ = conn.Write([]byte("ok"))
 	}()
@@ -94,6 +98,9 @@ func TestExactTLSPassthroughPreservesPinnedMTLSAndPayload(t *testing.T) {
 	}
 
 	guest, gateway := net.Pipe()
+	defer guest.Close()
+	defer gateway.Close()
+	_ = guest.SetDeadline(time.Now().Add(5 * time.Second))
 	forwarder := &TCPForwarder{}
 	result := make(chan error, 1)
 	go func() {

@@ -37,14 +37,23 @@ func TestRegisterIngressBindsDescriptorsToVM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer file.Close()
+	// RegisterIngress consumes its descriptor; retain the os.File's separate ownership.
+	fd, err := syscall.Dup(int(file.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
 	port := listener.Addr().(*net.TCPAddr).Port
 	cfg := config.Config{VMID: "vm1", Generation: "g1", Ingress: []config.Ingress{{ID: "dev", ListenHost: "127.0.0.1", HostPort: uint16(port), GuestAddress: GuestIP, GuestPort: 3000}}}
-	spec := fmt.Sprintf("vm1/g1/dev=%d", file.Fd())
+	spec := fmt.Sprintf("vm1/g1/dev=%d", fd)
 	registered, err := RegisterIngress(cfg, []string{spec})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer registered[0].Listener.Close()
+	if _, err := file.Stat(); err != nil {
+		t.Fatalf("registration closed the fixture-owned descriptor: %v", err)
+	}
 	if registered[0].Listener.Addr().String() != listener.Addr().String() {
 		t.Fatal("registered listener address changed")
 	}
@@ -62,9 +71,20 @@ func TestRegisterIngressBindsDescriptorsToVM(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unix.Close()
-	unixFile, _ := unix.File()
-	if _, err := RegisterIngress(cfg, []string{fmt.Sprintf("vm1/g1/dev=%d", unixFile.Fd())}); err == nil || !strings.Contains(err.Error(), "not a TCP listener") {
+	unixFile, err := unix.File()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unixFile.Close()
+	unixFD, err := syscall.Dup(int(unixFile.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RegisterIngress(cfg, []string{fmt.Sprintf("vm1/g1/dev=%d", unixFD)}); err == nil || !strings.Contains(err.Error(), "not a TCP listener") {
 		t.Fatal("non-TCP ingress descriptor was accepted")
+	}
+	if _, err := unixFile.Stat(); err != nil {
+		t.Fatalf("rejected registration closed the fixture-owned descriptor: %v", err)
 	}
 }
 
