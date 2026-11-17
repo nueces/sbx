@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -49,6 +50,7 @@ from sbx_gateway_mediator import (  # noqa: E402
     Admission,
     CapabilityVerifier,
     CredentialProviderError,
+    DestinationBinding,
     GatewayAddon,
     HeaderCredential,
     Hook,
@@ -64,6 +66,17 @@ KEY = b"k" * 32
 PLACEHOLDER = "p" * 43
 FAKE_TOKEN = "fake-real-token-task10"
 FIXTURE_LAUNCHER = Path(__file__).with_name("fixture_launch.py")
+
+
+def request_headers(addon: GatewayAddon, flow: http.HTTPFlow) -> None:
+    # Unit hooks start with a validated transport hint; DNS has separate boundary tests.
+    admission = addon._admissions.get(flow.client_conn.id)
+    if admission is not None:
+        addon._client_routes.setdefault(
+            flow.client_conn.id,
+            DestinationBinding(flow.client_conn.id, admission, ("93.184.216.34", admission.port)),
+        )
+    asyncio.run(addon.requestheaders(flow))
 
 
 def credential(
@@ -118,7 +131,7 @@ class SocketReader:
         return self.until(b"\r\n")
 
 
-def _certificate_files(directory: Path) -> tuple[Path, Path, Path]:
+def _certificate_files(directory: Path, hostname: str = "localhost") -> tuple[Path, Path, Path]:
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     root_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     now = datetime.now(UTC)
@@ -134,7 +147,7 @@ def _certificate_files(directory: Path) -> tuple[Path, Path, Path]:
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
         .sign(root_key, hashes.SHA256())
     )
-    leaf_name = x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, "localhost")])
+    leaf_name = x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, hostname)])
     leaf = (
         x509.CertificateBuilder()
         .subject_name(leaf_name)
@@ -143,7 +156,7 @@ def _certificate_files(directory: Path) -> tuple[Path, Path, Path]:
         .serial_number(x509.random_serial_number())
         .not_valid_before(now - timedelta(minutes=1))
         .not_valid_after(now + timedelta(days=1))
-        .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False)
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(hostname)]), critical=False)
         .sign(root_key, hashes.SHA256())
     )
     root_path, cert_path, key_path = (
@@ -164,18 +177,31 @@ def _certificate_files(directory: Path) -> tuple[Path, Path, Path]:
 
 
 class ProtocolFixture:
-    def __init__(self, directory: Path) -> None:
-        self.root_ca, cert, key = _certificate_files(directory)
+    def __init__(
+        self,
+        directory: Path,
+        certificate_host: str = "localhost",
+        *,
+        address: tuple[str, int] = ("127.0.0.1", 0),
+    ) -> None:
+        self.root_ca, cert, key = _certificate_files(directory, certificate_host)
         self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.context.load_cert_chain(cert, key)
         self.context.set_alpn_protocols(["h2", "http/1.1"])
-        self.listener = socket.create_server(("127.0.0.1", 0))
+        self.listener = socket.create_server(
+            address, family=socket.AF_INET6 if ":" in address[0] else socket.AF_INET
+        )
         self.listener.settimeout(0.2)
         self.port = self.listener.getsockname()[1]
         self.paths: list[str] = []
         self.http_started = threading.Event()
         self.authorizations: list[tuple[str, str]] = []
         self._lock = threading.Lock()
+        self.connections = 0
+        self.snis: list[str | None] = []
+        self.authorities: list[tuple[str, str]] = []
+        self.local_endpoints: list[tuple] = []
+        self.context.set_servername_callback(lambda conn, name, ctx: self.snis.append(name))
         self._stopped = threading.Event()
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
@@ -189,10 +215,11 @@ class ProtocolFixture:
         with self._lock:
             return self.paths.count(path)
 
-    def _record(self, path: str, authorization: str = "") -> None:
+    def _record(self, path: str, authorization: str = "", authority: str = "") -> None:
         with self._lock:
             self.paths.append(path)
             self.authorizations.append((path, authorization))
+            self.authorities.append((path, authority))
 
     def _serve(self) -> None:
         while not self._stopped.is_set():
@@ -202,6 +229,9 @@ class ProtocolFixture:
                 continue
             except OSError:
                 return
+            with self._lock:
+                self.connections += 1
+                self.local_endpoints.append(conn.getsockname())
             threading.Thread(target=self._connection, args=(conn,), daemon=True).start()
 
     def _connection(self, conn: socket.socket) -> None:
@@ -247,7 +277,7 @@ class ProtocolFixture:
                         return
             elif "content-length" in headers:
                 body = reader.exact(int(headers["content-length"]))
-            self._record(path, headers.get("authorization", ""))
+            self._record(path, headers.get("authorization", ""), headers.get("host", ""))
             if path == "/websocket":
                 self._websocket(conn, reader, headers)
                 return
@@ -272,7 +302,7 @@ class ProtocolFixture:
                 conn.sendall(b"0\r\n\r\n")
             else:
                 self._response(conn, 200, b"ok:" + method.encode())
-            if headers.get("connection", "").lower() == "close":
+            if headers.get("connection", "").lower() == "close" or path == "/close-silently":
                 return
 
     @staticmethod
@@ -333,7 +363,11 @@ class ProtocolFixture:
                     h2.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
                 elif isinstance(event, StreamEnded):
                     path = requests[event.stream_id][":path"]
-                    self._record(path, requests[event.stream_id].get("authorization", ""))
+                    self._record(
+                        path,
+                        requests[event.stream_id].get("authorization", ""),
+                        requests[event.stream_id].get(":authority", ""),
+                    )
                     body = b"h2-ok"
                     h2.send_headers(
                         event.stream_id,
@@ -355,8 +389,14 @@ class MediatorProcess:
         policy: dict | None = None,
         admission_gate: threading.Event | None = None,
         allow_fixture_loopback: bool = True,
+        runtime_dir: Path | None = None,
+        fixture_dns: str | None = None,
     ) -> None:
         self.confdir = Path(tempfile.mkdtemp(prefix="mitmproxy-", dir=directory))
+        if fixture_dns is not None:
+            dns_file = self.confdir / "fixture-dns.txt"
+            dns_file.write_text(fixture_dns)
+            dns_file.chmod(0o600)
         self.stdout = ""
         self.stderr = ""
         key_read, key_write = os.pipe()
@@ -389,7 +429,7 @@ class MediatorProcess:
         argv = [
             sys.executable,
             *([str(FIXTURE_LAUNCHER)] if allow_fixture_loopback else []),
-            str(Path(__file__).with_name("launch.py")),
+            str((runtime_dir or Path(__file__).parent) / "launch.py"),
             "--vm-id",
             "vm1",
             "--incarnation",
@@ -619,14 +659,14 @@ class CredentialInjectionTests(unittest.TestCase):
     def test_exact_basic_and_literal_substitution(self) -> None:
         addon, client = self._addon()
         flow = self._flow(client, _basic_authorization("aws", PLACEHOLDER))
-        addon.requestheaders(flow)
+        request_headers(addon, flow)
         self.assertEqual(
             flow.request.headers["Authorization"], _basic_authorization("aws", FAKE_TOKEN)
         )
 
         addon, client = self._addon(basic=False)
         flow = self._flow(client, f"Bearer {PLACEHOLDER}")
-        addon.requestheaders(flow)
+        request_headers(addon, flow)
         self.assertEqual(flow.request.headers["Authorization"], f"Bearer {FAKE_TOKEN}")
 
     def test_wrong_scope_or_placeholder_fails_closed(self) -> None:
@@ -636,7 +676,7 @@ class CredentialInjectionTests(unittest.TestCase):
         ):
             addon, client = self._addon(basic=False)
             flow = self._flow(client, authorization, path)
-            addon.requestheaders(flow)
+            request_headers(addon, flow)
             self.assertEqual(flow.response.status_code, 403)
 
 
@@ -719,7 +759,7 @@ class HookAuthorizationTests(unittest.TestCase):
         addon, client = self._addon(hooks=hooks)
         flow = self._flow(client)
 
-        addon.requestheaders(flow)
+        request_headers(addon, flow)
         self.assertIsNone(flow.response)
         self.assertEqual(flow.request.headers["X-request"], "12")
         flow.response = http.Response.make(200, b"ok")
@@ -742,7 +782,7 @@ class HookAuthorizationTests(unittest.TestCase):
         policy = RequestPolicy("rule1", "localhost", (443,), ("GET",), ("/",))
         addon, client = self._addon(policy=policy, credentials=(secret,))
         flow = self._flow(client, headers={"Authorization": f"Bearer {PLACEHOLDER}"})
-        addon.requestheaders(flow)
+        request_headers(addon, flow)
         self.assertEqual(flow.request.headers["Authorization"], f"Bearer {FAKE_TOKEN}")
 
         other_placeholder = "other-opaque-placeholder-value-123456789012345"
@@ -764,7 +804,7 @@ class HookAuthorizationTests(unittest.TestCase):
                 "X-Other-Token": f"Bearer {other_placeholder}",
             },
         )
-        addon.requestheaders(flow)
+        request_headers(addon, flow)
         self.assertEqual(flow.response.status_code, 403)
 
         for name, method, path, headers in (
@@ -776,7 +816,7 @@ class HookAuthorizationTests(unittest.TestCase):
             with self.subTest(name):
                 addon, client = self._addon(policy=policy, credentials=(secret,))
                 flow = self._flow(client, method=method, path=path, headers=headers)
-                addon.requestheaders(flow)
+                request_headers(addon, flow)
                 self.assertEqual(flow.response.status_code, 403)
                 self.assertNotIn(FAKE_TOKEN.encode(), flow.response.content)
                 self.assertNotIn(PLACEHOLDER.encode(), flow.response.content)
@@ -790,7 +830,7 @@ class HookAuthorizationTests(unittest.TestCase):
         }
         addon, client = self._addon(hooks=streaming)
         flow = self._flow(client)
-        addon.requestheaders(flow)
+        request_headers(addon, flow)
         self.assertTrue(callable(flow.request.stream))
         self.assertEqual(flow.request.stream(b"chunk"), b"CHUNK")
         flow.response = http.Response.make(200, b"body")
@@ -807,7 +847,7 @@ class HookAuthorizationTests(unittest.TestCase):
         }
         addon, client = self._addon(hooks=buffered)
         flow = self._flow(client)
-        addon.requestheaders(flow)
+        request_headers(addon, flow)
         self.assertEqual(flow.request.stream(b"ab"), b"")
         self.assertEqual(addon.retained.total, 2)
         self.assertEqual(flow.request.stream(b"cd"), b"")
@@ -817,7 +857,7 @@ class HookAuthorizationTests(unittest.TestCase):
 
         addon, client = self._addon(hooks=buffered)
         flow = self._flow(client)
-        addon.requestheaders(flow)
+        request_headers(addon, flow)
         self.assertEqual(flow.request.stream(b"abcde"), b"")
         self.assertEqual(flow.response.status_code, 413)
         self.assertEqual(addon.retained.total, 0)
@@ -847,7 +887,7 @@ class HookAuthorizationTests(unittest.TestCase):
                 hooks = {name: Hook(on_request_headers=callback)}
                 addon, client = self._addon(hooks=hooks, timeout=0.005)
                 flow = self._flow(client)
-                addon.requestheaders(flow)
+                request_headers(addon, flow)
                 self.assertEqual(flow.response.status_code, 403)
                 self.assertNotIn(FAKE_TOKEN.encode(), flow.response.content)
 
@@ -855,7 +895,7 @@ class HookAuthorizationTests(unittest.TestCase):
         hooks = {"bad": Hook(on_request_chunk=lambda _context, _chunk: "not-bytes")}
         addon, client = self._addon(hooks=hooks)
         flow = self._flow(client)
-        addon.requestheaders(flow)
+        request_headers(addon, flow)
         self.assertEqual(flow.request.stream(b"data"), b"")
         self.assertEqual(flow.response.status_code, 403)
 
@@ -866,7 +906,7 @@ class HookAuthorizationTests(unittest.TestCase):
         hooks = {"redirect": Hook(on_response_headers=redirect)}
         addon, client = self._addon(hooks=hooks)
         flow = self._flow(client)
-        addon.requestheaders(flow)
+        request_headers(addon, flow)
         flow.response = http.Response.make(302, b"", {"Location": "/allowed/next"})
         addon.responseheaders(flow)
         self.assertEqual(flow.response.status_code, 502)
@@ -929,7 +969,7 @@ class LimitTests(unittest.TestCase):
                 client_conn=client,
                 req=http.Request.make("GET", "https://localhost/"),
             )
-            addon.requestheaders(flow)
+            request_headers(addon, flow)
             flows.append(flow)
         self.assertIsNone(flows[MAX_ACTIVE_REQUESTS - 1].response)
         self.assertEqual(flows[MAX_ACTIVE_REQUESTS].response.status_code, 503)
@@ -938,7 +978,7 @@ class LimitTests(unittest.TestCase):
             client_conn=client,
             req=http.Request.make("GET", "https://localhost/"),
         )
-        addon.requestheaders(replacement)
+        request_headers(addon, replacement)
         self.assertIsNone(replacement.response)
 
 
@@ -1106,6 +1146,78 @@ class MediatorIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(status, 403)
         wrong_port.close()
+
+    def test_http1_reuse_exceeds_upstream_connection_limit(self) -> None:
+        connections = self.fixture.connections
+        snis = len(self.fixture.snis)
+        sock = self._tls()
+        sock.settimeout(1)
+        try:
+            for index in range(16):
+                status, _, body = self._request(
+                    sock,
+                    (
+                        f"GET /reuse-{index} HTTP/1.1\r\n"
+                        f"Host: localhost:{self.fixture.port}\r\n\r\n"
+                    ).encode(),
+                )
+                self.assertEqual((status, body), (200, b"ok:GET"))
+                self.assertEqual(self.fixture.count(f"/reuse-{index}"), 1)
+        finally:
+            sock.close()
+
+        self.assertEqual(self.fixture.connections - connections, 1)
+        self.assertEqual(self.fixture.snis[snis:], ["localhost"])
+        for index in range(16):
+            self.assertEqual(self.fixture.count(f"/reuse-{index}"), 1)
+            self.assertIn(
+                (f"/reuse-{index}", f"localhost:{self.fixture.port}"), self.fixture.authorities
+            )
+        self.assertEqual(self.fixture.local_endpoints[-1][0], "127.0.0.1")
+
+    def test_cold_plain_http_reuses_numeric_route(self) -> None:
+        connections = self.fixture.connections
+        with self._socks() as sock:
+            for index in range(16):
+                status, _, _ = self._request(
+                    sock,
+                    (
+                        f"GET /plain-{index} HTTP/1.1\r\n"
+                        f"Host: localhost:{self.fixture.port}\r\n\r\n"
+                    ).encode(),
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(self.fixture.count(f"/plain-{index}"), 1)
+        self.assertEqual(self.fixture.connections - connections, 1)
+
+    def test_upstream_certificate_name_is_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            origin = ProtocolFixture(Path(directory), certificate_host="wrong.example")
+            proxy = None
+            try:
+                proxy = MediatorProcess(Path(directory), origin.root_ca)
+                client = MediatorIntegrationTests()
+                client.fixture, client.mediator = origin, proxy
+                try:
+                    with client._tls() as sock:
+                        status, _, _ = client._request(
+                            sock,
+                            (
+                                "GET /wrong-certificate HTTP/1.1\r\n"
+                                f"Host: localhost:{origin.port}\r\n\r\n"
+                            ).encode(),
+                        )
+                        self.assertEqual(status, 502)
+                except (ssl.SSLError, OSError, EOFError):
+                    pass
+                self.assertEqual(origin.snis, ["localhost"])
+                self.assertFalse(origin.http_started.is_set())
+            finally:
+                try:
+                    if proxy is not None:
+                        proxy.close()
+                finally:
+                    origin.close()
 
     def test_http1_streaming_redirect_reuse_and_absolute_uri(self) -> None:
         sock = self._tls()

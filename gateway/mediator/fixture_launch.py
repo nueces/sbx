@@ -30,6 +30,21 @@ def fixture_command(confdir: Path, *args, **kwargs):
         "    return ipaddress.ip_address(address).is_loopback or production_check(address)\n"
         "environment['_destination_allowed'] = fixture_check\n"
     )
+    dns_file = confdir / "fixture-dns.txt"
+    if dns_file.exists():
+        addon.write_text(
+            addon.read_text()
+            + "from pathlib import Path\n"
+            + "loop = environment['asyncio'].get_running_loop()\n"
+            + "original_getaddrinfo = loop.getaddrinfo\n"
+            + "async def fixture_getaddrinfo(host, port, *args, **kwargs):\n"
+            + f"    if host == 'localhost': host = Path({str(dns_file)!r}).read_text()\n"
+            + "    return await original_getaddrinfo(host, port, *args, **kwargs)\n"
+            + "loop.getaddrinfo = fixture_getaddrinfo\n"
+            + "def disconnected(data):\n"
+            + f"    Path({str(confdir / 'fixture-disconnected')!r}).touch()\n"
+            + "addons[0].server_disconnected = disconnected\n"
+        )
     command = production_command(confdir, *args, **kwargs)
     command[command.index("-s") + 1] = str(addon)
     return command

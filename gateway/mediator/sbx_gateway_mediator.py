@@ -76,6 +76,24 @@ class Admission(NamedTuple):
     expires: int
 
 
+class DestinationBinding(NamedTuple):
+    client_id: str
+    admission: Admission
+    endpoint: tuple[str, int]
+
+
+class RequestRoute(NamedTuple):
+    destination: DestinationBinding
+    scheme: str
+    host_header: str | None
+    authority: str
+    host_headers: tuple[str, ...]
+
+
+class DestinationDenied(Exception):
+    pass
+
+
 def _valid_field(value: str) -> bool:
     return bool(value) and "|" not in value and all(32 < ord(char) < 127 for char in value)
 
@@ -367,6 +385,9 @@ class GatewayAddon:
         self._hook_timeout = hook_timeout
         self._hook_slots = threading.BoundedSemaphore(MAX_HOOK_WORKERS)
         self._admissions: dict[str, Admission] = {}
+        # Acquisition hints only; every new connection revalidates DNS.
+        self._client_routes: dict[str, DestinationBinding] = {}
+        self._request_routes: dict[str, RequestRoute] = {}
         self._invalid_tls: set[str] = set()
         self._active: set[str] = set()
         self._active_lock = threading.Lock()
@@ -425,13 +446,22 @@ class GatewayAddon:
     async def server_connect(self, data: server_hooks.ServerConnectionHookData) -> None:
         if data.server.error is not None:
             return
+        # Addon exceptions alone do not stop mitmproxy from connecting.
+        data.server.error = "destination_denied"
         admission = self._admissions.get(data.client.id)
         address = data.server.address
         pinned = getattr(data.server, "sbx_pinned_destination", None)
-        if pinned is not None and address == pinned[1]:
-            address = pinned[0]
-        # Addon exceptions alone do not stop mitmproxy from connecting.
-        data.server.error = "destination_denied"
+        with self._active_lock:
+            issued = [route.destination for route in self._request_routes.values()]
+        issued.extend((self._client_routes.get(data.client.id), pinned))
+        if any(
+            isinstance(binding, DestinationBinding)
+            and binding.client_id == data.client.id
+            and binding.admission == admission
+            and binding.endpoint == address
+            for binding in issued
+        ):
+            address = (admission.host, admission.port) if admission is not None else None
         if (
             admission is None
             or address is None
@@ -439,6 +469,26 @@ class GatewayAddon:
             or address[1] != admission.port
         ):
             return
+        data.server.error = "destination_ip_denied"
+        try:
+            endpoint = await self._resolve_destination(admission, data.server.address)
+        except DestinationDenied as exc:
+            data.server.error = str(exc)
+            return
+        if self._admissions.get(data.client.id) != admission:
+            data.server.error = "destination_denied"
+            return
+        binding = DestinationBinding(data.client.id, admission, endpoint)
+        data.server.sni = admission.host
+        data.server.sbx_pinned_destination = binding
+        data.server.address = endpoint
+        self._client_routes[data.client.id] = binding
+        data.server.error = None
+
+    @staticmethod
+    async def _resolve_destination(
+        admission: Admission, preferred: tuple[str, int] | None = None
+    ) -> tuple[str, int]:
         try:
             answers = await asyncio.wait_for(
                 asyncio.get_running_loop().getaddrinfo(
@@ -446,20 +496,15 @@ class GatewayAddon:
                 ),
                 timeout=HOOK_TIMEOUT,
             )
-        except (OSError, TimeoutError):
-            # DNS failures are translated only at this fail-closed connection boundary.
-            data.server.error = "destination_dns_failed"
-            return
-        data.server.error = "destination_ip_denied"
+        except (OSError, TimeoutError) as exc:
+            raise DestinationDenied("destination_dns_failed") from exc
         if not answers or not all(_destination_allowed(answer[4][0]) for answer in answers):
-            return
-        # Keep TLS identity logical while the connector receives only a validated numeric IP.
-        data.server.sni = data.server.sni or admission.host
+            raise DestinationDenied("destination_ip_denied")
+        if preferred in [(answer[4][0], admission.port) for answer in answers]:
+            assert preferred is not None
+            return preferred
         selected = min(answers, key=lambda answer: answer[0] != socket.AF_INET)
-        endpoint = (selected[4][0], admission.port)
-        data.server.sbx_pinned_destination = ((admission.host, admission.port), endpoint)
-        data.server.address = endpoint
-        data.server.error = None
+        return selected[4][0], admission.port
 
     def tls_clienthello(self, data: tls.ClientHelloData) -> None:
         client_id = data.context.client.id
@@ -495,8 +540,8 @@ class GatewayAddon:
     def tls_failed_client(self, data: Any) -> None:
         self._handshakes.discard(data.context.client.id)
 
-    def requestheaders(self, flow: http.HTTPFlow) -> None:
-        flow.metadata["sbx_request"] = self._request_details(flow)
+    async def requestheaders(self, flow: http.HTTPFlow) -> None:
+        flow.metadata.setdefault("sbx_request", self._request_details(flow))
         if flow.is_replay:
             self._deny(flow, 403, b"sbx gateway denied replay")
             return
@@ -528,12 +573,52 @@ class GatewayAddon:
             if self._authorize(flow, admission) is None or not self._headers_valid(flow.request):
                 self._deny(flow, 403, b"sbx gateway denied destination")
                 return
+            destination = self._client_routes.get(flow.client_conn.id)
+            if destination is not None and (
+                destination.client_id != flow.client_conn.id or destination.admission != admission
+            ):
+                self._deny(flow, 403, b"sbx gateway denied destination")
+                return
+            if destination is None:
+                try:
+                    endpoint = await self._resolve_destination(admission)
+                except DestinationDenied:
+                    self._deny(flow, 502, b"sbx gateway denied destination")
+                    return
+                destination = DestinationBinding(flow.client_conn.id, admission, endpoint)
+            if (
+                self._admissions.get(flow.client_conn.id) != admission
+                or self._authorize(flow, admission) is None
+                or flow.client_conn.id in self._invalid_tls
+                or flow.error is not None
+            ):
+                self._deny(flow, 403, b"sbx gateway denied destination")
+                return
+            route = RequestRoute(
+                destination,
+                flow.request.scheme,
+                flow.request.host_header,
+                flow.request.authority,
+                tuple(flow.request.headers.get_all("host")),
+            )
+            self._client_routes[flow.client_conn.id] = destination
+            flow.metadata["sbx_route"] = route
+            with self._active_lock:
+                self._request_routes[flow.id] = route
+            # Public routing setters rewrite wire authority too; restore it before forwarding.
+            flow.request.host, flow.request.port = destination.endpoint
+            flow.request.host_header = route.host_header
+            flow.request.authority = route.authority
+            flow.request.headers.set_all("Host", route.host_headers)
+            if self._authorize(flow, admission) is None:
+                self._deny(flow, 403, b"sbx gateway denied destination")
+                return
             if not flow.metadata.get("sbx_admitted"):
                 self._audit(flow, admitted=True)
                 flow.metadata["sbx_admitted"] = True
             flow.request.stream = self._body_stream(flow, admission, policy, request=True)
             prepared = True
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             # Addon exceptions are otherwise logged and ignored: kill before propagating.
             if flow.killable:
                 flow.kill()
@@ -579,7 +664,7 @@ class GatewayAddon:
             flow.websocket.messages.clear()
         if (
             admission is None
-            or not self._request_matches(flow.request, admission)
+            or not self._request_matches(flow, admission)
             or message is None
             or len(message.content) > MAX_WEBSOCKET_MESSAGE
         ):
@@ -595,13 +680,23 @@ class GatewayAddon:
 
     def client_disconnected(self, client: Any) -> None:
         self._admissions.pop(client.id, None)
+        self._client_routes.pop(client.id, None)
+        with self._active_lock:
+            for flow_id, route in list(self._request_routes.items()):
+                if route.destination.client_id == client.id:
+                    self._request_routes.pop(flow_id)
+                    self._active.discard(flow_id)
         self._invalid_tls.discard(client.id)
         self._handshakes.discard(client.id)
         if hasattr(client, "sbx_admission"):
             del client.sbx_admission
 
     def _authorize(self, flow: http.HTTPFlow, admission: Admission | None) -> RequestPolicy | None:
-        if admission is None or not self._request_matches(flow.request, admission):
+        if (
+            admission is None
+            or self._admissions.get(flow.client_conn.id) != admission
+            or not self._request_matches(flow, admission)
+        ):
             return None
         if not self._policies:
             return RequestPolicy(admission.rule_id, admission.host, (admission.port,))
@@ -988,6 +1083,7 @@ class GatewayAddon:
     def _release_request(self, flow: http.HTTPFlow) -> None:
         with self._active_lock:
             self._active.discard(flow.id)
+            self._request_routes.pop(flow.id, None)
 
     def _finish(self, flow: http.HTTPFlow) -> None:
         try:
@@ -1014,15 +1110,49 @@ class GatewayAddon:
         flow.response.stream = lambda _: b""
 
     @staticmethod
-    def _request_matches(request: http.Request, admission: Admission) -> bool:
+    def _request_matches(flow: http.HTTPFlow, admission: Admission) -> bool:
+        request = flow.request
+        route = flow.metadata.get("sbx_route")
+        expected_host = admission.host
+        if "sbx_route" in flow.metadata:
+            if (
+                not isinstance(route, RequestRoute)
+                or route.destination.client_id != flow.client_conn.id
+                or route.destination.admission != admission
+                or route.destination.endpoint[1] != admission.port
+                or request.scheme != route.scheme
+                or request.host_header != route.host_header
+                or request.authority != route.authority
+                or tuple(request.headers.get_all("host")) != route.host_headers
+            ):
+                return False
+            expected_host = route.destination.endpoint[0]
+            server = flow.server_conn
+            if server.connected:
+                binding = getattr(server, "sbx_pinned_destination", None)
+                if (
+                    not isinstance(binding, DestinationBinding)
+                    or binding.client_id != flow.client_conn.id
+                    or binding.admission != admission
+                    or binding.endpoint != server.address
+                    or server.peername is None
+                    or server.peername[1] != admission.port
+                    or ipaddress.ip_address(server.peername[0])
+                    != ipaddress.ip_address(binding.endpoint[0])
+                    or (server.tls and _normalize_host(server.sni or "") != admission.host)
+                ):
+                    return False
         if (
             request.scheme not in {"http", "https"}
-            or _normalize_host(request.host) != admission.host
+            or (request.host if route is not None else _normalize_host(request.host))
+            != expected_host
             or request.port != admission.port
         ):
             return False
         try:
-            target = urlsplit(request.pretty_url)
+            target = urlsplit(
+                request.pretty_url if route is None else GatewayAddon._logical_url(flow, admission)
+            )
             target_port = target.port or (443 if target.scheme == "https" else 80)
         except ValueError:
             return False
@@ -1033,7 +1163,11 @@ class GatewayAddon:
             or target_port != admission.port
         ):
             return False
-        authorities = {value for value in (request.authority, request.host_header) if value}
+        authorities = {
+            value
+            for value in (request.authority, request.host_header, *request.headers.get_all("host"))
+            if value
+        }
         for authority in authorities:
             try:
                 host, port = url.parse_authority(authority, check=True)
@@ -1046,10 +1180,17 @@ class GatewayAddon:
                 return False
         return True
 
+    @staticmethod
+    def _logical_url(flow: http.HTTPFlow, admission: Admission) -> str:
+        path = "" if flow.request.path == "*" else flow.request.path
+        return url.unparse(flow.request.scheme, admission.host, admission.port, path)
+
     def _redirect_matches(self, flow: http.HTTPFlow, admission: Admission) -> bool:
         assert flow.response is not None
         try:
-            target = urlsplit(urljoin(flow.request.pretty_url, flow.response.headers["location"]))
+            target = urlsplit(
+                urljoin(self._logical_url(flow, admission), flow.response.headers["location"])
+            )
             port = target.port or (443 if target.scheme == "https" else 80)
         except ValueError:
             return False

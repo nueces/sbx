@@ -270,8 +270,8 @@ def test_repeated_request_hook_does_not_duplicate_admission(monkeypatch):
     thread = threading.Thread(target=acknowledge)
     thread.start()
     try:
-        addon.requestheaders(flow)
-        addon.requestheaders(flow)
+        test_mediator.request_headers(addon, flow)
+        test_mediator.request_headers(addon, flow)
         assert flow.response is None
         assert flow.metadata["sbx_admitted"]
         thread.join(timeout=3)

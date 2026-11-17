@@ -93,10 +93,19 @@ def test_web_is_authenticated_read_only_bounded_and_secret_free(tmp_path: Path) 
             assert time.monotonic() < deadline
             time.sleep(0.05)
         assert len(flows) == 1
+        assert flows[0]["request"]["host"] == "localhost"
+        assert json.loads(flows[0]["comment"])["host"] == "localhost"
         snapshot = api("flows") + api("flows/dump") + api("events")
         assert all(
             value.encode() not in snapshot
-            for value in (PLACEHOLDER, FAKE_TOKEN, "Authorization", "Bearer")
+            for value in (
+                PLACEHOLDER,
+                FAKE_TOKEN,
+                "Authorization",
+                "Bearer",
+                "sbx_route",
+                "endpoint",
+            )
         )
         with pytest.raises(HTTPError) as denied:
             api(f"flows/{flows[0]['id']}/replay", "POST")

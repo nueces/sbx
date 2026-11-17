@@ -11,7 +11,7 @@ import test_mediator
 from mitmproxy import http, websocket
 from mitmproxy.test import tflow
 from sbx_gateway_mediator import BrokerClient, CredentialProviderError
-from test_mediator import KEY, Admission, CapabilityVerifier, GatewayAddon
+from test_mediator import KEY, Admission, CapabilityVerifier, GatewayAddon, request_headers
 
 from sbx import gateway_supervisor
 
@@ -132,12 +132,12 @@ def test_request_capacity_is_reserved_before_blocking_work(monkeypatch, stage):
         monkeypatch.setattr(addon, "_audit", audit)
 
     def request_second():
-        addon.requestheaders(second)
+        request_headers(addon, second)
         second_decided.set()
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         try:
-            pending = pool.submit(addon.requestheaders, first)
+            pending = pool.submit(request_headers, addon, first)
             assert entered.wait(timeout=2)
             rejected = pool.submit(request_second)
             assert second_decided.wait(timeout=2)
@@ -171,7 +171,7 @@ def test_admission_failure_releases_reserved_capacity(monkeypatch, stage):
     }[stage]
     monkeypatch.setattr(addon, method, fail)
     with pytest.raises(ValueError) as failed:
-        addon.requestheaders(flow)
+        request_headers(addon, flow)
     assert failed.value is error
     assert flow.id not in addon._active
     assert not flow.live
@@ -190,7 +190,7 @@ def test_admission_denial_releases_reserved_capacity(monkeypatch, stage):
     monkeypatch.setattr(
         addon, "_run_header_hooks" if stage == "hook" else "_substitute_credentials", deny
     )
-    addon.requestheaders(flow)
+    request_headers(addon, flow)
     assert flow.response.status_code == 403
     assert not addon._active
 
@@ -198,7 +198,7 @@ def test_admission_denial_releases_reserved_capacity(monkeypatch, stage):
 def test_terminal_audit_failure_still_releases_capacity_and_buffers(monkeypatch):
     addon = GatewayAddon(CapabilityVerifier(KEY, "vm1", "worker1"))
     flow = admitted_flow(addon)
-    addon.requestheaders(flow)
+    request_headers(addon, flow)
     addon.retained.reserve(f"{flow.id}:request", 10)
     addon.retained.reserve(f"{flow.id}:response", 10)
     error = OSError("simulated terminal audit failure")
@@ -217,7 +217,7 @@ def test_terminal_audit_failure_still_releases_capacity_and_buffers(monkeypatch)
 def test_response_denial_releases_capacity_without_waiting_for_completion():
     addon = GatewayAddon(CapabilityVerifier(KEY, "vm1", "worker1"))
     flow = admitted_flow(addon)
-    addon.requestheaders(flow)
+    request_headers(addon, flow)
     flow.response = http.Response.make(200, b"", [(f"X-{i}".encode(), b"x") for i in range(101)])
     addon.responseheaders(flow)
     assert flow.response.status_code == 502
