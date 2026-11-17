@@ -183,11 +183,18 @@ def build_qemu_argv(
 ) -> list[str]:
     """Build stock SmolVM argv, replacing only its single NIC when requested."""
     sandbox = False
+    tcg = False
     if external_network is not None:
         _validate_backend(external_network)
         require_external_network_support(qemu_bin)
         linux = (host_system or platform.system()) == "Linux"
         sandbox = linux and _qemu_sandbox_supported(qemu_bin)
+        tcg = linux and not os.access("/dev/kvm", os.R_OK | os.W_OK)
+        if tcg and "aarch64" not in qemu_bin.name and vm_info.config.qemu_machine == "auto":
+            # Automatic microvm can lack a usable TCG timer, including on existing VMs.
+            vm_info = vm_info.model_copy(
+                update={"config": vm_info.config.model_copy(update={"qemu_machine": "q35"})}
+            )
         if linux and not sandbox:
             print(
                 "sbx: warning: QEMU sandbox support is unavailable; confinement is reduced",
@@ -208,9 +215,7 @@ def build_qemu_argv(
     )
     if external_network is None:
         return argv
-    if (host_system or platform.system()) == "Linux" and not os.access(
-        "/dev/kvm", os.R_OK | os.W_OK
-    ):
+    if tcg:
         argv = _use_tcg_without_kvm(argv)
     argv = _replace_network(argv, external_network)
     if sandbox:

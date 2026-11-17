@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -495,11 +496,32 @@ def test_sync_existing_vm_mounts_missing_db_or_row_does_nothing(
     assert capsys.readouterr().out == ""
 
 
+@pytest.mark.parametrize(
+    "system,arch,kvm,expected_machine",
+    [
+        ("Linux", "x86_64", False, "q35"),
+        ("Linux", "x86_64", True, "auto"),
+        ("Linux", "aarch64", False, "auto"),
+        ("Darwin", "x86_64", False, "auto"),
+    ],
+)
 def test_start_local_image_happy_path(
     monkeypatch: pytest.MonkeyPatch,
     local_image_dir: Path,
     fake_smolvm_sdk: dict[str, object],
+    system: str,
+    arch: str,
+    kvm: bool,
+    expected_machine: str,
 ) -> None:
+    monkeypatch.setattr(cli.platform, "system", lambda: system)
+    monkeypatch.setattr(cli.platform, "machine", lambda: arch)
+    original_access = os.access
+    monkeypatch.setattr(
+        cli.os,
+        "access",
+        lambda path, mode: kvm if str(path) == "/dev/kvm" else original_access(path, mode),
+    )
     captured: dict[str, object] = {}
     calls: list[str] = []
     monkeypatch.setattr(
@@ -542,6 +564,7 @@ def test_start_local_image_happy_path(
     assert isinstance(vm_config, dict)
     assert vm_config["vm_id"] == "vm-from-cli"
     assert vm_config["boot_args"] == "boot args"
+    assert vm_config["qemu_machine"] == expected_machine
     assert vm_config["comm_channel"] == "ssh"
     assert vm_config["ssh_public_key"] == "ssh-ed25519 public"
     assert vm_config["port_forwards"] == [

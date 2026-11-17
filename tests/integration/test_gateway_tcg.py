@@ -604,6 +604,7 @@ def run_gateway_tcg() -> int:
             f" sbx.package_port={package.server_port}"
             f" sbx.gateway_ca_port={ca_port}"
         )
+        boot_args = " ".join(argument for argument in boot_args.split() if argument != "pci=off")
         command = [
             qemu,
             "-sandbox",
@@ -621,7 +622,7 @@ def run_gateway_tcg() -> int:
             "-m",
             "512",
             "-machine",
-            "microvm,accel=tcg",
+            "q35,accel=tcg",
             "-cpu",
             "qemu64",
             "-kernel",
@@ -633,9 +634,9 @@ def run_gateway_tcg() -> int:
             "-netdev",
             f"stream,id=net0,server=off,reconnect-ms=100,addr.type=unix,addr.path={qemu_socket}",
             "-device",
-            "virtio-net-device,netdev=net0,mac=52:54:00:12:34:56",
+            "virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56",
             "-device",
-            "virtio-blk-device,drive=rootdisk",
+            "virtio-blk-pci,drive=rootdisk",
         ]
         joined = " ".join(command)
         require(

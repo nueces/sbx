@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import platform
 import signal
 import sqlite3
 import subprocess
@@ -1235,7 +1236,16 @@ def _start_local_image(
         _arg_or_config(args, "boot_timeout", config, "sbx", default=DEFAULT_BOOT_TIMEOUT)
     )
 
+    # Auto microvm can stall in timer calibration under x86 TCG; use the SDK's q35 path.
+    machine = (
+        "q35"
+        if platform.system() == "Linux"
+        and platform.machine() in {"x86_64", "amd64"}
+        and not os.access("/dev/kvm", os.R_OK | os.W_OK)
+        else "auto"
+    )
     vm_config: dict[str, Any] = {
+        "qemu_machine": machine,
         "memory": memory,
         "kernel_path": kernel_path,
         "initrd_path": initrd_path,

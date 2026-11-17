@@ -320,6 +320,7 @@ def qemu_command(
         f" smolvm.network=guest sbx.task19_mode={mode}"
         f" sbx.task19_port={port} sbx.task19_ca_port={ca_port}"
     )
+    boot = " ".join(argument for argument in boot.split() if argument != "pci=off")
     command = [
         qemu,
         "-sandbox",
@@ -337,7 +338,7 @@ def qemu_command(
         "-m",
         "512",
         "-machine",
-        "microvm,accel=tcg",
+        "q35,accel=tcg",
         "-cpu",
         "qemu64",
         "-kernel",
@@ -361,9 +362,9 @@ def qemu_command(
         ]
     return command + [
         "-device",
-        "virtio-net-device,netdev=net0,mac=52:54:00:19:00:01",
+        "virtio-net-pci,netdev=net0,mac=52:54:00:19:00:01",
         "-device",
-        "virtio-blk-device,drive=rootdisk",
+        "virtio-blk-pci,drive=rootdisk",
     ]
 
 

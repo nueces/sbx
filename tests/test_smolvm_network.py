@@ -173,6 +173,64 @@ def test_external_network_falls_back_to_tcg_without_usable_kvm(
     assert argv[argv.index("-append") + 1].endswith("smolvm.network=guest")
 
 
+@pytest.mark.parametrize("state", [VMState.CREATED, VMState.STOPPED])
+@pytest.mark.parametrize("kvm", [False, True])
+def test_automatic_machine_uses_q35_only_for_x86_tcg_without_mutating_saved_config(
+    monkeypatch, vm_info, unix_socket, state, kvm
+):
+    vm_info = vm_info.model_copy(
+        update={
+            "status": state,
+            "config": vm_info.config.model_copy(update={"qemu_machine": "auto"}),
+        }
+    )
+    monkeypatch.setattr(smolvm_network, "_capture", support_capture)
+    monkeypatch.setattr(smolvm_network.os, "access", lambda *_args: kvm)
+    argv = smolvm_network.build_qemu_argv(
+        vm_info,
+        qemu_bin=Path("/usr/bin/qemu-system-x86_64"),
+        boot_args=vm_info.config.boot_args,
+        platform_spec=_LINUX_SPEC,
+        external_network=backend(unix_socket),
+        host_system="Linux",
+    )
+    machine = argv[argv.index("-machine") + 1]
+    assert machine.startswith("microvm,accel=kvm" if kvm else "q35,accel=tcg")
+    assert argv[argv.index("-cpu") + 1] == ("host" if kvm else "qemu64")
+    assert vm_info.config.qemu_machine == "auto" and vm_info.status == state
+    if not kvm:
+        assert any(value.startswith("virtio-net-pci,") for value in argv)
+        assert any(value.startswith("virtio-blk-pci,drive=") for value in argv)
+
+
+@pytest.mark.parametrize(
+    "binary,system,machine,cpu",
+    [
+        ("qemu-system-aarch64", "Linux", "virt,accel=tcg", "max"),
+        ("qemu-system-x86_64", "Darwin", "q35,accel=hvf", "host"),
+    ],
+)
+def test_automatic_machine_preserves_arm_and_darwin_behavior(
+    monkeypatch, vm_info, unix_socket, binary, system, machine, cpu
+):
+    vm_info = vm_info.model_copy(
+        update={"config": vm_info.config.model_copy(update={"qemu_machine": "auto"})}
+    )
+    monkeypatch.setattr(smolvm_network, "_capture", support_capture)
+    monkeypatch.setattr(smolvm_network.os, "access", lambda *_args: False)
+    argv = smolvm_network.build_qemu_argv(
+        vm_info,
+        qemu_bin=Path("/usr/bin") / binary,
+        boot_args=vm_info.config.boot_args,
+        platform_spec=_LINUX_SPEC,
+        external_network=backend(unix_socket),
+        host_system=system,
+    )
+    assert argv[argv.index("-machine") + 1] == machine
+    assert argv[argv.index("-cpu") + 1] == cpu
+    assert vm_info.config.qemu_machine == "auto"
+
+
 def test_tcg_microvm_enables_pit_for_clock_calibration() -> None:
     argv = smolvm_network._use_tcg_without_kvm(
         [
@@ -369,9 +427,7 @@ def test_malformed_socket_paths_fail_clearly(
 
 
 @pytest.mark.parametrize("mac", ["invalid", "01:00:00:00:00:00"])
-def test_invalid_external_mac_fails_clearly(
-    mac: str, vm_info: VMInfo, unix_socket: Path
-) -> None:
+def test_invalid_external_mac_fails_clearly(mac: str, vm_info: VMInfo, unix_socket: Path) -> None:
     external = smolvm_network.ExternalNetworkBackend(
         "unix-stream", unix_socket, "qemu-connects", mac
     )
