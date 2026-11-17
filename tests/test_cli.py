@@ -998,19 +998,26 @@ def test_shell_uses_configured_git_forwarding_policy(
     assert "git" not in captured
 
 
+@pytest.mark.parametrize("xdg", [False, True])
 def test_credential_free_env_preserves_real_smolvm_state(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    xdg: bool,
 ) -> None:
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("SMOLVM_DATA_DIR", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    state = home / ".local" / "state"
+    if xdg:
+        state = tmp_path / "xdg-state"
+        monkeypatch.setenv("XDG_STATE_HOME", str(state))
 
     env = guest_setup.credential_free_env(tmp_path / "temp-home", forward_env=[])
 
     assert env["HOME"] == str(tmp_path / "temp-home")
-    assert env["SMOLVM_DATA_DIR"] == str(home / ".local" / "state" / "smolvm")
+    assert env["SMOLVM_DATA_DIR"] == str(state / "smolvm")
     assert (tmp_path / "temp-home" / ".smolvm").is_symlink()
 
 

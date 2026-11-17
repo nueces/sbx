@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import smolvm.facade
-from smolvm.vm import SmolVMManager
+from smolvm.vm import SmolVMManager, resolve_data_dir
 
 from sbx import bootstrap, runtime, session_state, vm_metadata
 from sbx.runtime import ConfigError, ssh_command
@@ -134,7 +134,7 @@ def credential_free_env(temp_home: Path, *, forward_env: list[str]) -> dict[str,
     env = sanitize_forwarded_env(dict(os.environ), forward_env)
     real_home = Path.home()
     real_smolvm_cache = real_home / ".smolvm"
-    real_smolvm_data = Path(env.get("SMOLVM_DATA_DIR", real_home / ".local" / "state" / "smolvm"))
+    real_smolvm_data = resolve_data_dir()
     temp_home.mkdir(parents=True, exist_ok=True)
     real_smolvm_cache.mkdir(parents=True, exist_ok=True)
     real_smolvm_data.mkdir(parents=True, exist_ok=True)
@@ -204,7 +204,7 @@ def open_guest(vm_id: str):
 
 def sync_network_credentials(vm_id: str, values: dict[str, str]) -> None:
     with open_guest(vm_id) as vm:
-        current = vm.info.config.env_vars
+        current = vm.list_env_vars()
         old_names = current.get("SBX_NETWORK_CREDENTIAL_NAMES", "").split(",")
         if not values and not any(old_names):
             return

@@ -211,21 +211,19 @@ def test_rootless_environment_drops_stale_sudo_identity(monkeypatch) -> None:
     assert environment == {"HOME": "/home/agent"}
 
 
-def test_guest_placeholder_manifest_removes_stale_names(monkeypatch) -> None:
+@pytest.mark.parametrize("values", [{"NEW_TOKEN": "opaque"}, {}])
+def test_guest_placeholder_manifest_removes_stale_names(monkeypatch, values) -> None:
     captured: dict[str, object] = {}
     vm = SimpleNamespace(
-        info=SimpleNamespace(
-            config=SimpleNamespace(
-                env_vars={"OLD_TOKEN": "old", "SBX_NETWORK_CREDENTIAL_NAMES": "OLD_TOKEN"}
-            )
-        ),
+        info=SimpleNamespace(config=SimpleNamespace(env_vars={})),
+        list_env_vars=lambda: {"OLD_TOKEN": "old", "SBX_NETWORK_CREDENTIAL_NAMES": "OLD_TOKEN"},
         set_env_vars=lambda values: captured.update(values=values),
         unset_env_vars=lambda missing: captured.update(missing=missing),
     )
     monkeypatch.setattr(guest_setup, "open_guest", lambda vm_id: nullcontext(vm))
-    guest_setup.sync_network_credentials("vm1", {"NEW_TOKEN": "opaque"})
+    guest_setup.sync_network_credentials("vm1", values)
     assert captured == {
-        "values": {"NEW_TOKEN": "opaque", "SBX_NETWORK_CREDENTIAL_NAMES": "NEW_TOKEN"},
+        "values": {**values, "SBX_NETWORK_CREDENTIAL_NAMES": ",".join(sorted(values))},
         "missing": ["OLD_TOKEN"],
     }
 
