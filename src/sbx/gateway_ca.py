@@ -14,6 +14,7 @@ from pathlib import Path
 from sbx import runtime
 
 GUEST_CA_PATH = "/usr/local/share/ca-certificates/sbx-gateway-ca.crt"
+GUEST_CA_PROFILE = "/etc/profile.d/sbx-gateway-ca.sh"
 
 
 class GatewayCAError(RuntimeError):
@@ -88,6 +89,9 @@ def finalize_ca_state(confdir: Path) -> GatewayCA:
 def _guest_install_script(certificate: bytes, fingerprint: str) -> str:
     encoded = base64.b64encode(certificate).decode("ascii")
     target = shlex.quote(GUEST_CA_PATH)
+    node_profile = shlex.quote(
+        f'export NODE_EXTRA_CA_CERTS="${{NODE_EXTRA_CA_CERTS:-{GUEST_CA_PATH}}}"'
+    )
     return f"""
 set -euo pipefail
 for command in base64 openssl sha256sum update-ca-certificates; do
@@ -113,6 +117,15 @@ if [ ! -f "$target" ] || [ "$(fingerprint "$target")" != "$expected" ]; then
   trap - EXIT
   update-ca-certificates >/dev/null
 fi
+# Node uses bundled roots unless its supplemental CA file is selected explicitly.
+profile={shlex.quote(GUEST_CA_PROFILE)}
+install -d -m 0755 "$(dirname "$profile")"
+temporary=$(mktemp "${{profile}}.XXXXXXXX")
+trap 'rm -f "$temporary"' EXIT
+printf '%s\\n' {node_profile} > "$temporary"
+chmod 0644 "$temporary"
+mv -f "$temporary" "$profile"
+trap - EXIT
 actual=$(fingerprint "$target")
 [ "$actual" = "$expected" ] || {{ echo "installed gateway CA fingerprint mismatch" >&2; exit 1; }}
 printf '%s\n' "$actual"

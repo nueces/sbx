@@ -21,6 +21,11 @@ The package installation provides mitmproxy and the mediator dependencies from t
 
 Installed-file and dependency integrity are left to the package installer and OS. Gateway startup still probes required QEMU capabilities. No source build, compiler, runtime download, TAP/TUN device, sudo, capability, setuid helper, or host firewall rule is part of runtime setup. `SBX_GATEWAY_BIN` remains available for selecting a separately built worker. The mediator always uses the installed `sbx` interpreter and packaged launcher; `mitmdump` resolves through the initiating CLI's normal `PATH` ordering, which the persistent supervisor retains without inheriting any other environment values.
 
+Guest CA installation also writes `/etc/profile.d/sbx-gateway-ca.sh`, defaulting
+`NODE_EXTRA_CA_CERTS` to the public gateway certificate for Node/npm login-shell
+workloads. An explicit existing value is preserved. This supplements Node's bundled
+roots without disabling certificate verification or exporting the CA private key.
+
 ## Runtime layout
 
 Policy, logs, CA material, lifecycle locks, and non-secret metadata remain under the user sbx state directory. Live endpoints use owner-only runtime paths independent of the VM name and persistent state depth:

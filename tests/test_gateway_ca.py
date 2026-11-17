@@ -96,6 +96,8 @@ def test_guest_ca_script_is_idempotent_and_verifies_fingerprint(
     guest = tmp_path / "guest" / "usr" / "local" / "share" / "ca-certificates"
     target = guest / "sbx-gateway-ca.crt"
     monkeypatch.setattr(gateway_ca, "GUEST_CA_PATH", str(target))
+    profile = guest / "profile.d" / "sbx-gateway-ca.sh"
+    monkeypatch.setattr(gateway_ca, "GUEST_CA_PROFILE", str(profile))
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     updates = tmp_path / "updates"
@@ -117,6 +119,20 @@ def test_guest_ca_script_is_idempotent_and_verifies_fingerprint(
     assert updates.read_text().splitlines() == ["updated"]
     assert b"PRIVATE KEY" not in target.read_bytes()
     assert gateway_ca.certificate_fingerprint(target.read_bytes()) == ca.fingerprint
+    assert "NODE_TLS_REJECT_UNAUTHORIZED" not in profile.read_text()
+    for configured, expected in ((None, str(target)), ("/custom/ca.pem", "/custom/ca.pem")):
+        selected = environment.copy()
+        selected.pop("NODE_EXTRA_CA_CERTS", None)
+        if configured is not None:
+            selected["NODE_EXTRA_CA_CERTS"] = configured
+        sourced = subprocess.run(
+            ["bash", "-c", '. "$1"; printf %s "$NODE_EXTRA_CA_CERTS"', "bash", str(profile)],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=selected,
+        )
+        assert sourced.stdout == expected
 
 
 def test_guest_install_interface_exposes_no_private_key_and_denies_bad_verification(
