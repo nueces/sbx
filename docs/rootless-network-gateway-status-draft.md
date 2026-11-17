@@ -1,6 +1,10 @@
 # Rootless network gateway — implementation status
 
-**DRAFT — not release-ready. Updated 2026-11-12.**
+**Historical snapshot — not release-ready. Updated 2026-11-12.**
+
+For the newer strict acceptance campaign, fixes and outstanding merge gates, see
+[merge readiness](rootless-network-gateway-merge-readiness.md). Results below remain
+historical evidence; unavailable-host claims here do not describe the newer test host.
 
 Worktree: `/home/nueces/code/sbx/feature/rootless-network-gateway/`
 

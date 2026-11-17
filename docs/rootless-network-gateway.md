@@ -125,6 +125,8 @@ Guest-facing policy/credential denials now use HTTP 403 with a fixed empty body.
 
 ## Task 19 status
 
+The following records the initial checkpoint. The newer [merge-readiness campaign](rootless-network-gateway-merge-readiness.md) requires all targets; the initial deferrals no longer clear that campaign.
+
 Passed: the bounded ten-minute mediator stability smoke completed with bounded RSS, FDs, processes, and threads. This smoke does not launch QEMU; TCG coverage comes from the separate single- and multi-VM harnesses.
 
 Deferred, not passed: readiness p95, absolute throughput, sustained 128-active HTTP request performance, and repeat four-VM TCG performance. Current preference for the follow-up is a warm launcher/forkserver with separate per-VM children; do **not** collapse VMs into one shared mitmproxy process without a new design decision.
