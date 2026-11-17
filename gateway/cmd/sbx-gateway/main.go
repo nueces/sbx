@@ -320,6 +320,9 @@ func run() error {
 			}
 		}
 	}()
+	if err := network.ProbeGuest(); err != nil {
+		return fmt.Errorf("guest reachability probe: %w", err)
+	}
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	for {

@@ -78,6 +78,19 @@ func (n *Network) AddLocalAddress(ip net.IP) error {
 	return nil
 }
 
+// ProbeGuest wakes an idle guest so a replacement can authenticate its first frame.
+func (n *Network) ProbeGuest() error {
+	err := n.Stack.GetLinkAddress(NICID, tcpip.AddrFrom4Slice(net.ParseIP(GuestIP).To4()),
+		tcpip.AddrFrom4Slice(net.ParseIP(GatewayIP).To4()), ipv4.ProtocolNumber,
+		func(stack.LinkResolutionResult) {})
+	switch err.(type) {
+	case nil, *tcpip.ErrWouldBlock:
+		return nil
+	default:
+		return errors.New(err.String())
+	}
+}
+
 func (n *Network) Inject(frame []byte) {
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(frame)})
 	n.link.InjectInbound(0, pkt)

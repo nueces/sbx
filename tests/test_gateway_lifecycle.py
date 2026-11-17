@@ -2177,7 +2177,9 @@ def test_persistent_supervisor_survives_bootstrap_and_drains_data_plane(tmp_path
             (instance.directory / "audit.log").write_bytes(evidence)
             instance.drain()
             instance.drain()
-            assert peer.recv(1) == b""
+            # Reachability probes may already be buffered; EOF must still arrive.
+            while peer.recv(4096):
+                pass
         finally:
             peer.close()
             instance.close()
@@ -2226,7 +2228,9 @@ def test_supervisor_death_closes_data_plane_and_fallback_reclaims_state(tmp_path
         while time.monotonic() < deadline and any(gateway._pid_is_running(pid) for pid in owned):
             time.sleep(0.05)
         assert all(not gateway._pid_is_running(pid) for pid in owned)
-        assert peer.recv(1) == b""
+        # Reachability probes may already be buffered; EOF must still arrive.
+        while peer.recv(4096):
+            pass
         assert "Gateway state: stale" in gateway.diagnostic_lines(
             "vm-supervisor-death", configured=config, root=root
         )
