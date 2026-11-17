@@ -260,6 +260,8 @@ def sanitized_environment(confdir: Path, status: Status, values: dict[str, str])
         "HOME": str(confdir),
         "PATH": os.pathsep.join((str(Path(sys.executable).parent), "/usr/bin", "/bin")),
         "PYTHONUTF8": "1",
+        # Bound glibc's per-thread arena reservations under the address-space limit.
+        "MALLOC_ARENA_MAX": "2",
         "TZ": "UTC",
         "SBX_GATEWAY_HARDENING": status.encode(),
     }

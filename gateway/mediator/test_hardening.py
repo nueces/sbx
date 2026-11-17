@@ -48,6 +48,50 @@ print(status.encode())
         self.assertIn("no_new_privs,seccomp,", result.stdout)
         self.assertIn(",rlimits", result.stdout)
 
+    def test_concurrent_threads_fit_within_address_space_limit(self) -> None:
+        if sys.platform != "linux":
+            return
+        script = """
+import resource, sys, threading
+from pathlib import Path
+import mitmproxy.tools.web.master
+from hardening import MAX_ADDRESS_SPACE, apply
+confdir = Path(sys.argv[1]); confdir.mkdir(mode=0o700)
+apply(confdir, 128, Path(sys.executable))
+release = threading.Event()
+ready = threading.Barrier(33)
+threads = []
+def hold():
+    allocation = bytearray(1024 * 1024)
+    ready.wait(timeout=5)
+    release.wait(timeout=10)
+try:
+    for _ in range(32):
+        thread = threading.Thread(target=hold)
+        thread.start()
+        threads.append(thread)
+    ready.wait(timeout=5)
+    assert resource.getrlimit(resource.RLIMIT_AS)[0] == MAX_ADDRESS_SPACE
+    print('32 concurrent threads within unchanged address-space limit')
+finally:
+    release.set()
+    for thread in threads:
+        thread.join(timeout=6)
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            confdir = Path(directory) / "conf"
+            result = subprocess.run(
+                [sys.executable, "-c", script, str(confdir)],
+                cwd=Path(__file__).parent,
+                env=sanitized_environment(confdir, Status(False, False, False, False), {}),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("32 concurrent threads", result.stdout)
+
     def test_environment_and_inherited_descriptors_are_minimal(self) -> None:
         environment = sanitized_environment(
             Path("/private/state"),
@@ -57,6 +101,7 @@ print(status.encode())
         self.assertNotIn("LD_PRELOAD", environment)
         self.assertNotIn("PYTHONPATH", environment)
         self.assertNotIn("HTTP_PROXY", environment)
+        self.assertEqual(environment["MALLOC_ARENA_MAX"], "2")
         self.assertEqual(environment["HOME"], "/private/state")
         self.assertEqual(environment["SBX_GATEWAY_KEY_FD"], "7")
 
