@@ -38,7 +38,8 @@ def command(confdir: Path, upstream_ca: Path | None = None, *, mitmweb: bool = F
         "http3=false",
         "websocket=true",
         "rawtcp=false",
-        "tcp_timeout=10",
+        # Match the worker's HTTP idle limit, not its shorter TCP dial timeout.
+        "tcp_timeout=300",
         "onboarding=false",
         "validate_inbound_headers=true",
         f"confdir={confdir}",

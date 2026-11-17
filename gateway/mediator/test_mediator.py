@@ -1030,6 +1030,7 @@ class MediatorIntegrationTests(unittest.TestCase):
         self.assertIn("mode=socks5@127.0.0.1:0", rendered)
         self.assertIn("flow_detail=0", rendered)
         self.assertIn("store_streamed_bodies=false", rendered)
+        self.assertIn("tcp_timeout=300", rendered)
         self.assertNotIn("web_host", rendered)
         self.assertEqual(self.mediator.address[0], "127.0.0.1")
         self.assertTrue(
