@@ -115,7 +115,8 @@ def test_external_network_builds_exact_single_stream_argv(
         "-kernel",
         str(vm_info.config.kernel_path),
         "-append",
-        "console=ttyS0 reboot=k panic=1 init=/init smolvm.network=guest",
+        "console=ttyS0 reboot=k panic=1 init=/init "
+        "ip=192.0.2.2::192.0.2.1:255.255.255.0::eth0:off smolvm.network=guest",
         "-drive",
         (
             f"file={vm_info.config.rootfs_path},if=none,format=raw,"
@@ -255,7 +256,9 @@ def test_external_network_replaces_stock_guest_boot_network(
         backend(unix_socket),
     )
 
-    assert argv[argv.index("-append") + 1] == "console=ttyS0 smolvm.network=guest"
+    assert argv[argv.index("-append") + 1] == (
+        "console=ttyS0 ip=192.0.2.2::192.0.2.1:255.255.255.0::eth0:off smolvm.network=guest"
+    )
 
 
 def test_non_gateway_argv_is_stock_smolvm_argv(

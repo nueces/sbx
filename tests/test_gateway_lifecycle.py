@@ -1104,6 +1104,11 @@ class FakeVM:
         assert timeout == 1
         self.events.append("ssh-ready")
 
+    def run(self, command: str, *, timeout: float):
+        assert "nameserver 192.0.2.1" in command and timeout == 1
+        self.events.append("resolver")
+        return SimpleNamespace(exit_code=getattr(self, "resolver_exit_code", 0))
+
     def stop(self) -> None:
         self.events.append("vm-stop")
 
@@ -1134,7 +1139,7 @@ class FakeController:
         self.events.append("rollback")
 
 
-@pytest.mark.parametrize("failure", [None, "qemu", "network", "ca", "install"])
+@pytest.mark.parametrize("failure", [None, "qemu", "network", "resolver", "ca", "install"])
 def test_cli_startup_order_and_every_post_worker_failure_rolls_back(
     lifecycle_config: gateway.GatewayConfig,
     monkeypatch: pytest.MonkeyPatch,
@@ -1143,6 +1148,7 @@ def test_cli_startup_order_and_every_post_worker_failure_rolls_back(
     events: list[str] = []
     fake = FakeController(lifecycle_config, "vm1", events)
     vm = FakeVM(events)
+    vm.resolver_exit_code = int(failure == "resolver")
     holder: list[gateway.GatewayController] = []
     monkeypatch.setattr(cli.gateway, "PersistentGatewayController", lambda *_args: fake)
 
@@ -1192,6 +1198,7 @@ def test_cli_startup_order_and_every_post_worker_failure_rolls_back(
             "qemu",
             "network-ready",
             "ssh-ready",
+            "resolver",
             "credentials",
             "ca",
             "install",
@@ -1200,13 +1207,15 @@ def test_cli_startup_order_and_every_post_worker_failure_rolls_back(
         ]
         assert holder == [fake]
     else:
-        with pytest.raises(RuntimeError, match="failed"):
+        with pytest.raises((RuntimeError, cli.ConfigError), match="failed|resolver"):
             cli._start_gateway_vm(vm, lifecycle_config, 1, holder)  # type: ignore[arg-type]
         expected = ["prepare", "qemu"]
         if failure not in {"qemu"}:
             expected.append("network-ready")
         if failure not in {"qemu", "network"}:
-            expected.extend(("ssh-ready", "credentials", "ca"))
+            expected.extend(("ssh-ready", "resolver"))
+        if failure not in {"qemu", "network", "resolver"}:
+            expected.extend(("credentials", "ca"))
         if failure == "install":
             expected.append("install")
         assert events == [*expected, "drain", "vm-stop", "rollback"]

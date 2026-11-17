@@ -152,7 +152,9 @@ def _replace_network(argv: list[str], backend: ExternalNetworkBackend) -> list[s
 
     result = list(argv)
     boot_args = re.sub(r"(?<!\S)(?:ip|smolvm\.network)=\S+\s*", "", result[append_values[0]])
-    result[append_values[0]] = f"{boot_args.strip()} smolvm.network=guest"
+    result[append_values[0]] = (
+        f"{boot_args.strip()} ip=192.0.2.2::192.0.2.1:255.255.255.0::eth0:off smolvm.network=guest"
+    )
     result[netdev_values[0]] = (
         f"stream,id=net0,server=off,reconnect-ms=100,addr.type=unix,addr.path={backend.socket_path}"
     )

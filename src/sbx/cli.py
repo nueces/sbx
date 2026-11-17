@@ -687,6 +687,11 @@ def _start_gateway_vm(
         )
         controller.vm_network_ready(pid, boot_timeout)
         vm.wait_for_ssh(timeout=boot_timeout)
+        resolver = vm.run(
+            "printf '%s\\n' 'nameserver 192.0.2.1' > /etc/resolv.conf", timeout=boot_timeout
+        )
+        if resolver.exit_code != 0:
+            raise ConfigError("could not configure the guest gateway resolver")
         guest_setup.sync_network_credentials(str(vm.vm_id), controller.credential_placeholders)
         ca = gateway_ca.finalize_ca_state(controller.directory)  # type: ignore[arg-type]
         gateway_ca.install_guest_ca(str(vm.vm_id), ca)
