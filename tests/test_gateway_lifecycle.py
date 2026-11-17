@@ -48,6 +48,9 @@ class FakeListener:
         self.closed = False
         self.address: tuple[str, int] = ("127.0.0.1", port)
 
+    def setsockopt(self, level: int, option: int, value: int) -> None:
+        assert (level, option, value) == (socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
     def bind(self, address: tuple[str, int]) -> None:
         if self.fail:
             raise OSError("bind failed")

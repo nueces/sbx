@@ -1893,6 +1893,8 @@ class GatewayController:
             family = socket.AF_INET6 if ":" in rule.listen_host else socket.AF_INET
             listener = self.socket_factory(family, socket.SOCK_STREAM)
             try:
+                # Closed ingress connections can remain in host TIME_WAIT after VM stop.
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 listener.bind((rule.listen_host, rule.host_port))
                 listener.listen()
                 host, port = listener.getsockname()[:2]
