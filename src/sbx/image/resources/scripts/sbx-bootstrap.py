@@ -27,6 +27,8 @@ LOWER_ROOT = Path("/mnt")
 UPPER_ROOT = Path("/tmp")
 LOCAL_BIN = Path("/usr/local/bin")
 FILESYSTEMS = Path("/proc/filesystems")
+# 128 KiB caps each 9p readdir buffer; larger defaults fail high-order allocations.
+NINEP_MSIZE = "msize=131072"
 COPY_MARKER = ".sbx-incomplete-copy"
 COPY_MAGIC = "sbx-bootstrap-copy-v1\n"
 PHASES = {
@@ -409,6 +411,9 @@ class Runtime:
             # Linux omits the default 9p2000.L protocol version from mountinfo.
             if kind == "9p" and not any(option.startswith("version=") for option in actual):
                 expected.discard("version=9p2000.L")
+            # Linux also omits a default msize; older sbx mounted without one.
+            if kind == "9p" and not any(option.startswith("msize=") for option in actual):
+                expected.discard(NINEP_MSIZE)
             if current["source"] != source or current["fstype"] != kind or not expected <= actual:
                 raise ValueError(f"conflicting workspace at {target}; explicit repair required")
             self.prepare_mount_target(target, mounts)
@@ -437,7 +442,7 @@ class Runtime:
         for mount in self.mounts:
             target, tag = mount["target"], mount["tag"]
             if mount["writable"]:
-                self.mount_one(tag, target, "9p", "trans=virtio,version=9p2000.L,rw")
+                self.mount_one(tag, target, "9p", f"trans=virtio,version=9p2000.L,{NINEP_MSIZE},rw")
             else:
                 lower = LOWER_ROOT / f".smolvm-ws-{tag}"
                 upper = UPPER_ROOT / f".smolvm-ws-{tag}-upper"
@@ -452,7 +457,7 @@ class Runtime:
                         raise ValueError(
                             "overlay backing directory needs explicit ownership repair"
                         )
-                self.mount_one(tag, lower, "9p", "trans=virtio,version=9p2000.L,ro")
+                self.mount_one(tag, lower, "9p", f"trans=virtio,version=9p2000.L,{NINEP_MSIZE},ro")
                 self.mount_one(
                     "overlay",
                     target,

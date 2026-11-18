@@ -33,6 +33,7 @@ DEFAULT_NESTED_KVM_CONTAINERFILE = (
 DEFAULT_DOCKER_KERNEL_FRAGMENT = Path("kernel") / "docker.config.fragment"
 DEFAULT_NESTED_KVM_KERNEL_FRAGMENT = Path("kernel") / "nested-kvm.amd64.config.fragment"
 DEFAULT_LANDLOCK_KERNEL_FRAGMENT = Path("kernel") / "landlock.config.fragment"
+DEFAULT_DEBUG_KERNEL_FRAGMENT = Path("kernel") / "debug.config.fragment"
 DEFAULT_KERNEL_BUILDER_DOCKERFILE = Path("Containers") / "Build" / "Kernel.Containerfile"
 NESTED_KVM_CONFIG = (
     "CONFIG_VIRTUALIZATION",
@@ -41,6 +42,7 @@ NESTED_KVM_CONFIG = (
     "CONFIG_KVM_AMD",
 )
 LANDLOCK_CONFIG = ("CONFIG_SECURITY", "CONFIG_SECURITY_LANDLOCK")
+HUNG_TASK_CONFIG = ("CONFIG_DEBUG_KERNEL", "CONFIG_DETECT_HUNG_TASK")
 KERNEL_NAME = "vmlinux.bin"
 BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init"
 
@@ -265,6 +267,15 @@ def _verify_landlock_config(values: dict[str, str]) -> None:
         )
 
 
+def _verify_hung_task_config(values: dict[str, str]) -> None:
+    _verify_kernel_config(values, HUNG_TASK_CONFIG, "hung task")
+    if values.get("CONFIG_BOOTPARAM_HUNG_TASK_PANIC") == "y":
+        raise RuntimeError(
+            "hung task kernel config validation failed: "
+            "CONFIG_BOOTPARAM_HUNG_TASK_PANIC must not be y"
+        )
+
+
 def _build_docker_kernel(
     *,
     image_dir: Path,
@@ -284,7 +295,8 @@ def _build_docker_kernel(
     docker_fragment = resources_dir / DEFAULT_DOCKER_KERNEL_FRAGMENT
     landlock_fragment = resources_dir / DEFAULT_LANDLOCK_KERNEL_FRAGMENT
     builder_dockerfile = resources_dir / DEFAULT_KERNEL_BUILDER_DOCKERFILE
-    required_resources = [docker_fragment, landlock_fragment, builder_dockerfile]
+    debug_fragment = resources_dir / DEFAULT_DEBUG_KERNEL_FRAGMENT
+    required_resources = [docker_fragment, landlock_fragment, debug_fragment, builder_dockerfile]
     nested_kvm_fragment = resources_dir / DEFAULT_NESTED_KVM_KERNEL_FRAGMENT
     if nested_kvm:
         required_resources.append(nested_kvm_fragment)
@@ -303,6 +315,8 @@ def _build_docker_kernel(
             + docker_fragment.read_text(encoding="utf-8").lstrip().rstrip()
             + "\n\n# ---- sbx Landlock additions ----\n"
             + landlock_fragment.read_text(encoding="utf-8").lstrip().rstrip()
+            + "\n\n# ---- sbx debug additions ----\n"
+            + debug_fragment.read_text(encoding="utf-8").lstrip().rstrip()
         )
         if nested_kvm:
             additions += (
@@ -338,6 +352,7 @@ def _build_docker_kernel(
             )
             values = _kernel_config_values(out_dir / f"vmlinux-{arch}.config")
             _verify_landlock_config(values)
+            _verify_hung_task_config(values)
             if nested_kvm:
                 _verify_kernel_config(values, NESTED_KVM_CONFIG, "nested KVM")
         finally:
