@@ -8,8 +8,9 @@ import pytest
 
 from sbx.image import build_debian, kernel_inputs
 
-LANDLOCK_CONFIG = (
+FINAL_KERNEL_CONFIG = (
     'CONFIG_SECURITY=y\nCONFIG_SECURITY_LANDLOCK=y\nCONFIG_LSM="landlock,lockdown,yama"\n'
+    "CONFIG_DEBUG_KERNEL=y\nCONFIG_DETECT_HUNG_TASK=y\n"
 )
 
 
@@ -463,7 +464,7 @@ def test_build_docker_kernel_uses_only_verified_inputs(
             out = work_dir / "out"
             out.mkdir()
             (out / "vmlinux-amd64.image").write_text("kernel", encoding="utf-8")
-            (out / "vmlinux-amd64.config").write_text(LANDLOCK_CONFIG, encoding="utf-8")
+            (out / "vmlinux-amd64.config").write_text(FINAL_KERNEL_CONFIG, encoding="utf-8")
 
     monkeypatch.setattr(build_debian.subprocess, "run", fake_run)
     monkeypatch.setattr(
@@ -560,7 +561,7 @@ def test_nested_kvm_kernel_fragment_failure_preserves_existing_kernel(
             out.mkdir()
             (out / "vmlinux-amd64.image").write_text("new kernel", encoding="utf-8")
             (out / "vmlinux-amd64.config").write_text(
-                LANDLOCK_CONFIG + "CONFIG_VIRTUALIZATION=y\nCONFIG_KVM=y\nCONFIG_KVM_INTEL=y\n",
+                FINAL_KERNEL_CONFIG + "CONFIG_VIRTUALIZATION=y\nCONFIG_KVM=y\nCONFIG_KVM_INTEL=y\n",
                 encoding="utf-8",
             )
         assert check in {True, False}

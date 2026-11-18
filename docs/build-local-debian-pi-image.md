@@ -281,6 +281,21 @@ External hosts are not changed by sbx: it never alters host boot parameters, the
 - a kernel with `CONFIG_SECURITY_LANDLOCK=y` and `landlock` listed in `/sys/kernel/security/lsm` (add it to the `lsm=` boot parameter if the distribution omits it);
 - for containers, a seccomp profile that allows `landlock_create_ruleset`, `landlock_add_rule`, and `landlock_restrict_self`. Do not use `--privileged` or `--security-opt seccomp=unconfined` as the fix.
 
+## Hung-task detector
+
+Every curated image kernel is built with `CONFIG_DETECT_HUNG_TASK=y` (and its `CONFIG_DEBUG_KERNEL=y` dependency) and a 120 s timeout. It never panics on a hang. The build fails, keeping any existing kernel, if the final config lacks either option or enables `CONFIG_BOOTPARAM_HUNG_TASK_PANIC`.
+
+Reports such as `INFO: task ... blocked for more than 120 seconds` go to the VM console log on the host, `~/.local/state/smolvm/<vm>.log`. Inside the guest, as root:
+
+```bash
+cat /proc/sys/kernel/hung_task_timeout_secs        # 120; write a value to change it until shutdown
+echo w > /proc/sysrq-trigger                       # dump blocked tasks now, into the same log
+```
+
+After `sbx image build`, run `sbx stop` and `sbx run`, then check that `hung_task_timeout_secs` exists. If it is missing, the VM still boots the old kernel and needs `sbx recreate`, which deletes the sandbox disk.
+
+Shared folders are mounted with 9p `msize=131072`. This caps each directory-read buffer at 128 KiB, so listings keep working when guest memory is fragmented; larger defaults failed with `page allocation failure: order:6` under build load. The change applies on the next VM boot, without an image rebuild.
+
 ## Docker guest usage
 
 ### Host
