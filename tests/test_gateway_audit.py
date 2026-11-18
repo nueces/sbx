@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import select
+import threading
 import time
 from pathlib import Path
 
@@ -47,7 +48,7 @@ def test_audit_pipe_preserves_large_complete_records(audit_controller) -> None:
 
 
 @pytest.mark.parametrize(
-    "failure", ["invalid", "interrupted", "oversized", "storage", "rate", "mediator"]
+    "failure", ["invalid", "deep", "interrupted", "oversized", "storage", "rate", "mediator"]
 )
 def test_audit_failure_is_visible_and_stops_gateway(
     audit_controller, tmp_path, monkeypatch, failure
@@ -55,6 +56,8 @@ def test_audit_failure_is_visible_and_stops_gateway(
     raw = b'{"version":1,"url":"https://example.com/full?token=evidence"}\n'
     if failure == "invalid":
         raw = b"not-json\n"
+    elif failure == "deep":
+        raw = b'{"x":' + b"[" * 2000 + b"]" * 2000 + b"}\n"
     elif failure == "interrupted":
         raw = raw[:-1]
     elif failure == "oversized":
@@ -76,6 +79,18 @@ def test_audit_failure_is_visible_and_stops_gateway(
     state = gateway.read_state(audit_controller.directory)
     assert state["status"] == "failed"
     assert state["last_failure"]["code"] == "audit_failed"
+    assert (
+        gateway.read_audit_failure(audit_controller.directory)["reason"]
+        == {
+            "invalid": "framing",
+            "deep": "framing",
+            "interrupted": "interrupted",
+            "oversized": "event_limit",
+            "storage": "storage_limit",
+            "rate": "rate_limit",
+            "mediator": "delivery_failed",
+        }[failure]
+    )
     assert "controller/audit_failed" in "\n".join(
         gateway.diagnostic_lines("vm", root=audit_controller.root)
     )
@@ -132,6 +147,55 @@ def test_admission_failure_never_acknowledges(audit_controller, monkeypatch, fai
             os.close(ack_read)
 
 
+def test_closed_ack_after_slow_sync_retains_causal_stage(audit_controller, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    original_sync = os.fsync
+    audit_fd = audit_controller._audit_stream.fileno()
+
+    def stalled_sync(fd):
+        if fd == audit_fd:
+            entered.set()
+            assert release.wait(3)
+        return original_sync(fd)
+
+    monkeypatch.setattr(os, "fsync", stalled_sync)
+    source_read, source_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    event = {
+        "version": 2,
+        "event": "admitted",
+        "request_id": "slow-sync",
+        "generation": audit_controller.generation,
+        "incarnation": audit_controller.worker_incarnation,
+    }
+    audit_controller._route_audit(
+        os.fdopen(source_read, "rb", buffering=0), audit_controller._audit_stream, ack_write
+    )
+    try:
+        os.write(source_write, (json.dumps(event) + "\n").encode())
+        assert entered.wait(1)
+        assert not select.select([ack_read], [], [], 1.01)[0]
+        # Reproduce the historical one-second peer close, not the current five-second budget.
+        os.close(ack_read)
+        ack_read = None
+    finally:
+        release.set()
+        os.close(source_write)
+        if ack_read is not None:
+            os.close(ack_read)
+        for thread in audit_controller._log_threads:
+            thread.join(timeout=3)
+            assert not thread.is_alive()
+    detail = gateway.read_audit_failure(audit_controller.directory)
+    assert detail["operation"] == "acknowledgement"
+    assert detail["errno"] == 32
+    assert detail["stage_us"]["sync"] >= 1_000_000
+    with pytest.raises(gateway.GatewayLifecycleError):
+        audit_controller.check()
+    assert gateway.read_state(audit_controller.directory)["last_failure"]["code"] == "audit_failed"
+    assert json.loads((audit_controller.directory / "audit.log").read_text()) == event
+
+
 @pytest.mark.parametrize("operation", ["append", "sync"])
 def test_audit_io_failure_reports_stage_and_errno_without_exception_payload(
     audit_controller, monkeypatch, capsys, operation
@@ -167,6 +231,152 @@ def test_audit_io_failure_reports_stage_and_errno_without_exception_payload(
         assert "private-exception-payload" not in message
     finally:
         os.close(ack_read)
+
+
+@pytest.mark.parametrize("operation", ["append", "sync"])
+def test_redacted_audit_failure_is_retained_when_stderr_is_discarded(
+    audit_controller, monkeypatch, operation
+):
+    def fail(*args, **kwargs):
+        raise OSError(5, "secret-bearing-exception")
+
+    monkeypatch.setattr(
+        audit_controller, "_emit_log" if operation == "append" else "_sync_audit", fail
+    )
+    source_read, source_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    event = {
+        "version": 2,
+        "event": "admitted",
+        "generation": audit_controller.generation,
+        "incarnation": audit_controller.worker_incarnation,
+        "request_id": "opaque-request",
+    }
+    audit_controller._route_audit(
+        os.fdopen(source_read, "rb", buffering=0), audit_controller._audit_stream, ack_write
+    )
+    try:
+        os.write(source_write, (json.dumps(event) + "\n").encode())
+        os.close(source_write)
+        for thread in audit_controller._log_threads:
+            thread.join(3)
+            assert not thread.is_alive()
+        detail = gateway.read_audit_failure(
+            audit_controller.directory, incarnation=audit_controller.worker_incarnation
+        )
+        assert detail == audit_controller._audit_failure_detail
+        assert detail["operation"] == operation and detail["errno"] == 5
+        assert detail["reason"] == "io_error"
+        assert "secret-bearing-exception" not in json.dumps(detail)
+        assert "opaque-request" not in json.dumps(detail)
+        assert os.read(ack_read, 4096) == b""
+        assert (audit_controller.directory / "audit-failure.json").stat().st_mode & 0o777 == 0o600
+    finally:
+        os.close(ack_read)
+
+
+def test_failure_cache_precedes_unavailable_diagnostic_storage(audit_controller, monkeypatch):
+    detail = {
+        "version": 1,
+        "component": "controller",
+        "generation": audit_controller.generation,
+        "incarnation": audit_controller.worker_incarnation,
+        "operation": "append",
+        "reason": "io_error",
+        "errno": 28,
+        "elapsed_us": 10,
+        "stage_us": {"append": 10},
+        "request_id_hash": None,
+    }
+
+    def unavailable(*args, **kwargs):
+        assert audit_controller._audit_failure is not None
+        assert audit_controller._audit_failure_detail == detail
+        raise gateway.GatewayStateError("unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(gateway, "_atomic_json", unavailable)
+        audit_controller._record_audit_failure(
+            detail, gateway.GatewayLifecycleError("audit failed")
+        )
+        assert audit_controller._audit_failure_detail == detail
+        different = dict(detail, operation="sync")
+        audit_controller._record_audit_failure(
+            different, gateway.GatewayLifecycleError("later failure")
+        )
+        assert audit_controller._audit_failure_detail == detail
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        "oversized",
+        "symlink",
+        "mode",
+        "generation",
+        "incarnation",
+        "unknown",
+        "payload",
+        "deep_json",
+        "utf16",
+    ],
+)
+def test_audit_failure_sidecar_rejects_unsafe_data(audit_controller, unsafe):
+    detail = {
+        "version": 1,
+        "component": "controller",
+        "generation": audit_controller.generation,
+        "incarnation": audit_controller.worker_incarnation,
+        "operation": "read",
+        "reason": "eof",
+        "errno": None,
+        "elapsed_us": 1,
+        "stage_us": {},
+        "request_id_hash": None,
+    }
+    path = audit_controller.directory / "audit-failure.json"
+    if unsafe in ("generation", "incarnation"):
+        detail[unsafe] = "other"
+    elif unsafe == "unknown":
+        detail["unknown"] = "value"
+    elif unsafe == "payload":
+        detail["reason"] = "secret-exception-text"
+    if unsafe == "oversized":
+        path.write_bytes(b" " * 2049)
+    elif unsafe == "deep_json":
+        path.write_bytes(b'{"x":' + b"[" * 1010 + b"]" * 1010 + b"}")
+    elif unsafe == "utf16":
+        path.write_bytes(json.dumps(detail).encode("utf-16"))
+    elif unsafe == "symlink":
+        path.symlink_to(audit_controller.directory / "audit.log")
+    else:
+        path.write_text(json.dumps(detail))
+    if unsafe != "symlink":
+        path.chmod(0o644 if unsafe == "mode" else 0o600)
+    with pytest.raises(gateway.GatewayStateError):
+        gateway.read_audit_failure(
+            audit_controller.directory, incarnation=audit_controller.worker_incarnation
+        )
+
+
+def test_startup_rollback_preserves_failure_detail_without_an_admitted_record(audit_controller):
+    detail = {
+        "version": 1,
+        "component": "controller",
+        "generation": audit_controller.generation,
+        "incarnation": audit_controller.worker_incarnation,
+        "operation": "read",
+        "reason": "io_error",
+        "errno": 5,
+        "elapsed_us": 1,
+        "stage_us": {},
+        "request_id_hash": None,
+    }
+    audit_controller._record_audit_failure(detail, gateway.GatewayLifecycleError("audit failed"))
+    assert (audit_controller.directory / "audit.log").stat().st_size == 0
+    gateway._rollback_state_directory(audit_controller.directory)
+    assert audit_controller.directory.exists()
+    assert gateway.read_audit_failure(audit_controller.directory) == detail
 
 
 def test_ack_pipe_creation_failure_closes_unused_audit_reader(audit_controller, monkeypatch):

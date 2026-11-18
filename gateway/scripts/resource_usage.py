@@ -104,8 +104,8 @@ def collect(roots: list[dict[str, object]], uid: int, proc: Path = Path("/proc")
     }
 
 
-def process_usage(pids: list[int]) -> tuple[int, int, int, int]:
-    """Return RSS, FDs, processes and threads, optionally using an explicit observer."""
+def process_samples(pids: list[int]) -> list[dict]:
+    """Return complete identity-checked count samples, including descendants."""
     try:
         roots = [identity(pid) for pid in pids]
         observer = os.environ.get("SBX_GATEWAY_RESOURCE_OBSERVER")
@@ -140,14 +140,20 @@ def process_usage(pids: list[int]) -> tuple[int, int, int, int]:
         values = [int(s[key]) for s in samples for key in ("rss_bytes", "fds", "threads")]
         if any(value < 0 for value in values):
             raise MeasurementUnavailable("resource observer returned negative counts")
-        return (
-            sum(s["rss_bytes"] for s in samples),
-            sum(s["fds"] for s in samples),
-            len(samples),
-            sum(s["threads"] for s in samples),
-        )
+        return samples
     except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as exc:
         raise MeasurementUnavailable(f"resource measurement unavailable: {exc}") from exc
+
+
+def process_usage(pids: list[int]) -> tuple[int, int, int, int]:
+    """Return RSS, FDs, processes and threads, optionally using an explicit observer."""
+    samples = process_samples(pids)
+    return (
+        sum(s["rss_bytes"] for s in samples),
+        sum(s["fds"] for s in samples),
+        len(samples),
+        sum(s["threads"] for s in samples),
+    )
 
 
 if __name__ == "__main__":

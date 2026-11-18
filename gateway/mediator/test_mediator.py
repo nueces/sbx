@@ -470,7 +470,7 @@ class MediatorProcess:
 
         def sync(destination):
             self.admission_waiting.set()
-            if admission_gate is not None and not admission_gate.wait(timeout=3):
+            if admission_gate is not None and not admission_gate.wait(timeout=10):
                 raise OSError("test admission gate timed out")
             original_sync(destination)
 

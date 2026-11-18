@@ -48,7 +48,7 @@ TLS_CONTEXT_TTL = 10 * 60
 HOOK_TIMEOUT = 1.0
 # Bound memory and backpressure, not URL fields; overflow terminates mediation visibly.
 MAX_AUDIT_EVENT_BYTES = 1 << 20
-AUDIT_WRITE_TIMEOUT = 1.0
+AUDIT_WRITE_TIMEOUT = 5.0
 _IMMUTABLE_HEADERS = frozenset(
     {
         "connection",
@@ -371,6 +371,7 @@ class GatewayAddon:
         self._audit_fd = audit_fd
         self._audit_ack_fd = audit_ack_fd
         self._audit_failed = False
+        self._audit_failure_detail: dict | None = None
         self._audit_lock = threading.Lock()
         self._generation = generation
         if audit_fd is not None:
@@ -1012,6 +1013,8 @@ class GatewayAddon:
             return
         started = time.monotonic()
         operation = "validation"
+        stage_started = started
+        stages = {}
         try:
             if self._audit_failed:
                 raise OSError("audit transport failed")
@@ -1021,12 +1024,14 @@ class GatewayAddon:
             operation = "lock"
             if not self._audit_lock.acquire(timeout=AUDIT_WRITE_TIMEOUT):
                 raise OSError("audit transport busy")
+            stages["lock"] = int((time.monotonic() - stage_started) * 1_000_000)
             try:
                 if self._audit_failed:
                     raise OSError("audit transport failed")
                 if acknowledgement is not None and self._audit_ack_fd is None:
                     raise OSError("audit acknowledgement unavailable")
                 operation = "write"
+                stage_started = time.monotonic()
                 remaining = memoryview(encoded)
                 while remaining:
                     timeout = deadline - time.monotonic()
@@ -1039,8 +1044,10 @@ class GatewayAddon:
                     if written <= 0:
                         raise OSError("audit transport closed")
                     remaining = remaining[written:]
+                stages["write"] = int((time.monotonic() - stage_started) * 1_000_000)
                 if acknowledgement is not None:
                     operation = "acknowledgement"
+                    stage_started = time.monotonic()
                     reply = bytearray()
                     while b"\n" not in reply:
                         timeout = deadline - time.monotonic()
@@ -1062,26 +1069,70 @@ class GatewayAddon:
                         raise OSError("audit acknowledgement malformed")
                     if json.loads(reply) != acknowledgement:
                         raise OSError("audit acknowledgement mismatch")
-            except (OSError, ValueError):
+                if time.monotonic() > deadline:
+                    raise OSError("audit transaction timed out")
+            except (OSError, ValueError, RecursionError):
                 self._audit_failed = True
                 raise
             finally:
                 self._audit_lock.release()
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, RecursionError) as exc:
             self._audit_failed = True
-            with suppress(OSError):
-                detail = (
-                    f"sbx: audit delivery failed: operation={operation}, "
-                    f"category={type(exc).__name__}, errno={getattr(exc, 'errno', None)}, "
-                    f"elapsed={time.monotonic() - started:.6f}s; mediation stopped\n"
+            if self._audit_failure_detail is None:
+                reason = {
+                    "audit transport busy": "busy",
+                    "audit transport timed out": "deadline",
+                    "audit acknowledgement timed out": "deadline",
+                    "audit transaction timed out": "deadline",
+                    "audit transport closed": "eof",
+                    "audit acknowledgement closed": "eof",
+                    "audit acknowledgement unavailable": "eof",
+                    "audit acknowledgement oversized": "framing",
+                    "audit acknowledgement malformed": "framing",
+                    "audit acknowledgement mismatch": "identity",
+                    "audit event exceeds transport memory limit": "event_limit",
+                }.get(
+                    str(exc),
+                    "framing" if isinstance(exc, (ValueError, RecursionError)) else "io_error",
                 )
-                os.write(2, detail.encode())
-            with suppress(OSError):
-                os.write(self._audit_fd, b'{"version":1,"audit_error":"delivery_failed"}\n')
+                stages[operation] = int((time.monotonic() - stage_started) * 1_000_000)
+                request_id = acknowledgement.get("request_id") if acknowledgement else None
+                self._audit_failure_detail = {
+                    "version": 1,
+                    "component": "mediator",
+                    "generation": self._generation,
+                    "incarnation": self._verifier.identity[1],
+                    "operation": operation,
+                    "reason": reason,
+                    "errno": getattr(exc, "errno", None),
+                    "elapsed_us": int((time.monotonic() - started) * 1_000_000),
+                    "stage_us": stages,
+                    "request_id_hash": hashlib.sha256(request_id.encode()).hexdigest()
+                    if isinstance(request_id, str)
+                    else None,
+                }
             master = getattr(ctx, "master", None)
             if master is not None:
                 master.shutdown()
-            raise RuntimeError("gateway audit delivery failed; mediation stopped") from exc
+            detail = self._audit_failure_detail
+            with suppress(OSError):
+                # A full stderr pipe must not stall the fatal path.
+                os.set_blocking(2, False)
+                message = (
+                    f"sbx: audit delivery failed: operation={detail['operation']}, "
+                    f"reason={detail['reason']}, category={type(exc).__name__}, "
+                    f"errno={detail['errno']}, "
+                    f"elapsed_us={detail['elapsed_us']}; mediation stopped\n"
+                )
+                os.write(2, message.encode())
+            marker = {"version": 1, "audit_error": "delivery_failed", "failure": detail}
+            raw = (json.dumps(marker, separators=(",", ":")) + "\n").encode()
+            with suppress(OSError):
+                os.write(
+                    self._audit_fd,
+                    raw if len(raw) <= 2048 else b'{"version":1,"audit_error":"delivery_failed"}\n',
+                )
+            raise RuntimeError("gateway audit delivery failed; mediation stopped") from None
 
     def _audit(self, flow: http.HTTPFlow, *, admitted: bool = False) -> None:
         if not admitted:

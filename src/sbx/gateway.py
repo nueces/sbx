@@ -50,6 +50,38 @@ MAX_LOG_EVENTS_PER_SECOND = 1000
 MAX_LOG_EVENT_BURST = 2000
 MAX_LOG_EVENT_BYTES = 64 * 1024
 MAX_AUDIT_EVENT_BYTES = 1 << 20
+MAX_AUDIT_FAILURE_BYTES = 2048
+_AUDIT_OPERATIONS = frozenset(
+    {
+        "read",
+        "decode",
+        "append",
+        "flush",
+        "sync",
+        "full_sync",
+        "directory_sync",
+        "acknowledgement",
+        "validation",
+        "lock",
+        "write",
+    }
+)
+_AUDIT_REASONS = frozenset(
+    {
+        "io_error",
+        "deadline",
+        "eof",
+        "framing",
+        "identity",
+        "rate_limit",
+        "storage_limit",
+        "event_limit",
+        "sync_unavailable",
+        "delivery_failed",
+        "interrupted",
+        "busy",
+    }
+)
 MAX_DNS_JOURNAL_BYTES = 1 << 20
 MAX_DATA_PLANE_RSS = 512 * 1024 * 1024
 MAX_DATA_PLANE_PROCESSES = 16
@@ -1236,7 +1268,7 @@ def create_state(
         return directory
 
 
-def _read_json(path: Path) -> dict[str, Any]:
+def _read_json(path: Path, *, max_bytes: int = MAX_CONFIG_BYTES) -> dict[str, Any]:
     _private_directory(path.parent)
     try:
         info = path.lstat()
@@ -1245,13 +1277,16 @@ def _read_json(path: Path) -> dict[str, Any]:
             or stat.S_ISLNK(info.st_mode)
             or info.st_uid != os.getuid()
             or stat.S_IMODE(info.st_mode) != 0o600
-            or info.st_size > 1 << 20
+            or info.st_size > max_bytes
         ):
             raise GatewayStateError(f"unsafe gateway state file: {path}")
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        with os.fdopen(fd, "r", encoding="utf-8") as source:
-            data = json.load(source)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        with os.fdopen(fd, "rb") as source:
+            encoded = source.read(max_bytes + 1)
+            if len(encoded) > max_bytes:
+                raise GatewayStateError(f"gateway state exceeds its size limit: {path}")
+            data = json.loads(encoded.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise GatewayStateError(f"corrupt gateway state: {path}") from exc
     if not isinstance(data, dict):
         raise GatewayStateError(f"corrupt gateway state: {path}")
@@ -1373,6 +1408,72 @@ def read_state(directory: Path, *, vm_id: str | None = None) -> dict[str, Any]:
     _validate_id(selected_vm, "VM identity")
     _validate_id(generation, "gateway generation")
     return _validated_state(_read_json(directory / "state.json"), selected_vm, generation)
+
+
+def _validated_audit_failure(
+    data: object, generation: str, incarnation: str | None = None
+) -> dict[str, Any]:
+    fields = {
+        "version",
+        "component",
+        "generation",
+        "incarnation",
+        "operation",
+        "reason",
+        "errno",
+        "elapsed_us",
+        "stage_us",
+        "request_id_hash",
+    }
+    if not isinstance(data, dict) or set(data) != fields:
+        raise GatewayStateError("invalid audit failure detail")
+    if (
+        type(data["version"]) is not int
+        or data["version"] != 1
+        or not isinstance(data["component"], str)
+        or data["component"] not in {"controller", "mediator"}
+        or data["generation"] != generation
+        or not isinstance(data["incarnation"], str)
+        or _ID_RE.fullmatch(data["incarnation"]) is None
+        or (incarnation is not None and data["incarnation"] != incarnation)
+        or not isinstance(data["operation"], str)
+        or data["operation"] not in _AUDIT_OPERATIONS
+        or not isinstance(data["reason"], str)
+        or data["reason"] not in _AUDIT_REASONS
+        or (
+            data["errno"] is not None
+            and (type(data["errno"]) is not int or not 0 <= data["errno"] <= 4095)
+        )
+        or type(data["elapsed_us"]) is not int
+        or not 0 <= data["elapsed_us"] < 1 << 63
+        or not isinstance(data["stage_us"], dict)
+        or any(
+            name not in _AUDIT_OPERATIONS or type(value) is not int or not 0 <= value < 1 << 63
+            for name, value in data["stage_us"].items()
+        )
+        or (
+            data["request_id_hash"] is not None
+            and (
+                not isinstance(data["request_id_hash"], str)
+                or re.fullmatch(r"[0-9a-f]{64}", data["request_id_hash"]) is None
+            )
+        )
+        or len((json.dumps(data, indent=2, sort_keys=True) + "\n").encode())
+        > MAX_AUDIT_FAILURE_BYTES
+    ):
+        raise GatewayStateError("invalid audit failure detail")
+    return dict(data)
+
+
+def read_audit_failure(directory: Path, *, incarnation: str | None = None) -> dict[str, Any] | None:
+    path = directory / "audit-failure.json"
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    return _validated_audit_failure(
+        _read_json(path, max_bytes=MAX_AUDIT_FAILURE_BYTES), directory.name, incarnation
+    )
 
 
 def update_state(
@@ -1581,6 +1682,12 @@ class GatewayController:
         self._audit_stream: BinaryIO | None = None
         self._audit_directory_synced = False
         self._audit_failure: GatewayLifecycleError | None = None
+        self._audit_failure_detail: dict[str, Any] | None = None
+        self._audit_failure_at: str | None = None
+        self._audit_failure_lock = threading.Lock()
+        self._audit_sync_stage = "sync"
+        self._audit_sync_started = time.monotonic()
+        self._audit_stage_us: dict[str, int] = {}
         self._audit_write_fd: int | None = None
         self._audit_ack_read_fd: int | None = None
         self.worker_incarnation = uuid.uuid4().hex
@@ -1661,9 +1768,13 @@ class GatewayController:
                 self._log_tokens + (now - self._log_last) * MAX_LOG_EVENTS_PER_SECOND,
             )
             self._log_last = now
-            if self._log_tokens < 1 or self._log_bytes >= MAX_LOG_BYTES:
+            if self._log_tokens < 1:
                 if required:
-                    raise GatewayLifecycleError("gateway audit rate or storage limit exhausted")
+                    raise GatewayLifecycleError("gateway audit rate limit exhausted")
+                return
+            if self._log_bytes >= MAX_LOG_BYTES:
+                if required:
+                    raise GatewayLifecycleError("gateway audit storage limit exhausted")
                 return
             self._log_tokens -= 1
             if required:
@@ -1735,15 +1846,43 @@ class GatewayController:
             os.close(fd)
             raise
 
+    def _record_audit_failure(self, detail: dict[str, Any], error: GatewayLifecycleError) -> None:
+        detail = _validated_audit_failure(detail, self.generation)
+        with self._audit_failure_lock:
+            if self._audit_failure_detail is not None:
+                return
+            self._audit_failure_detail = detail
+            self._audit_failure_at = datetime.now(UTC).isoformat()
+            # Publish failure before any best-effort filesystem operation can block.
+            self._audit_failure = error
+        if self.directory is not None:
+            with suppress(OSError, GatewayStateError):
+                _atomic_json(self.directory, "audit-failure.json", detail)
+
     def _sync_audit(self, destination: BinaryIO) -> None:
-        destination.flush()
-        os.fsync(destination.fileno())
+        for stage, operation in (
+            ("flush", destination.flush),
+            ("sync", lambda: os.fsync(destination.fileno())),
+        ):
+            self._audit_sync_stage = stage
+            started = self._audit_sync_started = time.monotonic()
+            try:
+                operation()
+            finally:
+                self._audit_stage_us[stage] = int((time.monotonic() - started) * 1_000_000)
         if sys.platform == "darwin":
+            self._audit_sync_stage = "full_sync"
             if not hasattr(fcntl, "F_FULLFSYNC"):
                 raise GatewayLifecycleError("durable audit sync unavailable")
-            fcntl.fcntl(destination.fileno(), fcntl.F_FULLFSYNC)
+            started = self._audit_sync_started = time.monotonic()
+            try:
+                fcntl.fcntl(destination.fileno(), fcntl.F_FULLFSYNC)
+            finally:
+                self._audit_stage_us["full_sync"] = int((time.monotonic() - started) * 1_000_000)
         assert self.directory is not None
         if not self._audit_directory_synced:
+            self._audit_sync_stage = "directory_sync"
+            self._audit_sync_started = time.monotonic()
             # Persist newly created generation/state ancestors as well as the log entry.
             for directory in (self.directory, *self.directory.parents):
                 directory_fd = os.open(
@@ -1754,6 +1893,9 @@ class GatewayController:
                     os.fsync(directory_fd)
                 finally:
                     os.close(directory_fd)
+            self._audit_stage_us["directory_sync"] = int(
+                (time.monotonic() - self._audit_sync_started) * 1_000_000
+            )
             self._audit_directory_synced = True
 
     def _route_audit(
@@ -1766,9 +1908,15 @@ class GatewayController:
         def route() -> None:
             buffered = bytearray()
             operation = "read"
+            started = time.monotonic()
+            stage_started = started
+            record = None
+            incoming_detail = None
+            self._audit_stage_us = {}
             try:
                 while True:
                     operation = "read"
+                    stage_started = time.monotonic()
                     chunk = os.read(source.fileno(), MAX_LOG_EVENT_BYTES)
                     if not chunk:
                         break
@@ -1782,10 +1930,21 @@ class GatewayController:
                                 "gateway audit event exceeds transport memory limit"
                             )
                         operation = "decode"
+                        started = stage_started = time.monotonic()
+                        self._audit_stage_us = {}
                         record = json.loads(event)
                         if not isinstance(record, dict) or record.get("version") not in (1, 2):
                             raise GatewayLifecycleError("invalid gateway audit record")
                         if "audit_error" in record:
+                            if "failure" in record:
+                                try:
+                                    incoming_detail = _validated_audit_failure(
+                                        record["failure"], self.generation, incarnation
+                                    )
+                                except GatewayStateError:
+                                    raise GatewayLifecycleError(
+                                        "invalid mediator audit failure detail"
+                                    ) from None
                             raise GatewayLifecycleError("mediator audit delivery failed")
                         if record.get("version") == 2 and (
                             record.get("event") not in ("admitted", "outcome")
@@ -1801,17 +1960,24 @@ class GatewayController:
                                 "audit admission acknowledgement unavailable"
                             )
                         operation = "append"
+                        stage_started = time.monotonic()
                         self._emit_log(destination, event, required=True)
+                        self._audit_stage_us["append"] = int(
+                            (time.monotonic() - stage_started) * 1_000_000
+                        )
                         if admitted:
                             operation = "sync"
+                            self._audit_sync_stage = "sync"
+                            stage_started = self._audit_sync_started = time.monotonic()
                             self._sync_audit(destination)
                             operation = "acknowledgement"
+                            stage_started = time.monotonic()
                             ack = {
                                 key: record[key]
                                 for key in ("version", "generation", "incarnation", "request_id")
                             }
                             raw = (json.dumps(ack, ensure_ascii=True) + "\n").encode()
-                            if len(raw) > 4096 or not select.select([], [ack_fd], [], 1.0)[1]:
+                            if len(raw) > 4096 or not select.select([], [ack_fd], [], 5.0)[1]:
                                 raise GatewayLifecycleError("audit acknowledgement timed out")
                             if os.write(ack_fd, raw) != len(raw):
                                 raise GatewayLifecycleError("audit acknowledgement interrupted")
@@ -1821,15 +1987,50 @@ class GatewayController:
                         )
                 if buffered:
                     raise GatewayLifecycleError("gateway audit record interrupted")
-            except (OSError, ValueError, GatewayLifecycleError) as exc:
+            except (OSError, ValueError, RecursionError, GatewayLifecycleError) as exc:
                 reason = (
                     str(exc)
                     if isinstance(exc, GatewayLifecycleError)
                     else "invalid audit record encoding"
-                    if isinstance(exc, ValueError)
+                    if isinstance(exc, (ValueError, RecursionError))
                     else f"audit sink I/O failed (operation={operation}, errno={exc.errno})"
                 )
-                self._audit_failure = GatewayLifecycleError(reason)
+                category = "io_error" if isinstance(exc, OSError) else "framing"
+                if isinstance(exc, GatewayLifecycleError):
+                    category = {
+                        "mediator audit delivery failed": "delivery_failed",
+                        "invalid gateway audit identity": "identity",
+                        "audit admission acknowledgement unavailable": "eof",
+                        "audit acknowledgement timed out": "deadline",
+                        "audit acknowledgement interrupted": "interrupted",
+                        "gateway audit record interrupted": "interrupted",
+                        "gateway audit rate limit exhausted": "rate_limit",
+                        "gateway audit storage limit exhausted": "storage_limit",
+                        "gateway audit event exceeds transport memory limit": "event_limit",
+                        "durable audit sync unavailable": "sync_unavailable",
+                    }.get(str(exc), "framing")
+                if operation == "sync":
+                    operation = self._audit_sync_stage
+                    stage_started = self._audit_sync_started
+                self._audit_stage_us.setdefault(
+                    operation, int((time.monotonic() - stage_started) * 1_000_000)
+                )
+                request_id = record.get("request_id") if isinstance(record, dict) else None
+                detail = incoming_detail or {
+                    "version": 1,
+                    "component": "controller",
+                    "generation": self.generation,
+                    "incarnation": incarnation,
+                    "operation": operation,
+                    "reason": category,
+                    "errno": exc.errno if isinstance(exc, OSError) else None,
+                    "elapsed_us": int((time.monotonic() - started) * 1_000_000),
+                    "stage_us": dict(self._audit_stage_us),
+                    "request_id_hash": hashlib.sha256(request_id.encode()).hexdigest()
+                    if isinstance(request_id, str)
+                    else None,
+                }
+                self._record_audit_failure(detail, GatewayLifecycleError(reason))
                 print(
                     f"sbx: {reason}; stopping gateway (see network diagnostics)",
                     file=sys.stderr,
@@ -3089,6 +3290,9 @@ def drain(vm_id: str, *, root: Path | None = None) -> None:
 
 
 def _rollback_state_directory(directory: Path, *, ownership_fd: int | None = None) -> None:
+    if read_audit_failure(directory) is not None:
+        _preserve_stopped_state(directory, ownership_fd=ownership_fd)
+        return
     audit = directory / "audit.log"
     if audit.exists() or audit.is_symlink():
         info = audit.lstat()
@@ -3426,6 +3630,20 @@ def diagnostic_lines(
     )
     failure = state["last_failure"]
     failure_detail = "-" if failure is None else f"{failure['component']}/{failure['code']}"
+    audit_lines = []
+    try:
+        detail = live.get("audit_failure") if live is not None else None
+        if detail is not None:
+            detail = _validated_audit_failure(detail, state["generation"])
+        else:
+            detail = read_audit_failure(_state_root(root) / vm_id / state["generation"])
+        if detail is not None:
+            audit_lines = [
+                f"Gateway audit failure: {detail['component']}/{detail['operation']}/"
+                f"{detail['reason']}, errno={detail['errno']}, elapsed_us={detail['elapsed_us']}"
+            ]
+    except (OSError, GatewayStateError):
+        audit_lines = ["Gateway audit failure detail: unavailable (unsafe or corrupt)"]
     return [
         f"Gateway: enabled{platform_note}",
         f"Gateway state: {status}",
@@ -3442,6 +3660,7 @@ def diagnostic_lines(
         f"Gateway ingress: {listeners}",
         f"Gateway counters: {counters}",
         f"Gateway last failure: {failure_detail}",
+        *audit_lines,
         f"Gateway audit log: {_state_root(root) / vm_id / state['generation'] / 'audit.log'}",
         *_web_diagnostic_lines(vm_id, state, root=root),
     ]

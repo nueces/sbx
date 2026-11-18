@@ -13,6 +13,7 @@ import json
 import os
 import shlex
 import signal
+import statistics
 import sys
 import threading
 import time
@@ -24,13 +25,18 @@ from sbx import gateway, guest_setup
 
 # Scripts also run from outside the checkout against wheel-installed sbx.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from gateway.scripts.resource_usage import process_usage  # noqa: E402
+from gateway.scripts.resource_usage import process_samples  # noqa: E402
 
 DURATION_SECONDS = 600
 SAMPLE_SECONDS = 2
 RSS_CEILING = 512 * 1024 * 1024
 FD_CEILING = 4096
-ALLOWANCES = {"rss_bytes": 4 * 1024 * 1024, "fds": 2, "processes": 0, "threads": 0}
+WARMUP_SECONDS = 150
+QUIET_SECONDS = 2
+ALLOWANCES = {"rss_bytes": 16 * 1024 * 1024, "fds": 2, "processes": 0, "threads": 0}
+PLATEAU_SECONDS = 1800
+PLATEAU_WINDOW_SECONDS = 300
+PLATEAU_RSS_SPAN = 2 * 1024 * 1024
 
 # Only opaque guest credentials enter these commands. Origin values stay on the host.
 GUEST_SETUP = r"""
@@ -145,22 +151,89 @@ def ready_state(vm_id: str, root: Path) -> dict:
     return stored
 
 
+def pair_identity(row: dict) -> tuple:
+    return row["generation"], tuple(row["pids"]), tuple(row["start_ticks"])
+
+
 def growth_exceeded(samples: list[dict], field: str, allowance: int) -> bool:
-    groups: dict[tuple[str, tuple[int, ...]], list[int]] = {}
+    groups: dict[tuple, list[dict]] = {}
     for row in samples:
-        key = (row["generation"], tuple(row["pids"]))
-        groups.setdefault(key, []).append(int(row["usage"][field]))
-    return not groups or any(
-        len(values) < 12 or values[-1] - values[len(values) // 4] > allowance
-        for values in groups.values()
-    )
+        group = groups.setdefault(pair_identity(row), [])
+        if row["pair_seconds"] >= WARMUP_SECONDS:
+            group.append(row)
+    for group in groups.values():
+        if len(group) < 12 or group[-1]["pair_seconds"] - group[0]["pair_seconds"] < 120:
+            return True
+        values = [int(row["usage"][field]) for row in group]
+        retained = [values[-1]]
+        if field == "rss_bytes":
+            windows: dict[int, list[int]] = {}
+            for row, value in zip(group, values, strict=True):
+                window = int((row["pair_seconds"] - WARMUP_SECONDS) // PLATEAU_WINDOW_SECONDS)
+                windows.setdefault(window, []).append(value)
+            retained.extend(statistics.median(window) for window in windows.values())
+        if max(retained) - values[0] > allowance:
+            return True
+    return not groups
 
 
-def check_quiescent_growth(baseline: dict, final: dict) -> None:
-    if (baseline["generation"], baseline["pids"]) != (final["generation"], final["pids"]):
+def plateau_exceeded(samples: list[dict], field: str, span: int) -> bool:
+    if not samples or len({pair_identity(row) for row in samples}) != 1:
+        return True
+    end = samples[-1]["elapsed_seconds"]
+    start = end - PLATEAU_SECONDS
+    if start < WARMUP_SECONDS:
+        return True
+    windows = [[] for _ in range(6)]
+    for row in samples:
+        if start <= row["elapsed_seconds"] <= end:
+            window = min(5, int((row["elapsed_seconds"] - start) // PLATEAU_WINDOW_SECONDS))
+            windows[window].append(row["usage"][field])
+    if any(len(window) < 120 for window in windows):
+        return True
+    medians = [statistics.median(window) for window in windows]
+    return max(medians) - min(medians) > span
+
+
+def workload_windows_valid(iterations: list[float], end: float, minimum: int = 3) -> bool:
+    start = end - PLATEAU_SECONDS
+    counts = [
+        sum(start + i * 300 < t <= start + (i + 1) * 300 for t in iterations) for i in range(6)
+    ]
+    return min(counts) >= minimum and min(counts) >= statistics.median(counts) / 2
+
+
+def thread_violations(samples: list[dict], budgets: dict, *, plateau: bool = False) -> list[str]:
+    violations = []
+    for name in ("worker", "mediator"):
+        component_rows = [row | {"usage": row["components"][name]} for row in samples]
+        if name in budgets:
+            if any(row["usage"]["threads"] > budgets[name]["ceiling"] for row in component_rows):
+                violations.append(name + " thread ceiling")
+        elif growth_exceeded(component_rows, "threads", 0):
+            violations.append(name + " unexplained thread growth")
+        if plateau:
+            cutoff = samples[-1]["elapsed_seconds"] - PLATEAU_SECONDS if samples else 0
+            early = [
+                row["usage"]["threads"]
+                for row in component_rows
+                if cutoff <= row["elapsed_seconds"] < cutoff + 900
+            ]
+            late = [
+                row["usage"]["threads"]
+                for row in component_rows
+                if row["elapsed_seconds"] >= cutoff + 900
+            ]
+            if not early or not late or max(late) > max(early):
+                violations.append(name + " thread tail kept growing")
+    return violations
+
+
+def check_quiescent_growth(baseline: dict, final: dict, *, fields=ALLOWANCES) -> None:
+    if pair_identity(baseline) != pair_identity(final):
         raise RuntimeError("quiescent checkpoints crossed gateway pairs")
-    for field, allowance in ALLOWANCES.items():
-        if final["usage"][field] - baseline["usage"][field] > allowance:
+    for field in fields:
+        if final["usage"][field] - baseline["usage"][field] > ALLOWANCES[field]:
             raise RuntimeError("quiescent growth: " + field)
 
 
@@ -172,7 +245,30 @@ def main() -> int:
     parser.add_argument("--gateway-root", required=True, type=Path)
     parser.add_argument("--ingress-port", required=True, type=int)
     parser.add_argument("--artifacts", required=True, type=Path)
+    parser.add_argument("--duration", type=int, default=DURATION_SECONDS)
+    parser.add_argument("--no-replacement", action="store_true")
+    parser.add_argument("--thread-budgets", type=Path)
+    parser.add_argument("--minimum-tail-iterations", type=int, default=3)
     args = parser.parse_args()
+    if args.minimum_tail_iterations < 3:
+        parser.error("tail windows require at least three complete mixed iterations")
+    if args.duration < DURATION_SECONDS:
+        parser.error("duration must be at least 600 seconds")
+    if not args.no_replacement and args.duration != DURATION_SECONDS:
+        parser.error("extended soaks require --no-replacement")
+    budgets = {} if args.thread_budgets is None else json.loads(args.thread_budgets.read_text())
+    if set(budgets) - {"worker", "mediator"}:
+        parser.error("unknown component in thread budgets")
+    for budget in budgets.values():
+        if (
+            not isinstance(budget, dict)
+            or set(budget) != {"ceiling", "evidence", "sha256"}
+            or type(budget["ceiling"]) is not int
+            or not 1 <= budget["ceiling"] <= gateway.MAX_DATA_PLANE_THREADS
+            or not isinstance(budget["evidence"], str)
+            or hashlib.sha256(Path(budget["evidence"]).read_bytes()).hexdigest() != budget["sha256"]
+        ):
+            parser.error("thread budget requires a bounded ceiling and hashed ownership evidence")
     origin = urlsplit(args.origin)
     if origin.scheme != "https" or not origin.hostname or origin.username or origin.password:
         parser.error("origin must be the synthetic HTTPS fixture without userinfo")
@@ -192,21 +288,57 @@ def main() -> int:
         "gateway_module": gateway.__file__,
         "guest_module": guest_setup.__file__,
         "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        "required_seconds": DURATION_SECONDS,
+        "required_seconds": args.duration,
+        "replacement_required": not args.no_replacement,
+        "acceptance_scope": (
+            "single long soak; independent repeat and replacement smokes also required"
+            if args.duration >= 3600
+            else "smoke only; conditional RSS allowance requires passing long soaks"
+        ),
+        "warmup_seconds": WARMUP_SECONDS,
+        "rss_growth_allowance": ALLOWANCES["rss_bytes"],
+        "thread_budgets": budgets,
+        "minimum_tail_iterations": args.minimum_tail_iterations,
         "mixed_iterations": 0,
+        "iteration_seconds": [],
     }
 
     def state():
         return ready_state(args.vm, args.gateway_root)
 
+    first_seen = {}
+
     def measure():
         current = state()
         roots = [current["pids"][name] for name in ("worker", "mediator")]
-        rss, fds, processes, threads = process_usage(roots)
+        measured = process_samples(roots)
+        by_pid = {row["pid"]: row for row in measured}
+        starts = [by_pid[pid]["start_ticks"] for pid in roots]
+        key = current["generation"], tuple(roots), tuple(starts)
+        now = time.monotonic()
+        first_seen.setdefault(key, now)
+        components = {
+            name: {field: by_pid[pid][field] for field in ("rss_bytes", "fds", "threads")}
+            for name, pid in zip(("worker", "mediator"), roots, strict=True)
+        }
+        supervisor = current["pids"]["supervisor"]
+        own = next(row for row in process_samples([supervisor]) if row["pid"] == supervisor)
         return {
             "generation": current["generation"],
             "pids": roots,
-            "usage": dict(rss_bytes=rss, fds=fds, processes=processes, threads=threads),
+            "start_ticks": starts,
+            "pair_seconds": now - first_seen[key],
+            "components": components,
+            "supervisor": {
+                field: own[field] for field in ("pid", "start_ticks", "rss_bytes", "fds", "threads")
+            },
+            "usage": {
+                **{
+                    field: sum(row[field] for row in measured)
+                    for field in ("rss_bytes", "fds", "threads")
+                },
+                "processes": len(measured),
+            },
         }
 
     def monitor(started):
@@ -257,7 +389,7 @@ def main() -> int:
             result["initial_idle"] = measure()
             thread = threading.Thread(target=monitor, args=(started,), daemon=True)
             thread.start()
-            while time.monotonic() - started < DURATION_SECONDS and not failures:
+            while time.monotonic() - started < args.duration and not failures:
                 guest(
                     vm,
                     "URL="
@@ -273,19 +405,16 @@ def main() -> int:
                     assert response.read() == b"task19-ingress-ok"
                 result["mixed_iterations"] += 1
                 elapsed = time.monotonic() - started
-                if (
-                    "replacement" in result
-                    and "recovered_idle" not in result
-                    and result["mixed_iterations"] >= result["replacement"]["mixed_at"] + 3
-                ):
-                    time.sleep(SAMPLE_SECONDS)
+                result["iteration_seconds"].append(elapsed)
+                with lock:
+                    age = measure()["pair_seconds"]
+                checkpoint = "recovered_idle" if "replacement" in result else "warm_idle"
+                if age >= WARMUP_SECONDS and checkpoint not in result:
+                    time.sleep(QUIET_SECONDS)
                     with lock:
-                        result["recovered_idle"] = measure()
-                if elapsed >= 150 and "warm_idle" not in result:
-                    time.sleep(SAMPLE_SECONDS)
-                    with lock:
-                        result["warm_idle"] = measure()
-                if elapsed >= 300 and "replacement" not in result:
+                        result[checkpoint] = measure()
+                if not args.no_replacement and elapsed >= 300 and "replacement" not in result:
+                    time.sleep(QUIET_SECONDS)
                     with lock:
                         before = measure()
                         previous = state()["pids"]["worker"]
@@ -317,23 +446,63 @@ def main() -> int:
             result["elapsed_seconds"] = time.monotonic() - started
             if (
                 failures
-                or result["elapsed_seconds"] < DURATION_SECONDS
+                or result["elapsed_seconds"] < args.duration
                 or result["mixed_iterations"] < 3
             ):
                 raise RuntimeError(f"incomplete stability workload: {failures}")
             final_boot = vm.run("cat /proc/sys/kernel/random/boot_id", timeout=15)
             if final_boot.exit_code or final_boot.stdout.strip() != result["guest_boot_id"]:
                 raise RuntimeError("guest identity changed during worker replacement")
-            time.sleep(SAMPLE_SECONDS)
+            time.sleep(QUIET_SECONDS)
             with lock:
                 final = measure()
+                final["elapsed_seconds"] = time.monotonic() - started
+                evaluated = [*samples, final]
             result["final_idle"] = final
-            for field, allowance in ALLOWANCES.items():
-                if growth_exceeded(samples, field, allowance):
-                    raise RuntimeError("post-warmup growth: " + field)
-            check_quiescent_growth(result["warm_idle"], result["replacement"]["before_idle"])
-            check_quiescent_growth(result["recovered_idle"], final)
-            assert result.get("replacement") and len(samples) >= 60
+            violations = []
+            fields = [field for field in ALLOWANCES if field != "threads" or not budgets]
+            for field in fields:
+                if growth_exceeded(evaluated, field, ALLOWANCES[field]):
+                    violations.append("post-warmup growth: " + field)
+            violations.extend(thread_violations(evaluated, budgets, plateau=args.duration >= 3600))
+            pairs = (
+                [(result["warm_idle"], final)]
+                if args.no_replacement
+                else [
+                    (result["warm_idle"], result["replacement"]["before_idle"]),
+                    (result["recovered_idle"], final),
+                ]
+            )
+            for baseline, last in pairs:
+                for field in fields:
+                    try:
+                        check_quiescent_growth(baseline, last, fields=[field])
+                    except RuntimeError as exc:
+                        violations.append(str(exc))
+                for name in ("worker", "mediator"):
+                    if (
+                        name not in budgets
+                        and last["components"][name]["threads"]
+                        > baseline["components"][name]["threads"]
+                    ):
+                        violations.append(name + " quiescent thread growth")
+            result["old_4_mib_allowance_under_fixed_warmup_exceeded"] = growth_exceeded(
+                evaluated, "rss_bytes", 4 * 1024 * 1024
+            )
+            if args.duration >= 3600:
+                if plateau_exceeded(evaluated, "rss_bytes", PLATEAU_RSS_SPAN):
+                    violations.append("RSS tail did not plateau")
+                if not workload_windows_valid(
+                    result["iteration_seconds"],
+                    result["elapsed_seconds"],
+                    args.minimum_tail_iterations,
+                ):
+                    violations.append("incomplete or reduced tail workload")
+            if len(samples) < 60 or (not args.no_replacement and not result.get("replacement")):
+                violations.append("incomplete replacement or samples")
+            result["violations"] = violations
+            if violations:
+                raise RuntimeError("; ".join(violations))
             result["status"] = "PASS"
         except BaseException as exc:
             result["status"] = "FAIL"

@@ -408,20 +408,34 @@ def _serve(controller: gateway.GatewayController, server: socket.socket) -> None
                     return
                 else:
                     raise gateway.GatewayLifecycleError("unknown gateway control operation")
-                state = gateway.read_state(controller.directory)  # type: ignore[arg-type]
-                send_frame(
-                    client,
-                    {
-                        "version": 1,
-                        "generation": controller.generation,
-                        "status": state["status"],
-                        "config_digest": getattr(
-                            controller, "_requested_config_digest", state["config_digest"]
-                        ),
-                        "counters": state["counters"],
-                        "last_failure": state["last_failure"],
-                    },
-                )
+                detail = getattr(controller, "_audit_failure_detail", None)
+                if detail is None:
+                    state = gateway.read_state(controller.directory)  # type: ignore[arg-type]
+                else:
+                    # The failed filesystem must not be needed to report a cached failure.
+                    state = {
+                        "status": "failed",
+                        "config_digest": controller._requested_config_digest,
+                        "counters": {},
+                        "last_failure": {
+                            "component": "controller",
+                            "code": "audit_failed",
+                            "at": controller._audit_failure_at,
+                        },
+                    }
+                response = {
+                    "version": 1,
+                    "generation": controller.generation,
+                    "status": state["status"],
+                    "config_digest": getattr(
+                        controller, "_requested_config_digest", state["config_digest"]
+                    ),
+                    "counters": state["counters"],
+                    "last_failure": state["last_failure"],
+                }
+                if operation == "diagnostics" and detail is not None:
+                    response["audit_failure"] = detail
+                send_frame(client, response)
             except Exception as exc:  # control errors are bounded and secret-free
                 if shutdown_complete:
                     # A failed final reply must not leave a stopped supervisor owning the lock.

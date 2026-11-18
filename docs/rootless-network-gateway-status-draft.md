@@ -91,7 +91,7 @@ Admission without an outcome means **execution unknown**: a crash may occur befo
 
 The guarantee covers mediated HTTP requests, not TLS passthrough, non-HTTP traffic, DNS or connection establishment. It relies on the host storage honoring sync semantics. Subsequent request-body validation may still deny an admitted request.
 
-Limits remain 1 MiB per serialized event, a one-second end-to-end admission deadline including lock/transport/acknowledgement, a 4 KiB acknowledgement cap, 100 MiB aggregate per-generation logs, and 1,000 records/second with a 2,000-record burst. Admission and outcome each consume byte/rate budgets; these are failure boundaries, not truncation limits. Durable syncs are serialized without batching or new configuration.
+Limits remain 1 MiB per serialized event, a five-second end-to-end admission deadline including lock/transport/acknowledgement (user-approved early-adoption revision on 2026-11-18; earlier one-second campaign failures remain historical), a 4 KiB acknowledgement cap, 100 MiB aggregate per-generation logs, and 1,000 records/second with a 2,000-record burst. Admission and outcome each consume byte/rate budgets; these are failure boundaries, not truncation limits. Durable syncs are serialized without batching or new configuration.
 
 ## UI integration scope
 
