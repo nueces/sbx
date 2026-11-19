@@ -16,7 +16,7 @@ done
 build() {
   local goos="$1" goarch="$2"
   CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" "$GO" -C "$root/gateway" build \
-    -trimpath -ldflags='-s -w' \
+    -trimpath -buildvcs=false -ldflags='-s -w' \
     -o "$out/bin/sbx-gateway-$goos-$goarch" ./cmd/sbx-gateway
   chmod 0555 "$out/bin/sbx-gateway-$goos-$goarch"
 }
