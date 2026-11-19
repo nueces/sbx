@@ -23,16 +23,16 @@ This guide describes the current development checkout. Gateway support is absent
 | --- | --- |
 | Linux amd64 | Functional gateway and isolated TCG tests have passed. This is not blanket release or long-duration acceptance. |
 | macOS amd64 / arm64 | Workers cross-build; native runtime and weaker Darwin confinement remain unverified. |
-| Dependency security | Last recorded check: 2026-11-11. The Tornado/mitmproxy compatibility conflict remains unresolved here, not freshly re-audited; see [upgrade gates](dependency-upgrade.md). |
+| Dependency security | Tornado advisories remain unfixed. Four CI-reported IDs have a user-approved development-only exception; stable versions retain the full audit gate. See [exception scope and upgrade gates](dependency-upgrade.md#experimental-audit-exception). |
 | Intel macOS installation | Last checked 2026-11-11: the locked secure Cryptography release lacked a wheel. Cross-building Go does not clear this gate. |
 | Reliability / performance | Fresh complete final-artifact long-soak and reference-performance acceptance remain open. A functional smoke or bounded RSS snapshot is not full acceptance; a small stable thread increase is not itself proof of a leak. |
 | Distribution / images | Licensing/notices decisions and manual booted-image Landlock verification remain separate gates. |
 
-No dependency exception, shared launcher or release approval is implied. Runtime gateway processes need no sudo or network capabilities; image building and isolated integration-test setup have different prerequisites. [Contributor validation](development.md) documents those separately.
+Only the documented development-only Tornado exception is approved; no other dependency, platform, distribution or performance gate is waived. This is not stable-release clearance. Runtime gateway processes need no sudo or network capabilities; image building and isolated integration-test setup have different prerequisites. [Contributor validation](development.md) documents those separately.
 
 ## Runtime provisioning
 
-The package installation provides mitmproxy and the mediator dependencies from the root lock. Gateway startup uses the installed `sbx` interpreter; it does not invoke uv, download Python or packages, or create a per-VM virtual environment. CPython 3.12 is the supported baseline; newer versions are best effort. Mitmproxy is pinned to the numbered PyPI release 12.3.1. The last recorded audit blocks release on Tornado vulnerabilities; this is not a fresh security assessment. See [dependency upgrades](dependency-upgrade.md).
+The package installation provides mitmproxy and the mediator dependencies from the root lock. Gateway startup uses the installed `sbx` interpreter; it does not invoke uv, download Python or packages, or create a per-VM virtual environment. CPython 3.12 is the supported baseline; newer versions are best effort. Mitmproxy is pinned to the numbered PyPI release 12.3.1. Known Tornado vulnerabilities still block stable release; the documented development-only exception accepts their risk without fixing them. This is not a fresh security clearance. See [dependency upgrades](dependency-upgrade.md).
 
 Installed-file and dependency integrity are left to the package installer and OS. Gateway startup still probes required QEMU capabilities. No source build, compiler, runtime download, TAP/TUN device, sudo, capability, setuid helper, or host firewall rule is part of runtime setup. `SBX_GATEWAY_BIN` remains available for selecting a separately built worker. The mediator always uses the installed `sbx` interpreter and packaged launcher; `mitmdump` resolves through the initiating CLI's normal `PATH` ordering, which the persistent supervisor retains without inheriting any other environment values.
 
@@ -261,7 +261,7 @@ Guest-facing policy/credential denials now use HTTP 403 with a fixed empty body.
 ## Release checklist
 
 1. Build Linux amd64 and Darwin amd64/arm64 workers.
-2. Verify the root lock resolves wheel-only for supported Linux and Darwin targets and passes `uv audit`.
+2. Verify the root lock resolves wheel-only for supported Linux and Darwin targets. Apply the [documented audit policy](dependency-upgrade.md#experimental-audit-exception); stable candidates must pass `uv audit --locked` without exceptions.
 3. Run the fast, mediator, Go/race and explicit-TCG integration checks in [development](development.md), then the [operator smoke](rootless-network-gateway-manual-validation.md). Record long-duration/performance and native-platform results separately; missing required results remain open.
 4. Run help/completion/doc example parse checks, tests, ruff, Go tests, audits, and `git diff --check`.
 5. Record macOS as unverified unless it was actually run.

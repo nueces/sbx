@@ -43,7 +43,7 @@ jobs:
           test -x "$worker"
           test "$("$worker" 2>&1 || true)" = "sbx-gateway: --config must be an absolute path"
           uv sync --locked --no-build --no-dev --no-install-project --python 3.12
-          uv audit --locked
+          python .github/scripts/audit_dependencies.py
           uv run --extra dev pytest --no-cov gateway/mediator
 
       - name: Run Go tests
