@@ -144,6 +144,7 @@ class Credential:
     inherit_environment: tuple[str, ...]
     bindings: tuple[CredentialBinding, ...]
     header: Mapping[str, Any] | None = None
+    fetch: str = "lazy"
 
 
 @dataclass(frozen=True)
@@ -185,6 +186,11 @@ class GatewayConfig:
     def canonical(self, vm_id: str, generation: str) -> dict[str, Any]:
         _validate_id(vm_id, "VM identity")
         _validate_id(generation, "gateway generation")
+        credentials = [asdict(credential) for credential in self.credentials]
+        for credential in credentials:
+            # Keep existing configuration digests stable when eager fetching is disabled.
+            if credential["fetch"] == "lazy":
+                del credential["fetch"]
         return {
             "version": 1,
             "vm_id": vm_id,
@@ -193,7 +199,7 @@ class GatewayConfig:
             "platform": self.platform,
             "mitmweb": self.mitmweb,
             "rules": [asdict(rule) for rule in self.rules],
-            "credentials": [asdict(credential) for credential in self.credentials],
+            "credentials": credentials,
             "ingress": [asdict(rule) for rule in self.ingress if rule.source != "controller"],
             "quotas": asdict(self.quotas),
             "reconnection": asdict(self.reconnection),
@@ -532,7 +538,10 @@ def _binding(item: Mapping[str, Any], label: str) -> CredentialBinding:
 
 def _credential(item: Mapping[str, Any], index: int) -> Credential:
     label = "[[network.credential]]"
-    _reject_unknown(item, {"id", "environment", "method", "options", "bindings"}, label)
+    _reject_unknown(item, {"id", "environment", "method", "options", "bindings", "fetch"}, label)
+    fetch = item.get("fetch", "lazy")
+    if not isinstance(fetch, str) or fetch not in {"startup", "lazy"}:
+        raise ConfigError(f'{label}.fetch must be "startup" or "lazy"')
     credential_id = item.get("id")
     environment = item.get("environment")
     method = item.get("method")
@@ -574,7 +583,15 @@ def _credential(item: Mapping[str, Any], index: int) -> Credential:
     )
     if method == "command" and any(binding.header is None for binding in bindings):
         raise ConfigError("command credential bindings require an explicit header")
-    return Credential(credential_id, environment, str(method), options, tuple(inherited), bindings)
+    return Credential(
+        credential_id,
+        environment,
+        str(method),
+        options,
+        tuple(inherited),
+        bindings,
+        fetch=fetch,
+    )
 
 
 def _listen(value: object, label: str) -> tuple[str, int]:
@@ -3142,7 +3159,16 @@ class PersistentGatewayController:
                     self.directory, path=os.environ.get("PATH", os.defpath)
                 ),
             )
-            response = gateway_supervisor.recv_frame(parent, self.timeout)
+            startup_fetches = sum(
+                1
+                for credential in self.config.credentials
+                if credential.fetch == "startup" and credential.bindings
+            )
+            response = gateway_supervisor.recv_frame(
+                parent,
+                self.timeout
+                + startup_fetches * gateway_supervisor.STARTUP_PROVIDER_TIMEOUT_SECONDS,
+            )
             if (
                 response.get("status") != "prepared"
                 or response.get("generation") != self.generation

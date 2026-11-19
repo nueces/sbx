@@ -1766,10 +1766,12 @@ def test_control_rejects_wrong_uid_and_remains_available(
     assert not thread.is_alive()
 
 
+@pytest.mark.parametrize("prefetch_failure", [False, True])
 def test_supervisor_run_completes_two_phase_bootstrap(
     lifecycle_config: gateway.GatewayConfig,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    prefetch_failure: bool,
 ) -> None:
     runtime_directory = gateway._create_runtime_directory("generation1", root=tmp_path / "runtime")
     directory = gateway.create_state(
@@ -1807,6 +1809,14 @@ def test_supervisor_run_completes_two_phase_bootstrap(
     os.close(provider_write)
     parent, child = socket.socketpair()
     instances: list[Any] = []
+    steps: list[str] = []
+
+    def prefetch(_broker: object) -> None:
+        steps.append("prefetch")
+        if prefetch_failure:
+            raise gateway.GatewayLifecycleError("startup credential unavailable")
+
+    monkeypatch.setattr(gateway_supervisor.CredentialBroker, "prefetch", prefetch)
 
     class Controller:
         def __init__(self, config: object, vm_id: str, **kwargs: object) -> None:
@@ -1827,6 +1837,8 @@ def test_supervisor_run_completes_two_phase_bootstrap(
 
         def _start_data_plane(self, deadline: float) -> None:
             assert deadline > time.monotonic()
+            assert steps == ["prefetch"]
+            steps.append("data-plane")
 
         def _process_ids(self) -> dict[str, int]:
             return {"worker": os.getpid(), "mediator": os.getpid()}
@@ -1855,21 +1867,28 @@ def test_supervisor_run_completes_two_phase_bootstrap(
     )
     thread.start()
     try:
-        assert gateway_supervisor.recv_frame(parent, 2)["status"] == "prepared"
-        gateway_supervisor.send_frame(
-            parent,
-            {
-                "version": 1,
-                "generation": "generation1",
-                "operation": "commit",
-                "qemu_pid": 123,
-                "timeout": 1,
-            },
-        )
-        assert gateway_supervisor.recv_frame(parent, 2)["status"] == "ready"
+        response = gateway_supervisor.recv_frame(parent, 2)
+        if prefetch_failure:
+            assert response["error"] == "startup credential unavailable"
+            assert steps == ["prefetch"]
+            assert not hasattr(instances[0], "_mediator_policy_payload")
+        else:
+            assert response["status"] == "prepared"
+            assert steps == ["prefetch", "data-plane"]
+            assert instances[0]._mediator_policy_payload.startswith(b'{"version":2')
+            gateway_supervisor.send_frame(
+                parent,
+                {
+                    "version": 1,
+                    "generation": "generation1",
+                    "operation": "commit",
+                    "qemu_pid": 123,
+                    "timeout": 1,
+                },
+            )
+            assert gateway_supervisor.recv_frame(parent, 2)["status"] == "ready"
         thread.join(2)
-        assert result == [0]
-        assert instances[0]._mediator_policy_payload.startswith(b'{"version":2')
+        assert result == [1 if prefetch_failure else 0]
     finally:
         parent.close()
         child.close()
@@ -1903,8 +1922,9 @@ def test_supervisor_run_rejects_invalid_inherited_payload(tmp_path: Path) -> Non
 
 
 @pytest.mark.parametrize("sanitized", [False, True])
+@pytest.mark.parametrize("fetch", ["lazy", "startup"])
 def test_persistent_bootstrap_uses_fresh_subprocess_and_inherited_provider_fd(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sanitized: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sanitized: bool, fetch: str
 ) -> None:
     monkeypatch.setenv("TASK33_TOKEN", "task33-source-value")
     monkeypatch.setenv("HOME", str(tmp_path / "real-home"))
@@ -1935,7 +1955,15 @@ def test_persistent_bootstrap_uses_fresh_subprocess_and_inherited_provider_fd(
         platform="linux",
     )
     assert config is not None
+    config = replace(config, credentials=(replace(config.credentials[0], fetch=fetch),))
     captured: dict[str, Any] = {}
+    recv_frame = gateway_supervisor.recv_frame
+
+    def receive(connection: socket.socket, timeout: float) -> dict[str, Any]:
+        captured["bootstrap_timeout"] = timeout
+        return recv_frame(connection, timeout)
+
+    monkeypatch.setattr(gateway_supervisor, "recv_frame", receive)
 
     class BootstrapProcess:
         pid = 999_999
@@ -1981,6 +2009,9 @@ def test_persistent_bootstrap_uses_fresh_subprocess_and_inherited_provider_fd(
     else:
         instance.prepare()
     try:
+        assert captured["bootstrap_timeout"] == 0.2 + (
+            gateway_supervisor.STARTUP_PROVIDER_TIMEOUT_SECONDS if fetch == "startup" else 0
+        )
         provider = json.loads(captured["provider"])
         assert provider["baseline"]["HOME"] == str(tmp_path / "real-home")
         assert provider["inherited"] == {

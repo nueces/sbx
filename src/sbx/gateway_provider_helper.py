@@ -35,7 +35,10 @@ def _plugin(name: str, operation: str, payload: dict[str, Any]) -> object:
 def _command(operation: str, payload: dict[str, Any]) -> object:
     if operation == "describe":
         return {"header": None}
-    result = run_bounded(payload["argv"])
+    if "timeout" in payload:
+        result = run_bounded(payload["argv"], timeout=payload["timeout"])
+    else:
+        result = run_bounded(payload["argv"])
     if result.returncode:
         raise RuntimeError("credential command failed")
     if payload["format"] == "text":

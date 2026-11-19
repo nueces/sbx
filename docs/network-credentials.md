@@ -66,6 +66,7 @@ A credential is an array entry with these core fields:
 - `environment`: guest environment variable that receives the placeholder.
 - `method`: `plugin:<entry-point-name>` or `command`.
 - `options`: method-specific TOML table.
+- `fetch`: optional string, `"lazy"` (default) or `"startup"`; fetch on first authorized use or before networking starts.
 
 Example:
 
@@ -85,7 +86,7 @@ policies = ["github-api", "github-uploads"]
 
 Each `options` and `bindings` table belongs to the most recent `[[network.credential]]` entry. The outer credential schema accepts no other fields. Actual credential values must never appear in options.
 
-A credential without bindings is not retrieved and its placeholder is not exported to the guest.
+A credential without bindings is not retrieved and its placeholder is not exported to the guest, even with `fetch = "startup"`.
 
 ### Placeholder security
 
@@ -151,7 +152,7 @@ provider.describe(credential_id, options) == {
 }
 ```
 
-Fetch is lazy and returns only the changing value and expiry:
+Fetch is lazy by default (or performed at startup when opted in) and returns only the changing value and expiry:
 
 ```python
 provider.fetch(credential_id, options) == {
@@ -177,6 +178,29 @@ Plugins are trusted host code installed in the sbx environment. Their descriptio
 ## Command methods
 
 Commands use an argv array and never a shell string.
+
+### Fetching at startup for authentication
+
+Set `fetch = "startup"` directly on the credential, not inside `options`. Omit it or use `fetch = "lazy"` to wait for the first authorized use. Only these two string values are accepted; this is not an array of triggers.
+
+```toml
+[[network.credential]]
+id = "github"
+environment = "GH_TOKEN"
+method = "command"
+fetch = "startup"
+options = { argv = ["op", "read", "op://Engineering/GitHub/token"], format = "text" }
+
+[[network.credential.bindings]]
+policies = ["github-api"]
+header = "Authorization: Bearer {placeholder}"
+```
+
+This uses the previously configured `github-api` policy. Startup fetches opted-in bound credentials sequentially, after validating descriptions and bindings but before starting the mediator, worker, or QEMU. Each fetch has a 60-second provider execution budget, including command execution; plugins may impose shorter internal limits. The startup wait includes these budgets without extending ordinary request/provider deadlines. Failure aborts startup with a redacted error identifying the credential; sbx does not continue lazily after a failed startup fetch.
+
+Provider stdin is reserved for its protocol and commands receive no interactive terminal. For 1Password, use supported desktop-app/GUI authentication or sign in on the host beforehand; this option cannot service a terminal password prompt. Required host environment names still need explicit `options.inherit_environment` entries.
+
+The result uses the same memory-only supervisor cache and expiry rules as lazy fetches. Data-plane recovery keeps that cache; a new gateway session fetches again. Text output has no expiry, so changing the vault value does not trigger automatic refresh. Changing this option for an already running VM requires stop/start.
 
 ### Text output
 
@@ -315,7 +339,7 @@ The GitHub plugin supplies its conventional authorization header. The CodeArtifa
 
 ## Retrieval and refresh
 
-- Retrieval is lazy on the first matching authorized request.
+- Retrieval is lazy on the first matching authorized request unless the credential sets `fetch = "startup"`.
 - The per-VM supervisor/broker is the sole cache owner; the mediator retains a returned value only for the current request.
 - Each credential has an independent cache and refresh lock.
 - A value without expiry is cached for the supervisor session.
@@ -344,7 +368,7 @@ Real values must never appear in:
 
 ## Contributor smoke
 
-Use a temporary fake `aws` executable on `PATH` that prints JSON such as `{"authorizationToken":"fake-token","expiration":1787600000}`. Never put a real cloud token in tests, examples, logs, or fixtures. Run `pytest --no-cov tests/test_gateway_credentials.py` and the mediator suite from `docs/development.md`.
+Use a temporary fake `aws` executable on `PATH` that prints JSON such as `{"authorizationToken":"fake-token","expiration":1787600000}`. Never put a real cloud token in tests, examples, logs, or fixtures. Run `pytest --no-cov tests/test_gateway_credentials.py tests/test_gateway_startup_credentials.py` and the mediator suite from `docs/development.md`.
 
 ## Required validation
 

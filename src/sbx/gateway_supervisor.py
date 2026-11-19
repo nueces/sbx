@@ -25,6 +25,7 @@ from sbx.gateway_credentials import communicate_bounded
 PROTOCOL_VERSION = 1
 MAX_FRAME_BYTES = 64 * 1024
 PROVIDER_TIMEOUT_SECONDS = 10
+STARTUP_PROVIDER_TIMEOUT_SECONDS = 60
 PROVIDER_OUTPUT_BYTES = 64 * 1024
 PROVIDER_CONCURRENCY = 8
 BROKER_CONCURRENCY = 128
@@ -129,6 +130,17 @@ class CredentialBroker:
         self.credentials = {credential.id: credential for credential in described}
         return tuple(described)
 
+    def prefetch(self) -> None:
+        for credential in self.credentials.values():
+            if credential.fetch == "startup" and credential.bindings:
+                try:
+                    self.fetch(credential.id, timeout=STARTUP_PROVIDER_TIMEOUT_SECONDS)
+                except gateway.GatewayLifecycleError:
+                    raise gateway.GatewayLifecycleError(
+                        f"startup credential {credential.id!r} could not be fetched; "
+                        "authenticate the host provider and retry"
+                    ) from None
+
     def _environment(self, credential: gateway.Credential, operation: str) -> dict[str, str]:
         baseline = self.source_environment.get("baseline")
         inherited = self.source_environment.get("inherited")
@@ -166,6 +178,7 @@ class CredentialBroker:
         operation: str,
         *,
         cancelled: threading.Event | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "credential_id": credential.id,
@@ -173,6 +186,8 @@ class CredentialBroker:
         }
         if credential.method == "command":
             payload.update(credential.options)
+        if timeout is not None:
+            payload["timeout"] = timeout
         lifetime_read, lifetime_write = os.pipe()
         command = [
             sys.executable,
@@ -210,7 +225,7 @@ class CredentialBroker:
                 completed = communicate_bounded(
                     process,
                     input=json.dumps(payload, separators=(",", ":")).encode(),
-                    timeout=PROVIDER_TIMEOUT_SECONDS,
+                    timeout=PROVIDER_TIMEOUT_SECONDS if timeout is None else timeout,
                     maximum=PROVIDER_OUTPUT_BYTES,
                 )
             except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
@@ -237,7 +252,13 @@ class CredentialBroker:
             if acquired:
                 self.slots.release()
 
-    def fetch(self, credential_id: str, *, cancelled: threading.Event | None = None) -> str:
+    def fetch(
+        self,
+        credential_id: str,
+        *,
+        cancelled: threading.Event | None = None,
+        timeout: float | None = None,
+    ) -> str:
         credential = self.credentials.get(credential_id)
         if credential is None or not credential.bindings:
             raise gateway.GatewayAuthenticationError("unknown broker credential")
@@ -251,7 +272,7 @@ class CredentialBroker:
             ):
                 return cached[0]
             try:
-                result = self._invoke(credential, "fetch", cancelled=cancelled)
+                result = self._invoke(credential, "fetch", cancelled=cancelled, timeout=timeout)
                 if set(result) != {"value", "expires_at"}:
                     raise gateway.GatewayLifecycleError("credential result is invalid")
                 value, expires = result["value"], result["expires_at"]
@@ -494,6 +515,7 @@ def run(bootstrap_fd: int, config_fd: int, provider_fd: int, lock_fd: int) -> in
         )
         controller.qemu_listener = socket.socket(fileno=int(metadata["qemu_fd"]))
         controller.listeners = [socket.socket(fileno=int(fd)) for fd in metadata["listener_fds"]]
+        broker.prefetch()
         gateway.write_effective_policy(directory, config, controller.vm_id, controller.generation)
         controller._immutable_policy = (directory / "policy.json").read_bytes()
         controller._mediator_policy_payload = controller._mediator_policy()
