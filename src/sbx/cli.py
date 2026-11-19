@@ -1954,6 +1954,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(raw_argv)
     runtime.DEBUG = bool(args.debug)
     runtime.debug(f"action: {args.action}")
+    try:
+        # Reject a bad value here: failing inside SmolVM's launch marks the VM as errored.
+        sbx.smolvm_compat.virtio_bus()
+    except ConfigError as exc:
+        print(f"sbx: {exc}", file=sys.stderr)
+        return 2
     if args.action in {"completion", "image"}:
         args.config_data = {}
     else:

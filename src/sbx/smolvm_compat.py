@@ -17,6 +17,8 @@ import smolvm.vm as _smolvm_vm
 from annotated_types import Le
 from smolvm.types import SnapshotInfo, VMConfig, VMInfo
 
+from sbx.runtime import ConfigError
+
 MAX_MEMORY_MIB = 32768
 
 _memory = VMConfig.model_fields["memory"]
@@ -79,10 +81,11 @@ def microvm_argv_to_pci(argv: Sequence[str]) -> list[str]:
     return rest
 
 
-def _virtio_bus() -> str:
+def virtio_bus() -> str:
+    """Return the requested virtio bus; sbx checks this before any VM is started."""
     value = os.environ.get(VIRTIO_BUS_ENV, "").strip().lower() or "pci"
     if value not in ("pci", "mmio"):
-        raise RuntimeError(f"sbx: {VIRTIO_BUS_ENV} must be 'pci' or 'mmio', got {value!r}")
+        raise ConfigError(f"{VIRTIO_BUS_ENV} must be 'pci' or 'mmio', got {value!r}")
     return value
 
 
@@ -91,7 +94,7 @@ _smolvm_build_qemu_argv = _smolvm_vm.build_qemu_argv
 
 def _build_qemu_argv(*args: Any, **kwargs: Any) -> list[str]:
     argv = _smolvm_build_qemu_argv(*args, **kwargs)
-    return argv if _virtio_bus() == "mmio" else microvm_argv_to_pci(argv)
+    return argv if virtio_bus() == "mmio" else microvm_argv_to_pci(argv)
 
 
 # smolvm.vm imports build_qemu_argv by name, so the patch must replace that binding.

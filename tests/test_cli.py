@@ -2013,3 +2013,46 @@ def test_existing_vm_start_does_not_reset_hostname(monkeypatch: pytest.MonkeyPat
 
     assert cli.main(["run", "vm1", "--no-attach"]) == 0
     assert hostnames == []
+
+
+def test_invalid_virtio_bus_is_rejected_before_vm_start_then_valid_value_starts(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    touched: list[str] = []
+
+    def status(name: str) -> str:
+        touched.append("status")
+        return "stopped"
+
+    def start(*args: object, **kwargs: object) -> int:
+        touched.append("start")
+        return 0
+
+    def load_config(path: object) -> dict[str, object]:
+        touched.append("config")
+        return {}
+
+    monkeypatch.setattr(cli, "load_config", load_config)
+    monkeypatch.setattr(cli, "_get_existing_vm_status", status)
+    monkeypatch.setattr(cli, "_start_existing_vm_if_needed", start)
+    monkeypatch.setattr(cli, "_post_start_actions", lambda **kwargs: 0)
+
+    monkeypatch.setenv("SBX_QEMU_VIRTIO_BUS", "isa")
+    assert cli.main(["run", "vm1", "--no-attach"]) == 2
+    assert "sbx: SBX_QEMU_VIRTIO_BUS must be 'pci' or 'mmio', got 'isa'" in capsys.readouterr().err
+    assert touched == []
+
+    monkeypatch.setenv("SBX_QEMU_VIRTIO_BUS", "mmio")
+    assert cli.main(["run", "vm1", "--no-attach"]) == 0
+    assert "start" in touched
+
+
+def test_invalid_virtio_bus_fails_every_command_but_not_help(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("SBX_QEMU_VIRTIO_BUS", "isa")
+    assert cli.main(["ls"]) == 2
+    assert "SBX_QEMU_VIRTIO_BUS" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["run", "--help"])
+    assert excinfo.value.code == 0

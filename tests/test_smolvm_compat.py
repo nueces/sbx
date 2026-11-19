@@ -172,8 +172,22 @@ def test_virtio_bus_opt_out_and_invalid_value(monkeypatch: pytest.MonkeyPatch) -
     assert all(device.split(",")[0].endswith("-device") for device in _devices(argv))
 
     monkeypatch.setenv(smolvm_compat.VIRTIO_BUS_ENV, "isa")
-    with pytest.raises(RuntimeError, match="must be 'pci' or 'mmio'"):
+    with pytest.raises(runtime.ConfigError, match="must be 'pci' or 'mmio', got 'isa'"):
         _smolvm_argv()
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, "pci"), ("", "pci"), (" PCI ", "pci"), ("MMIO", "mmio")],
+)
+def test_virtio_bus_values(
+    monkeypatch: pytest.MonkeyPatch, value: str | None, expected: str
+) -> None:
+    if value is None:
+        monkeypatch.delenv(smolvm_compat.VIRTIO_BUS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(smolvm_compat.VIRTIO_BUS_ENV, value)
+    assert smolvm_compat.virtio_bus() == expected
 
 
 def test_smolvm_cli_subprocess_installs_pci_rewrite() -> None:

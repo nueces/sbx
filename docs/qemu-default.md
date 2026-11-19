@@ -77,6 +77,8 @@ SBX_QEMU_VIRTIO_BUS=mmio sbx run   # keep the old virtio-mmio devices
 SMOLVM_QEMU_MACHINE=q35 sbx run    # use the q35 machine instead of microvm
 ```
 
+Any other value of `SBX_QEMU_VIRTIO_BUS` is rejected by every `sbx` command before a VM is started, so a typo does not change the VM's state.
+
 A VM that is already stuck on the old devices can usually be freed without a restart by running `stat -f <shared folder>` for each shared folder from a root shell in the guest.
 
 This is an interim patch in `sbx/smolvm_compat.py` until the pinned SmolVM/Celesto release attaches these devices to PCI itself.
