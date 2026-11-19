@@ -91,11 +91,11 @@ Gateway mode replaces slirp with QEMU 7.2+ `-netdev stream` over a controller-ow
 QEMU virtio-net -> sbx-gateway worker -> per-VM mediator -> host sockets
 ```
 
-The final QEMU argv must contain exactly one stream NIC and no `user`, slirp, TAP, bridge, passt, vmnet, or second NIC backend. Tests run with explicit `-accel tcg` in the constrained Linux environment. If the gateway cannot start, startup fails closed rather than falling back to slirp.
+Raw TCP/TLS rules can connect from the worker without HTTP mediation. The final QEMU argv must contain exactly one stream NIC and no `user`, slirp, TAP, bridge, passt, vmnet, or second NIC backend. Tests run with explicit `-accel tcg` in the constrained Linux environment. If the gateway cannot start, startup fails closed rather than falling back to slirp.
 
 ## Trade-offs
 
-QEMU/slirp and gateway networking may be slower than privileged TAP networking. That trade-off is acceptable for now because it avoids privileged host networking requirements and lets us focus on the agent sandbox UX. Task 19 proved a ten-minute stability smoke; readiness, absolute throughput, 128-active concurrency, and repeat four-VM performance are deferred, not passed.
+QEMU/SLIRP and gateway networking trade potential TAP throughput for a smaller privileged host setup. Measure the actual workload rather than inferring performance from the backend name. Functional tests, resource/performance acceptance and native-platform support are different claims; current gateway limits and unresolved gates live in the [support reference](rootless-network-gateway.md#support-and-prerequisites).
 
 ## Current constraint
 

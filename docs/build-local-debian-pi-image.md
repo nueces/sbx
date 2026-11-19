@@ -31,14 +31,13 @@ At first startup, `sbx` creates the configured user or a user matching the curre
 
 ## 2. Install the tools
 
-Install the currently supported tools first:
+Use a feature-capable [sbx installation](../README.md#install), working host Docker, and the network access required below. For a local source checkout, from its repository root on the host:
 
 ```bash
 uv tool install --editable .
-uv tool install 'smolvm==0.0.28'
 ```
 
-`sbx` pins SmolVM `0.0.28`.
+The sbx dependency supplies the pinned SmolVM 0.0.28 SDK; a separate SmolVM CLI installation is not required. Host image building and guest root operations are distinct from the unprivileged gateway runtime.
 
 ## 3. Build the image
 
@@ -126,7 +125,7 @@ sbx run the-quest \
   --write-config
 ```
 
-When CLI and project configuration do not select a user, `sbx` uses the current host username. `--project-path .` remains explicit because it creates a writable host mount.
+When CLI and project configuration do not select a user, `sbx` uses the current host username. `--project-path .` selects the shared project; `--writable-mounts` explicitly permits guest writes to reach that host directory.
 
 The suggested `.sbx.toml` is:
 
@@ -154,39 +153,39 @@ sbx run
 
 ### Recovering from root-owned mount parents
 
-Mount preparation gives newly created guest-local directories beneath the runtime user's home to that user. It also automatically transfers existing root-owned components on the mount path to the runtime UID/GID. For `/home/nueces/.local/share/uv/credentials`, this repairs root-owned `.local`, `share`, and `uv`. `/home`, the runtime home itself, directories outside that home, and mounted content remain unchanged. An unmounted destination directory follows the same ownership policy as its parents.
+Mount preparation gives newly created guest-local directories beneath the runtime user's home to that user. It also transfers existing root-owned components on the configured mount path to the runtime UID/GID. For `/home/developer/.local/share/uv/credentials`, this repairs root-owned `.local`, `share`, and `uv`. `/home`, the runtime home, directories outside it and mounted content remain unchanged. An unmounted destination follows the same ownership policy as its parents.
 
 Directories already owned by the runtime UID keep their group and modes. Directories owned by another non-root UID require explicit ownership repair; sbx reports the path and UIDs rather than taking them over. Existing modes are not explicitly changed, although the operating system may clear special permission bits during ownership transfer. Missing directories inside an already active shared mount must be prepared explicitly; sbx will not create or re-own host-backed directories there.
 
 Older versions could leave root-owned parents that block Pi installation with `EACCES` while creating `$HOME/.local/lib`. After upgrading, provisioning (including `--reprovision`) repairs those parents even when the credentials mount already exists, without remounting it. Configuring a mount beneath the runtime home authorizes this root-owned-parent transfer; sbx cannot distinguish old provisioning artifacts from intentionally root-protected directories on that path.
 
 ```bash
-sbx run dt --reprovision --no-attach
-sbx run dt --agent pi
+sbx run --reprovision --no-attach
+sbx run --agent pi
 ```
 
 Inspect the affected VM before changing ownership:
 
 ```bash
 # On the host:
-sbx shell dt --root
+sbx shell --root --keep-running
 
 # Inside the guest:
-id nueces
-namei -l /home/nueces/.local/share/uv/credentials
-findmnt -T /home/nueces/.local
+id developer
+namei -l /home/developer/.local/share/uv/credentials
+findmnt -T /home/developer/.local
 ```
 
-If automatic repair does not apply (for example, the directory has another non-root owner), investigate that ownership before explicitly authorizing any change. Only repair a directory after confirming it is guest-local and its current ownership is incorrect. For an installation where that owner should be `nueces:nueces`, a narrowly scoped repair would be:
+If automatic repair does not apply (for example, the directory has another non-root owner), investigate that ownership before explicitly authorizing any change. Only repair a directory after confirming it is guest-local and its current ownership is incorrect. For an installation where that owner should be `developer:developer`, a narrowly scoped repair would be:
 
 ```bash
 # Inside the guest:
-chown nueces:nueces /home/nueces/.local
+chown developer:developer /home/developer/.local
 exit
 
 # Back on the host:
-sbx run dt --reprovision --no-attach
-sbx run dt --agent pi
+sbx run --reprovision --no-attach
+sbx run --agent pi
 ```
 
 Use the actual account, group and VM name for other installations. Do not use recursive `chown`: descendants can be host mounts. Deleting the VM is unnecessary, risks losing guest-local data, and can reproduce the original problem on an older sbx version.
@@ -221,7 +220,7 @@ The flag is supported only on Linux x86_64 and cannot be combined with the fully
 "features": ["docker", "nested-kvm"]
 ```
 
-Select the new image in `.sbx.toml`, then recreate the VM so it receives the new kernel and rootfs:
+Select the new image in `.sbx.toml`. **Recreation deletes the VM disk:** preserve guest-only data and private gateway evidence first. Then deliberately recreate to adopt the new kernel/rootfs:
 
 ```toml
 [sbx]
@@ -229,7 +228,7 @@ image = "~/.smolvm/images/sbx-nested-kvm"
 ```
 
 ```bash
-sbx recreate --force
+sbx recreate
 ```
 
 Inside the outer VM, verify CPU exposure, the device, and runtime-user access:
@@ -262,7 +261,7 @@ Landlock confines processes running on the kernel that handles their system call
 | `sbx` runs inside a curated sbx VM and starts an inner sandbox | The curated VM's kernel |
 | Gateway runs outside a sandbox guest | Adding Landlock to that guest does not confine the external gateway |
 
-Existing images and VMs keep their old kernel: rebuild with `sbx image build`, then `sbx recreate --force`. Verify inside the guest:
+Existing VMs retain their kernel/image selection. Preserve guest-only data and gateway evidence before rebuilding and explicitly recreating a VM; recreation deletes its disk. Verify inside the guest:
 
 ```bash
 grep -w landlock /sys/kernel/security/lsm
@@ -292,7 +291,7 @@ cat /proc/sys/kernel/hung_task_timeout_secs        # 120; write a value to chang
 echo w > /proc/sysrq-trigger                       # dump blocked tasks now, into the same log
 ```
 
-After `sbx image build`, run `sbx stop` and `sbx run`, then check that `hung_task_timeout_secs` exists. If it is missing, the VM still boots the old kernel and needs `sbx recreate`, which deletes the sandbox disk.
+A rebuild does not replace an existing VM's isolated rootfs or change its saved boot-artifact paths. After a controlled restart, check the running kernel and `hung_task_timeout_secs`; a kernel at a reused path may change while the VM disk stays old. To adopt the complete rebuilt image, preserve guest-only data and private gateway evidence before explicit recreation, which deletes the disk.
 
 Shared folders are mounted with 9p `msize=131072`. This caps each directory-read buffer at 128 KiB, so listings keep working when guest memory is fragmented; larger defaults failed with `page allocation failure: order:6` under build load. The change applies on the next VM boot, without an image rebuild.
 
@@ -444,11 +443,10 @@ Resizing is per VM. SmolVM normally materializes an isolated disk for each sandb
 
 ### Existing VM keeps using old image contents
 
-If you changed and rebuilt the image, remove/recreate the VM:
+If you changed and rebuilt the image, first preserve guest-only data and private gateway evidence. **Recreation deletes the old disk.** From the host, explicitly confirm recreation:
 
 ```bash
-sbx rm the-quest --force
-sbx run
+sbx recreate
 ```
 
 ### Auth callback port already open

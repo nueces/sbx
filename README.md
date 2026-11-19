@@ -1,68 +1,54 @@
 # sbx
 
-`sbx` runs coding agents in disposable [SmolVM](https://github.com/CelestoAI/smolVM) virtual machines. Your project is mounted into the VM, while the agent, tools, and optional rootless Docker daemon run inside it.
+`sbx` runs coding agents in disposable [SmolVM](https://github.com/CelestoAI/smolVM) virtual machines. Selected project directories are shared with the guest; tools and optional rootless Docker run inside it.
 
-Host credentials are not copied by default. `sbx` forwards only selected environment variables and a safe subset of Git settings; it never forwards Git credentials or keys.
+Host agent configuration is not copied by default. Explicit environment forwarding can give the guest real values; gateway credential substitution is a separate host-side mechanism. Shared writable directories are writable by guest workloads—do not mount secrets or host evidence directories.
 
 ## Install
+
+**Documentation version:** this checkout. The tagged command below installs a released version, not every unreleased feature described here. In particular, `v0.2.5` predates gateway mode.
+
+Released installation, on the host:
 
 ```bash
 uv tool install git+https://github.com/nueces/sbx.git@v0.2.5
 ```
 
-Alternatively, install an editable clone:
+For unreleased features, use a local source checkout that contains them. From that repository's root on the host:
 
 ```bash
-git clone https://github.com/nueces/sbx.git
-uv tool install --editable ./sbx
+uv tool install --editable .
 ```
 
-After either installation, check that the host, QEMU backend, and project configuration are ready before creating a sandbox:
+This does not fetch or publish an unreleased tag. Check the installed command before creating a sandbox:
 
 ```bash
+sbx --version
 sbx doctor
 ```
 
-`sbx doctor` reports missing host requirements and configuration or VM-state problems without starting a VM.
+`doctor` checks host, QEMU, configuration and VM-state requirements without starting a VM. Linux amd64 gateway functionality has been tested; native macOS gateway execution remains unverified. See [gateway support and open gates](docs/rootless-network-gateway.md#support-and-prerequisites), not a cross-build alone, for the platform boundary.
 
-## Recommended workflow
+## First sandbox
 
-### 1. Build the curated image
+### 1. Build the image
 
-The curated image contains common development tools and rootless Docker, but no agent. Building it requires a working host Docker installation:
+On a host with working Docker:
 
 ```bash
 sbx image build
-```
-
-The image is written to `~/.smolvm/images/sbx`. The first build compiles a QEMU kernel and can take a while. Later builds reuse Docker layers.
-
-New agent presets without `--image` also use this prepared Debian image from SmolVM's image cache; they no longer download a stock Ubuntu image. Build it first with `sbx image build`. The base includes `sudo`/`visudo`, Node.js and OS prerequisites, so presets install only their agent, without rerunning the stock OS-package setup. Existing VMs and explicit `--image` selections are unchanged. Remove any old `[sbx].os` setting or change it to `"debian"`.
-
-On a Linux x86_64 host with nested virtualization enabled, build a separate image for running KVM-accelerated inner VMs:
-
-```bash
-sbx image build --name sbx-nested-kvm --nested-kvm
-```
-
-Nested KVM increases the kernel and QEMU attack surface and is never enabled in the default image. See the [image guide](docs/build-local-debian-pi-image.md#nested-kvm-images) for host checks, verification, and cleanup.
-
-Every curated image kernel, default and nested, includes Landlock. See [Landlock](docs/build-local-debian-pi-image.md#landlock) for verification and host requirements.
-
-Check the result with:
-
-```bash
 sbx image list
 ```
 
-See the [image guide](docs/build-local-debian-pi-image.md) for custom sizes, Docker details, and troubleshooting.
+The default image is `~/.smolvm/images/sbx`. It contains common tools, Node.js, SSH and rootless Docker, but no agent. New presets without `--image` also use this prepared Debian base; build it first. Old `[sbx].os` settings must be removed or set to `"debian"`.
 
-### 2. Create the project sandbox
+Kernel builds take time and need network access. See [image building and recovery](docs/build-local-debian-pi-image.md) for prerequisites, sizes, Landlock and optional nested KVM. Nested KVM is never enabled by default and increases the attack surface.
 
-Run this from the project you want the agent to work on:
+### 2. Create and launch
+
+From the host project directory:
 
 ```bash
-cd ~/code/my-project
 sbx run the-quest \
   --image '~/.smolvm/images/sbx' \
   --project-path . \
@@ -70,162 +56,34 @@ sbx run the-quest \
   --runtime-install pi
 ```
 
-On first creation, `sbx`:
+This creates/provisions the VM, creates a runtime account matching the host username unless configured otherwise, mounts the project at the same absolute path, writes missing project settings to `.sbx.toml`, and launches Pi. `--writable-mounts` permits guest writes to reach the host. Mount only the project data you intend to expose.
 
-1. creates and starts the VM with its share devices configured;
-2. writes the project settings to `./.sbx.toml`;
-3. creates the guest account and skeleton-initialized home matching your host username, before creating workspace targets;
-4. mounts the project at the same absolute path inside the VM; and
-5. completes boot setup, installs the explicitly requested Pi runtime as that user, then launches it directly through the guest login shell.
+Agent selection and installation are independent. Other supported installers include `claude`, `opencode`, `codex` and `specify`; installation runs third-party code inside the guest as the runtime user. Existing tools are not silently upgraded or removed.
 
-### 3. Use the sandbox day to day
+### 3. Use it day to day
 
-The sandbox name is stored in `.sbx.toml`, so commands run from the project directory do not need it again:
+From the configured project directory on the host:
 
 ```bash
-sbx run       # start if needed and launch the agent
-sbx shell     # open a shell in the mounted project
-sbx stop      # stop the VM without deleting its disk
-sbx ls        # list all sandboxes, including stopped ones
-sbx rm        # remove the VM after confirmation
-```
-
-Normal boot setup (account/home checks, workspace mounting, hostname, clock, optional KVM access, and rootless Docker) runs when sbx starts the VM or reprovisioning is requested—not on each attachment to a running VM. To repair setup in a running VM, use `sbx run --reprovision --no-attach`. See [guest setup lifecycle](docs/ergonomics.md#guest-setup-lifecycle) for recovery and diagnostic-root behavior.
-
-For recovery, `sbx shell --root` opens in a safe default directory, not the project directory. It can start an incomplete VM without mandatory account, environment synchronization, workspace mounts or KVM/Docker setup. After a diagnostic boot, use `sbx run --reprovision --no-attach` or stop/start normally to apply that setup.
-
-Automatic stop-on-exit leaves the VM running if another session joins during its filesystem flush. An explicit `sbx stop` is different: it requests a stop even when sessions are active and may disconnect them. Flushing is best effort, not a crash-durability guarantee.
-
-Nested KVM remains opt-in through `sbx image build --nested-kvm`; ordinary images do not require guest `/dev/kvm` or the optional KVM helper.
-
-## Customize the sandbox
-
-### Add another folder
-
-Mounts are applied when a VM starts; they cannot be hot-added to an already-running VM. Add the folder to `.sbx.toml` using an absolute host path:
-
-```toml
-[sbx]
-# Existing project settings remain here.
-mount = [
-  "/home/me/code/shared-tools",
-  "/home/me/data:/workspace/data",
-]
-writable_mounts = true
-```
-
-A bare path appears at the same absolute path in the VM. `HOST:GUEST` chooses a different guest path.
-
-If the VM is running, restart it through `sbx` to apply the mounts:
-
-```bash
-sbx stop
 sbx run
-```
-
-This stop/start cycle does not recreate the sandbox or delete its disk, so applying a new mount does not lose the agent session. Use the agent's normal resume/continue flow after restarting.
-
-If you try to run with different mounts while the VM is already running, `sbx` keeps the current mounts and prints the same stop-and-run guidance.
-
-### Install more tools
-
-The curated image is agent-neutral. Install Pi, Claude, OpenCode, or Specify explicitly during creation or reprovisioning:
-
-```toml
-[sbx]
-runtime_install = ["pi", "specify"]
-```
-
-Repeated CLI options provide the same request for one invocation:
-
-```bash
-sbx run --runtime-install pi --runtime-install specify --no-attach
-```
-
-Claude, OpenCode, and Codex use the same provisioning path:
-
-```bash
-sbx run --runtime-install claude --agent claude
-sbx run --runtime-install opencode --agent opencode
-sbx run --runtime-install codex --agent codex
-```
-
-These install `@anthropic-ai/claude-code`, `opencode-ai`, and `@openai/codex` under the runtime user's `$HOME/.local`. Their npm lifecycle scripts run as that user to prepare platform binaries. Existing executables are preserved. Installing a tool never changes the selected agent.
-
-For other tools, install directly on the sandbox disk instead of rebuilding the image:
-
-```bash
 sbx shell
-# Inside the VM as the configured runtime user:
-npm install -g --prefix "$HOME/.local" <package>
-exit
+sbx stop
+sbx ls
 ```
 
-Runtime installation is additive: removing a tool from `runtime_install` does not uninstall it. Installed software survives `sbx stop` and remains available on later runs:
+The nearest ancestor `.sbx.toml` supplies the sandbox name and project anchor; explicit names still win. Existing VM disks survive stop/start. Adding mounts or changing memory/CPUs requires stop/start; user/tool setup changes require explicit reprovisioning:
 
 ```bash
-sbx run --agent claude
-sbx run --agent codex
-
-sbx run --agent opencode
-```
-
-`sbx recreate` and `sbx rm` delete the sandbox disk. Add frequently used tools to the curated image if every new or recreated sandbox should contain them.
-
-## Authentication and networking
-
-`[sbx].auth_port` accepts only the named strings `"auto"`, `"openai"`, `"anthropic"`, `"both"`, and `"none"`.
-
-Run `/login` inside Pi when authentication is needed. After successful first provisioning, an attached `sbx run` opens OAuth callback forwarding. Later runs require `--auth-port` or an enabled `[sbx].auth_port` setting. Tunnels created by a session close when it exits; manual tunnels remain independent.
-
-```bash
-sbx run --auth-port=openai      # localhost:1455 -> VM:1455
-sbx run --auth-port=anthropic   # localhost:53692 -> VM:53692
-sbx run --auth-port=both
-sbx network auth-port --auth-port=anthropic  # persistent manual tunnel
-sbx network close-auth-port                 # close all manual/session tunnels for this VM
-```
-
-`auto` (also the bare `--auth-port` flag) uses `--auth-provider` / `[sbx].auth_provider` as a forwarding hint; otherwise Claude defaults to Anthropic, Codex to OpenAI, and Pi/OpenCode to both. The hint does not configure a model or enable forwarding on later runs by itself. These are named port profiles, not guarantees about every client's login implementation. See [OAuth callback forwarding](docs/auth-ports.md) for configuration, numeric overrides, and lifecycle details.
-
-Temporarily expose a VM service to the host until Ctrl-C:
-
-```bash
-sbx network forward 3000       # host 3000 -> guest 3000
-sbx network forward 8080:3000  # host 8080 -> guest 3000
-```
-
-These commands use the sandbox named in `.sbx.toml`. Use `--name OTHER_VM` only when forwarding from a different sandbox.
-
-### Rootless network gateway
-
-Gateway mode replaces SLIRP with a default-deny path through a per-VM worker and mediator. Exact [IPv4 policies](docs/network-credentials.md#direct-ipv4-policies) optionally allow raw TCP or credential-free mediated HTTP/HTTPS without DNS. Linux amd64 packages include the worker; macOS artifacts are built but runtime remains unverified.
-
-Set `[network].mitmweb = true` for an authenticated, read-only host-loopback metadata UI (off by default). `sbx network diagnostics NAME` reports its address, private login-file path, and generation audit-log path. Live credentials, headers and bodies are never retained in the UI.
-
-See [`docs/rootless-network-gateway.md`](docs/rootless-network-gateway.md) for configuration, current dependency-audit release blockers, security status, performance deferrals, release, and rollback notes. The [credential guide](docs/network-credentials.md) includes a request-flow diagram, supported authentication methods and limits, and GitHub/CodeArtifact configuration and guest examples.
-
-## Other operations
-
-```bash
-# Create or start without launching or checking agent availability.
-sbx run --no-attach
-
-# Explicitly rerun user/tool provisioning after changing its config.
 sbx run --reprovision --no-attach
-
-# Keep the VM running after the agent exits.
-sbx run --keep-running
-
-# Delete and recreate the VM from the current configuration.
-sbx recreate --force
 ```
 
-Use `sbx --help` or `sbx COMMAND --help` for the complete command and option reference.
+For recovery, `sbx shell --root --keep-running` opens a diagnostic root session without normal workspace or environment setup. See [sandbox lifecycle and recovery](docs/ergonomics.md).
+
+**Destructive:** `sbx recreate` and `sbx rm` delete the VM disk. Preserve guest-only data and private gateway evidence before using them. They are not substitutes for stop/start or reprovisioning.
 
 ## Project configuration
 
-The first project creation produces a small `.sbx.toml` resembling:
+Complete project example (replace the name and paths for your project):
 
 ```toml
 [sbx]
@@ -239,72 +97,64 @@ copy_host_credentials = false
 git_config = true
 ```
 
-`sbx` reads configuration in this order, with later values winning:
+User defaults, the nearest project config, an explicit `--config PATH` override and CLI options apply in that order. Relative config paths belong to the file supplying them; CLI-relative paths belong to the invoking directory. Nested invocations preserve the corresponding mounted subdirectory. See [project context and configuration](docs/ergonomics.md#project-context) and [`sbx.toml.example`](sbx.toml.example).
 
-1. `~/.config/sbx/config.toml` — user defaults;
-2. the nearest `.sbx.toml` in the current directory or its ancestors — project defaults; and
-3. `--config PATH` — an explicit override.
-
-CLI options override configuration. Repeated `--runtime-install` values replace the configured list for that invocation and imply reprovisioning for an existing VM. When `run_user` is omitted, `sbx` uses the current host username and records it in a newly generated `.sbx.toml`. Keep durable choices such as the image, VM resources, user, mounts, runtime installation, and forwarded environment names in `.sbx.toml`; use `sbx run --reprovision` after changing provisioning config. Changing the runtime user of an existing VM requires `sbx recreate`.
-
-`memory` (128–32768 MiB) and `cpus` (1–32) apply to an existing VM on its next `sbx stop` then `sbx run`/`sbx shell`, without recreating it; a running VM keeps its current resources and `sbx` prints the stop-and-run hint. `disk_size` changes still require `sbx recreate`. The 32768 MiB limit relies on a temporary patch of SmolVM 0.0.28, so a VM configured above 16384 MiB can only be loaded through `sbx`, not the plain `smolvm` CLI.
-
-All config-consuming commands use the same ancestor discovery, including `stop` and `rm`. An explicit VM name still wins. Nested projects use the nearest config only, not a merge of every ancestor. Relative `project_path`, image and mount host paths resolve against the file that supplies them (including user defaults); CLI-relative paths resolve against the invoking directory. This changes relative-path behavior for configs stored outside that directory.
-
-`sbx run` and `sbx shell` preserve your current subdirectory through the VM's actual mounts, including renamed guest mount targets. `--project-path` explicitly selects the starting project directory instead. Config discovery does not add mounts or make them writable. Overlapping guest mount targets remain user-controlled: a nested remap can expose different files at the mapped directory. SBX does not reject intentional shadowing. If the requested directory is not mounted, stop the VM and use `sbx run` to apply the mounts. A new run does not create a child config that shadows an existing ancestor/explicit config; `--write-config` still writes local `.sbx.toml` deliberately. When creating a local config below an ancestor project, choose a new VM name, for example `sbx run local-vm --write-config`: the new VM belongs to the local project immediately, and the generated config retains inherited settings and CLI overrides. Selecting the ancestor's VM instead reports an ownership conflict; SBX never silently reassigns it. Existing local configs still receive missing values only.
-
-### Guest login and shell
-
-User sessions connect directly over SSH as the runtime user. Provisioning authorizes the existing SBX public key in that user's home, independently of `copy_host_credentials`; administrative control and `shell --root` retain root SSH. Existing VMs need `sbx run --reprovision --no-attach` once to authorize user access. Key installation follows `ssh-copy-id`'s append-only approach, preserving existing entries and adding a missing newline before a new key when necessary. Comments are opaque text; quotes in a comment never justify an unrestricted duplicate of an existing key. SSH failures never fall back to root or generate replacement keys.
-
-Bash is the supported guest shell. Zsh checks were exploratory; Zsh is not supported yet.
-
-`sbx shell` changes to the mapped project directory, then starts the guest account's interactive login shell. User startup files may change directory afterward; SBX does not override them. `sbx run` launches the agent through the guest-selected non-interactive login shell (`exec "$SHELL" -lc ...`). Login startup runs before the quoted project `cd` and agent `exec`; failed `cd` prevents launch. Exported login-profile variables reach the agent and its children; unexported values and interactive-only branches do not.
-
-Bash reads `/etc/profile`, then the first readable `~/.bash_profile`, `~/.bash_login`, or `~/.profile`; an existing `.bash_profile` can therefore bypass `.profile`. Profiles may override managed exports, print output, or add startup time; avoid prompts and printing secrets. Profile output is not parsed or redacted. Startup files must allow the agent command to run: an `exit 0` or `exec` in a profile can prevent launch without reporting failure.
-
-There is no separate agent-availability lookup or SSH connection for validation. Provisioning success means setup/check phases completed; `--no-attach` does not check whether the agent exists. An unavailable agent fails when launch is attempted. Existing VMs need no recreation, agent reinstall, image/sshd change, or `.bashrc` edit to gain login-shell launch behavior; independently required SSH authorization repair is separate.
-
-SBX publishes managed environment in `/etc/profile.d/` and assumes the guest's packaged shell handles system-profile integration. It does not manually source profiles, adapt individual shells, mirror the host shell or import the host home. New accounts keep the provisioning default; existing users' shells are preserved. Normal-user public-key login is an image responsibility (SSH defaults or the image Containerfile), not runtime policy repair.
-
-Security-sensitive behavior is configuration-only:
+Security/configuration fragments:
 
 ```toml
 [sbx]
-# Disabled by default. Enable only when the VM should receive host agent configs.
 copy_host_credentials = false
-
-# Copies safe Git identity/workflow settings, never credentials or keys.
 git_config = true
-
-# Forward host values or set harmless literals. Do not commit literal secrets.
 env = ["OPENAI_API_KEY", "APP_MODE=development", "SERVICE_TOKEN=${HOST_TOKEN}"]
 ```
 
-See [`sbx.toml.example`](sbx.toml.example) for available settings and
-[environment forwarding](docs/environment-forwarding.md) for value syntax,
-validation, CLI replacement, and persistence limits.
+- [Environment forwarding](docs/environment-forwarding.md) sends selected **real values** into persistent guest-managed environment; it is not a secret broker. Never commit literal secrets.
+- [Git configuration forwarding](docs/git-config-forwarding.md) copies safe identity/workflow settings, not Git credentials or keys.
+- [Host-side network credentials](docs/network-credentials.md) give the guest placeholders and substitute real values only on authorized HTTPS requests.
 
-## Shell completion
+## Authentication and networking
+
+OAuth callback tunnels only forward traffic; they do not fetch credentials, authenticate the agent, or select its model. On the host:
 
 ```bash
-# One-off setup for the current shell.
+sbx run --auth-port=openai
+sbx run --auth-port=anthropic
+sbx network auth-port --auth-port=both
+sbx network close-auth-port
+```
+
+The profiles use OpenAI port 1455 and Anthropic port 53692. Omitted configuration allows session forwarding only after first successful attached provisioning; explicit profiles can enable it on later runs. See [callback profiles and tunnel ownership](docs/auth-ports.md).
+
+Without `[network]`, the QEMU backend normally uses SLIRP. Adding `[network]` enables a separate **default-deny gateway**; it never falls back to SLIRP on failure. Policies can explicitly allow DNS destinations or [exact IPv4 TCP/HTTP(S)](docs/rootless-network-gateway.md#direct-ipv4-policies). See the [gateway guide](docs/rootless-network-gateway.md) for policy, TLS, durable audit and platform limits.
+
+Useful host commands:
+
+```bash
+sbx network forward 3000
+sbx network status
+sbx network diagnostics
+```
+
+A foreground forward lasts until Ctrl-C. Optional `[network].mitmweb = true` enables a private authenticated read-only UI; diagnostics show its private authentication-file path. Do not expose the UI or publish raw diagnostics/state without reviewing sensitive content. The [networking command reference](docs/network-command-roadmap.md) covers both modes.
+
+## Completion and command help
+
+On the host, select the appropriate shell:
+
+```bash
 eval "$(sbx completion bash)"
 eval "$(sbx completion zsh)"
-
-# fish
 sbx completion fish | source
 ```
 
-The same commands can be redirected into your shell's normal completion directory for permanent installation.
+Shell completion support does not imply Zsh guest-shell support; Bash is the supported guest shell. See [guest setup and shell behavior](docs/ergonomics.md#guest-setup-lifecycle).
 
-## More documentation
+```bash
+sbx --help
+sbx run --help
+sbx network --help
+```
 
-- [Build and run the curated image](docs/build-local-debian-pi-image.md)
-- [Environment forwarding](docs/environment-forwarding.md)
-- [Safe Git configuration forwarding](docs/git-config-forwarding.md)
-- [Networking commands](docs/network-command-roadmap.md)
-- [CLI ergonomics and behavior](docs/ergonomics.md)
-- [Contributor setup and tests](docs/development.md)
+## Documentation
 
-`sbx` uses QEMU by default to avoid per-VM TAP and nftables setup. See [QEMU defaults](docs/qemu-default.md) for the rationale.
+Start at the [documentation index](docs/README.md) for user guides, networking/security reference and contributor instructions. Documentation describes supported behavior, not an approval to publish a release or a claim that every platform and long-duration gate has passed.

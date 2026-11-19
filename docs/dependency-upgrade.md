@@ -1,17 +1,31 @@
 # Dependency upgrades
 
-Rootless gateway runtime pins are release inputs, not loose ranges:
+## Purpose and inputs
 
-- Go worker: Go 1.26.5 with `GOTOOLCHAIN=local` and the committed `gateway/go.mod`/`go.sum`.
-- Mediator: root `pyproject.toml` pins the PyPI release mitmproxy 12.3.1, cryptography 50.0.2 and h2 4.4.1. Tornado has no direct version pin; `uv.lock` still resolves 6.5.10 under mitmproxy's upper bound. This replaces the temporary Git dependency. CPython 3.12 is the supported CI baseline; newer CPython versions are best effort and depend on available dependency wheels.
-- **Release blocker (reverified 2026-11-11):** mitmproxy 12.3.1 requires Tornado <=6.5.10, but the audit reports GHSA-pw9p-v7r6-gx4p, GHSA-r4j5-9xpp-3985, and GHSA-pcg2-g6cj-q92c, fixed in Tornado 6.6. Do not suppress these findings, weaken CI, or force conflicting package metadata. Release requires an upstream-compatible fixed dependency or a separately reviewed mitigation. GitHub affected ranges and [PyPI's 6.5.10 metadata](https://pypi.org/pypi/tornado/6.5.10/json) list all versions `<6.6`; these are not findings already fixed in 6.5.10. The current locked audit confirms all three and no additional known vulnerabilities.
-- **Darwin amd64 wheel gate blocked:** cryptography 50.0.2 publishes Darwin arm64 wheels but no Darwin amd64 wheel. Wheel-only resolution succeeds for Darwin arm64 and Linux amd64, but not Darwin amd64. Published stable 49.x/50.x releases lack the amd64 wheel; 48.0.1 has universal2 wheels but known security findings, so no vulnerable downgrade was introduced. Building the Go artifact does not establish Python runtime installability; do not claim that platform passed or silently allow source builds.
+Use this contributor procedure when changing runtime dependencies or distribution artifacts. Read the current `pyproject.toml`, `uv.lock`, `gateway/go.mod` and `gateway/go.sum` as the authoritative version inputs; do not substitute a historical validation environment. Python 3.12 is the supported baseline; newer Python versions are best effort.
 
-Upgrade checklist:
+The current checkout pins SmolVM 0.0.28, mitmproxy 12.3.1, Cryptography 50.0.2 and h2 4.4.1. The worker uses Go 1.26.5 with `GOTOOLCHAIN=local`. Tornado is constrained transitively by mitmproxy rather than directly pinned by sbx.
 
-1. Update the source locks (`uv.lock`, `gateway/go.mod`, and `gateway/go.sum`).
-2. Rebuild `src/sbx/gateway_runtime/bin/sbx-gateway-{linux-amd64,darwin-amd64,darwin-arm64}` and copy the mediator launcher/addon files.
-3. Run root wheel-only resolution/audit, mediator tests, Go tests, Python tests, explicit-TCG functional/security acceptance, license audit, and `git diff --check`.
-4. Keep macOS marked unverified unless the gateway was actually executed there.
+## Known unresolved gates
 
-Do not add a compiler, source build, privileged helper, unpinned runtime download, or shared single mitmproxy data plane as part of a dependency bump.
+These are **dated findings**, not a newly executed audit or a claim that an installed dependency is exploitable in every gateway path:
+
+- **Last recorded check, 2026-11-11:** mitmproxy 12.3.1 constrains Tornado to `>=6.5.0,<=6.5.10`, while GHSA-pw9p-v7r6-gx4p, GHSA-r4j5-9xpp-3985 and GHSA-pcg2-g6cj-q92c list fixes in Tornado 6.6. No approved compatible resolution is recorded here.
+- **Last recorded check, 2026-11-11:** Cryptography 50.0.2 lacked a Darwin amd64 wheel. The older universal2 release had known security findings; a vulnerable downgrade or source-build fallback was not approved. Linux amd64/Darwin arm64 resolution evidence does not clear Intel macOS.
+- Native macOS execution, licensing/source/notices and booted-image validation are separate from version resolution. See the [support boundary](rootless-network-gateway.md#support-and-prerequisites).
+
+Recheck advisories, upstream constraints and target wheels for the actual proposed candidate. Do not suppress findings, force conflicting metadata, silently drop a platform or weaken CI to obtain a pass. Any alternative mitigation/fork needs a separate explicit review.
+
+## Upgrade procedure
+
+From the repository root on the host:
+
+1. Review release notes and the [integration seams](fragile-glue.md), then update only the intended source locks. SmolVM upgrades require explicit compatibility/facade review, not just a lock refresh.
+2. Rebuild all three workers and synchronize all four mediator assets with `gateway/scripts/build_release_artifacts.sh` when their sources/toolchain change. Follow [development validation](development.md#gateway-validation).
+3. Build a wheel and clean-install its locked dependencies **wheel-only** for each supported target. Execute installed Linux artifacts; record Darwin resolution/build separately from native execution. Verify source/wheel/installed bytes and executable modes.
+4. Run `uv audit --locked`, Python/mediator/Go/race tests and affected explicit-TCG functional/security integrations. Record actual commands, versions and failures privately; do not turn unavailable gates into passes.
+5. Repeat required resource/performance/fault/native-platform acceptance when the dependency change affects those paths. Preserve durable admission, destination/TLS identity, no replay and confinement.
+6. Review bundled/transitive licenses, source/notices and image/agent redistribution. Run the image-input checker from [development](development.md#packaging-and-integration-seams) when those pins change.
+7. Run documentation example, lint and diff checks. Keep support labels and installation instructions aligned with the candidate actually validated.
+
+Do not add compilers, runtime downloads, privileged networking, source-build fallbacks or a shared mitmproxy data plane as an incidental dependency upgrade. Keep unresolved gates explicit in the release decision.

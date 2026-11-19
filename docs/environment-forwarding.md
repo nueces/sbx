@@ -39,6 +39,8 @@ sbx run --env OPENAI_API_KEY
 rather than merges the configured selection for that invocation. Repeated CLI
 names remain accepted. `sbx shell` reads configuration only and has no `--env` flag.
 
+This mechanism puts actual selected values in the guest and may persist them there. For host-only credentials substituted into authorized HTTPS, use [network credentials](network-credentials.md) instead. [OAuth callback tunnels](auth-ports.md) merely forward traffic; they do not retrieve either kind of credential.
+
 ## Validation and compatibility
 
 Each loaded configuration file is validated before merging, even if a later file

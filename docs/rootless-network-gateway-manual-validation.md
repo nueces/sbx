@@ -1,114 +1,64 @@
-# Rootless network gateway operator smoke test
+# Gateway operator smoke test
 
-This runbook validates the gateway through the public `sbx` CLI as an operator would use it. It intentionally excludes unit tests, direct harnesses, artifact builds, and other checks that belong in the automated test suite.
+## Purpose and prerequisites
 
-Run it on Linux from the feature worktree root (`feature/rootless-network-gateway`), not the project organization root. Do not use real credentials.
+Exercise allowed/denied egress, ingress and stop/start through the public CLI on Linux. This is a functional smoke, not release, performance, long-soak or native macOS acceptance.
 
-## Architecture and data flow
+Use an installed development version containing the gateway and a prepared image. See [installation](../README.md#install), [image building](build-local-debian-pi-image.md) and the [support boundary](rootless-network-gateway.md#support-and-prerequisites). Do not use real credentials. The anonymous HTTPS check needs host internet access to `example.com`.
 
-```mermaid
-flowchart LR
-  Operator[Operator / sbx CLI]
+The [canonical component diagram](rootless-network-gateway-components.mmd) explains the host/guest boundary. Keep all host evidence and state outside the one shared project directory. Do not mount the repository, its `local/` directory, a host home, Docker socket or credential store.
 
-  subgraph Host[Unprivileged host user]
-    Supervisor[Persistent per-VM supervisor<br/>state, lifecycle, recovery]
-    State[(Owner-only per-VM state)]
-    Ingress[Controller-owned<br/>ingress listeners]
-    Worker[Per-VM sbx-gateway worker<br/>gVisor netstack]
-    Mediator[Per-VM mitmproxy mediator<br/>HTTP, hooks, credential injection]
-    Broker[Supervisor-owned credential broker<br/>memory-only cache]
-    Provider[Bounded host credential helper]
-    Upstream[(Approved upstream)]
-    CA[Per-VM CA<br/>private key host-only]
-  end
+## 1. Prepare isolated host state
 
-  subgraph VM[Disposable VM]
-    QEMU[QEMU / SmolVM<br/>one Unix-stream NIC]
-    Guest[Guest network stack and workload]
-    GuestCA[Public CA certificate]
-  end
-
-  Operator -->|inherited bootstrap FDs| Supervisor
-  Supervisor -->|atomic metadata| State
-  Supervisor -->|spawn, authenticate, monitor| Worker
-  Supervisor -->|spawn, authenticate, monitor| Mediator
-  Supervisor -->|pre-opened Unix socket| QEMU
-  Supervisor -->|reserved descriptors| Ingress
-
-  Guest <-->|Ethernet: DHCP, DNS, TCP| QEMU
-  QEMU <-->|length-framed Ethernet<br/>Unix stream| Worker
-
-  Worker -->|destination-bound<br/>single-use SOCKS capability| Mediator
-  Mediator -->|approved HTTP/TLS| Upstream
-  Mediator <-->|private bounded credential IPC| Broker
-  Supervisor -->|owns, optional startup fetch| Broker
-  Broker <-->|describe / fetch| Provider
-  Worker -->|exact TLS passthrough<br/>or approved raw TCP| Upstream
-
-  Ingress -->|owned listener descriptor| Worker
-  Worker -->|approved guest TCP| Guest
-
-  CA --> Mediator
-  CA -->|public certificate only| GuestCA
-  GuestCA --> Guest
-
-  Worker -. default deny .-> Denied[Unknown host, unconfigured IP,<br/>wrong port, unsupported UDP]
-  Mediator -. fail closed .-> Denied
-
-  classDef security fill:#fee,stroke:#b33,color:#111;
-  classDef runtime fill:#eef,stroke:#336,color:#111;
-  class Denied security;
-  class Supervisor,Worker,Mediator,QEMU runtime;
-```
-
-The current standalone Mermaid source, including supervisor-owned credential IPC, is [`rootless-network-gateway-components.mmd`](rootless-network-gateway-components.mmd).
-
-### Optional direct-IP check
-
-For the supported IPv4 modes, use the [direct-IP policy examples](network-credentials.md#direct-ipv4-policies) with a controlled service you own, then upgrade and stop/start before testing from the guest. Check allowed IP/port success, wrong port and unlisted IP denial, and the same behavior after worker replacement. For mediated HTTPS, require a trusted upstream IP SAN and normal guest CA verification; never use `curl -k`. Verify origin execution counts and admission/outcome records, not just the client exit status. DNS-named credentials must not become available through an IP Host/authority override.
-
-The automated production-address-path regression is `tests/integration/test_gateway_direct_ip.py`. It creates origins only in a disposable network namespace, retains the guest overlay until evidence archival verifies, and must not substitute a loopback-predicate exception for a production-path pass.
-
-## 1. Prepare the smoke configuration
-
-Confirm the feature worktree and required commands are available, then select the ignored local test directory:
+Use a dedicated host Bash terminal and keep it open throughout the smoke. Resolve the installed command and existing image **before** changing HOME. Replace the image path if you deliberately built another image:
 
 ```bash
-test "$(git branch --show-current)" = feature/rootless-network-gateway
-export ROOT=$PWD
-export TEST_DIR="$ROOT/local"
-mkdir -p "$TEST_DIR"
-export UV_TOOL_DIR="$TEST_DIR/tool"
-export UV_TOOL_BIN_DIR="$TEST_DIR/bin"
-rm -rf "$TEST_DIR/dist" "$UV_TOOL_DIR" "$UV_TOOL_BIN_DIR"
-uv build --wheel --out-dir "$TEST_DIR/dist"
-WHEEL=$(find "$TEST_DIR/dist" -maxdepth 1 -name 'sbx-*.whl' -print -quit)
-test -n "$WHEEL"
-uv tool install --from "$WHEEL" sbx --python 3.12 --force
-export PATH="$UV_TOOL_BIN_DIR:$PATH"
-test "$(command -v sbx)" = "$UV_TOOL_BIN_DIR/sbx"
-sbx --version
-sbx network --help | grep -q diagnostics
-mitmdump --version
-qemu-system-x86_64 --version
-rm -rf "$HOME/.smolvm/images/gateway-smoke-task31"
-sbx image build --name gateway-smoke-task31
+SBX_BIN=$(command -v sbx)
+IMAGE_DIR=$(realpath "$HOME/.smolvm/images/sbx")
+test -f "$IMAGE_DIR/smolvm-image.json"
+SMOKE_DIR=$(mktemp -d /tmp/sbx-smoke.XXXXXX)
+printf 'Private smoke root: %s\n' "$SMOKE_DIR"
+PROJECT_DIR="$SMOKE_DIR/project"
+EVIDENCE_DIR="$SMOKE_DIR/host-evidence"
+umask 077
+mkdir -m 700 "$PROJECT_DIR" "$EVIDENCE_DIR"
+export HOME="$SMOKE_DIR/home"
+export XDG_CONFIG_HOME="$SMOKE_DIR/config"
+export XDG_STATE_HOME="$SMOKE_DIR/state"
+export XDG_DATA_HOME="$SMOKE_DIR/data"
+export XDG_CACHE_HOME="$SMOKE_DIR/cache"
+export XDG_RUNTIME_DIR="$SMOKE_DIR/runtime"
+mkdir -m 700 "$HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR"
+"$SBX_BIN" --version | tee "$EVIDENCE_DIR/version.txt"
+"$SBX_BIN" network diagnostics --help
 ```
 
-Create the smoke configuration from that fresh curated image.
+**Expected:** the command is the intended feature-capable installation; the image already exists; only a new owner-private temporary tree is created. No shared image is rebuilt or removed. Runtime gateway startup needs no host sudo; building the image and automated namespace fixtures have separate prerequisites.
+
+Create this complete smoke config. The project is the only shared directory; the sibling state/evidence directories are not mounted. Empty lists deliberately override inherited selections:
 
 ```bash
-cat >"$TEST_DIR/.sbx.toml" <<EOF
+CONFIG="$PROJECT_DIR/.sbx.toml"
+cat >"$CONFIG" <<EOF
 [sbx]
 name = "gateway-smoke"
 agent = "pi"
-image = "~/.smolvm/images/gateway-smoke-task31"
+image = "$IMAGE_DIR"
 run_user = "agent"
-project_path = "$ROOT"
-env = ["TEST_DIR"]
+project_path = "$PROJECT_DIR"
+writable_mounts = true
+stop_on_exit = false
+copy_host_credentials = false
+git_config = false
+env = []
+mount = []
+port_forwards = []
+runtime_install = []
+auth_port = "none"
 
 [network]
 default = "deny"
+credential = []
 
 [[network.policy]]
 id = "example"
@@ -122,178 +72,110 @@ id = "dev-server"
 listen = "127.0.0.1:13000"
 guest_port = 3000
 EOF
+cd "$PROJECT_DIR"
 ```
 
-The egress smoke uses `example.com`; it requires host internet access. The policy deliberately allows only HTTPS GET/HEAD requests to that exact hostname. `project_path` makes the worktree, including `local/`, available at the same absolute path inside the guest, and the explicitly forwarded `TEST_DIR` points commands to it.
+An agent is not installed or launched by this smoke. Port 13000 must be free; choose another unused explicit port in the config and host checks if necessary. Keep the same shell variables for later host steps. Do not reuse these test settings as a credential-bearing production configuration.
 
-Run the cleanly installed command from `local/` so `sbx` discovers `.sbx.toml` automatically:
+## 2. Create and inspect (host)
 
 ```bash
-cd "$TEST_DIR"
+"$SBX_BIN" --config "$CONFIG" create
+"$SBX_BIN" --config "$CONFIG" network status
+"$SBX_BIN" --config "$CONFIG" network diagnostics >"$EVIDENCE_DIR/diagnostics.before-stop.txt"
+"$SBX_BIN" --config "$CONFIG" shell
 ```
 
-## 2. Create the VM and inspect readiness
+**Expected:** ready gateway, loopback ingress and no SLIRP fallback. If any command fails, stop the procedure, retain the temporary tree and follow the failure guidance below. Do not weaken policy or TLS checks to obtain a pass.
+
+## 3. Check egress and prepare ingress (guest, runtime user)
+
+Inside the guest shell:
 
 ```bash
-sbx create
-sbx network status
-sbx network diagnostics
-```
-
-**Pass:**
-
-- the VM is running;
-- the gateway reports ready rather than disabled, stale, or error;
-- the ingress listener is bound to `127.0.0.1:13000`;
-- no command asks for sudo, TAP/TUN, capabilities, or firewall changes;
-- there is no warning about falling back to SLIRP.
-
-If creation fails, stop here and preserve the diagnostics. Do not disable gateway mode to make the smoke test pass.
-
-## 3. Verify allowed and denied egress
-
-Open the guest shell:
-
-```bash
-sbx shell
-```
-
-Run these commands inside the guest:
-
-```bash
-set -eu
-
 resolver=$(awk '$1 == "nameserver" { print $2 }' /etc/resolv.conf)
 test "$resolver" = "192.0.2.1"
 getent ahostsv4 example.com | awk '{ print $1 }' | grep -Eqm1 '^198\.(18|19)\.'
-sudo /usr/local/bin/sbx-start-rootless-docker
-test "$(awk '$1 == "nameserver" { print $2 }' /etc/resolv.conf)" = "192.0.2.1"
-
-# A valid query sent directly to an alternate resolver must fail over UDP and TCP.
-python3 - <<'PY'
-import socket
-import struct
-
-name = b"\x07example\x03com\x00"
-query = struct.pack("!HHHHHH", 1, 0x0100, 1, 0, 0, 0) + name + struct.pack("!HH", 1, 1)
-for kind in (socket.SOCK_DGRAM, socket.SOCK_STREAM):
-    try:
-        with socket.socket(socket.AF_INET, kind) as sock:
-            sock.settimeout(2)
-            sock.connect(("1.1.1.1", 53))
-            sock.sendall(query if kind == socket.SOCK_DGRAM else struct.pack("!H", len(query)) + query)
-            if sock.recv(1):
-                raise AssertionError(f"alternate DNS answered over socket type {kind}")
-    except OSError:
-        pass
-PY
-
-# Exact allowed HTTPS hostname and method: must succeed with certificate validation.
 curl --max-time 15 -fsSI https://example.com/
+```
 
+Check negatives in the same guest shell. Certificate verification remains enabled; these targets are not authorized by this config:
+
+```bash
 must_fail() {
   if "$@"; then
-    echo "FAIL: unexpectedly allowed: $*" >&2
+    echo "FAIL: unexpectedly allowed" >&2
     return 1
   fi
-  echo "PASS: denied: $*"
+  echo "PASS: denied"
 }
-
-# A sibling hostname is not covered by the exact rule.
 must_fail curl --max-time 10 -fsSI https://www.example.com/
-
-# Direct-IP egress remains denied even when TLS verification is disabled.
-must_fail curl --max-time 10 -kfsSI https://1.1.1.1/
-
-# Port 80 and HTTP downgrade are not covered by the port-443 rule.
+must_fail curl --max-time 10 -fsSI https://1.1.1.1/
 must_fail curl --max-time 10 -fsSI http://example.com/
-
-# POST is not one of the allowed methods.
 must_fail curl --max-time 10 -fsS -X POST https://example.com/
 ```
 
-**Pass:** the resolver list contains only `192.0.2.1` before and after the Docker helper, `example.com` receives a synthetic `198.18.0.0/15` address, alternate UDP/TCP DNS fails, the allowed request succeeds, and all four negative requests print `PASS: denied`. Successful certificate validation also exercises the guest's public CA installation and mediated TLS path. Do not edit `/etc/resolv.conf`.
+A client failure alone does not establish why it failed. Inspect private admission/outcome records using the audit path in host diagnostics. A missing outcome means unknown execution, never permission to replay. Alternate DNS, protocol and identity negatives are covered more comprehensively by the [automated integration suite](development.md#gateway-validation).
 
-## 4. Verify host-to-guest ingress
-
-Keep the guest shell open and start a guest service:
+Start an ingress server inside the guest, bound to all guest interfaces:
 
 ```bash
-mkdir -p "$TEST_DIR/sbx-ingress-smoke"
-printf 'gateway ingress works\n' >"$TEST_DIR/sbx-ingress-smoke/index.html"
-python3 -m http.server 3000 --bind 0.0.0.0 --directory "$TEST_DIR/sbx-ingress-smoke"
+python3 -m http.server 3000 --bind 0.0.0.0
 ```
 
-From a second host terminal:
+From a second host terminal, only the following loopback request is needed:
 
 ```bash
-export ROOT=/home/nueces/code/sbx/feature/rootless-network-gateway
-export TEST_DIR="$ROOT/local"
-export UV_TOOL_BIN_DIR="$TEST_DIR/bin"
-export PATH="$UV_TOOL_BIN_DIR:$PATH"
-cd "$TEST_DIR"
-sbx network status >/dev/null
-test "$(curl -fsS http://127.0.0.1:13000/)" = "gateway ingress works"
+curl --max-time 5 --fail http://127.0.0.1:13000/
 ```
 
-**Pass:** the host request reaches the guest service through the configured loopback listener. Stop the guest HTTP server with Ctrl-C after this check.
+**Expected:** the host receives the guest project directory listing. Stop the guest HTTP server with Ctrl-C, then leave that shell with `exit`.
 
-## 5. Verify stop and restart behavior
+## 4. Stop and restart (original host terminal)
 
-From the host:
+Collect needed live diagnostics before stopping; stop removes ephemeral runtime/authentication material. Then:
 
 ```bash
-sbx stop
-! curl -fsS --max-time 2 http://127.0.0.1:13000/
-sbx network diagnostics
+"$SBX_BIN" --config "$CONFIG" stop
+! curl --max-time 2 --fail http://127.0.0.1:13000/
+"$SBX_BIN" --config "$CONFIG" network diagnostics >"$EVIDENCE_DIR/diagnostics.stopped.txt"
+"$SBX_BIN" --config "$CONFIG" create
+"$SBX_BIN" --config "$CONFIG" network status
+"$SBX_BIN" --config "$CONFIG" shell
 ```
 
-**Pass:** stopping the VM closes ingress, and diagnostics do not report a live gateway.
-
-Start the same VM again without recreating it:
+Inside the guest, repeat the allowed request and resolver checks from step 3. Exit the guest shell and stop again from the original host terminal:
 
 ```bash
-sbx create
-sbx network status
-sbx network diagnostics
+"$SBX_BIN" --config "$CONFIG" stop
 ```
 
-Enter the guest and repeat the exact allowed request:
+**Expected:** ingress closes on stop, the existing VM disk is reused on restart, and the next gateway permits only configured traffic. Do not confuse a successful stop/start with pair-recovery acceptance; the integration suite checks authenticated replacement while QEMU stays alive.
+
+## Optional direct IPv4 check
+
+Use the [IPv4 examples](rootless-network-gateway.md#direct-ipv4-policies) with a service you own, then stop/start to apply policy. Check the exact allowed address/port, wrong ports and unlisted neighbors. HTTPS needs trusted IP SANs and normal guest CA verification; never use a DNS Host override or disable verification. Check origin execution counts and private audit records, not only curl's status. DNS-bound host credentials must not become available through an IP admission.
+
+The automated direct-IP fixture uses owned isolated public-address origins, not an arbitrary third-party endpoint. It does not weaken production address checks.
+
+## Failure, preservation and optional cleanup (host)
+
+**Default on failure: stop if possible and retain the VM, disk and entire private temporary tree.** Do not run `remove`, `recreate`, a recursive deletion or a failed request again to manufacture evidence. If guest export is unavailable, keep the stopped disk for later recovery. Never post raw logs, state, CA keys or UI login files; URLs can contain secrets.
+
+After collecting guest-only data and stopping all test writers, preserve the full isolated tree in a sibling archive (Linux GNU tar). The archive is outside the input tree. Comparing member contents must succeed before destructive cleanup:
 
 ```bash
-sbx shell
-test "$(awk '$1 == "nameserver" { print $2 }' /etc/resolv.conf)" = "192.0.2.1"
-getent ahostsv4 example.com | awk '{ print $1 }' | grep -Eqm1 '^198\.(18|19)\.'
-curl --max-time 15 -fsSI https://example.com/
-exit
+ARCHIVE="$SMOKE_DIR.tar.gz"
+tar -czf "$ARCHIVE" -C "$(dirname "$SMOKE_DIR")" "$(basename "$SMOKE_DIR")"
+tar -dzf "$ARCHIVE" -C "$(dirname "$SMOKE_DIR")"
 ```
 
-**Pass:** the existing VM starts with a newly ready gateway and allowed egress works again. There is no unrestricted fallback during the stopped interval or restart.
+**Expected:** both commands succeed and `tar --diff` reports no differences. A failed or partial archive does not authorize deletion. This is a private local snapshot, not a portable VM restore guarantee. Record its path and keep the original tree if uncertain.
 
-## 6. Clean up
+Only after verifying preservation, optionally remove the disposable VM through the installed CLI. **This deletes guest-only disk data and retained gateway generations**; review the confirmation rather than bypassing it:
 
 ```bash
-sbx stop
-sbx rm --force
-! curl -fsS --max-time 2 http://127.0.0.1:13000/
-rm -rf "$TEST_DIR/sbx-ingress-smoke"
-rm -f "$TEST_DIR/.sbx.toml"
-rm -rf "$TEST_DIR/tool" "$TEST_DIR/bin" "$TEST_DIR/dist"
-rm -rf "$HOME/.smolvm/images/gateway-smoke-task31"
+"$SBX_BIN" --config "$CONFIG" remove
 ```
 
-**Pass:** the VM is removed and the ingress port remains closed.
-
-## Operator record
-
-Record the following in the PR or release notes:
-
-- commit hash;
-- Linux and QEMU versions;
-- curated image path;
-- create, status, and diagnostics output;
-- allowed/denied egress results;
-- ingress response;
-- stop, restart, and cleanup results;
-- confirmation that no real credentials were used;
-- `macOS runtime: unverified` unless separately tested on macOS.
+Leave the evidence/archive in place. Close the dedicated host shell to discard its temporary HOME/XDG selection. Record sbx/image/QEMU identity, platform, allowed/denied results, audit interpretation, ingress and restart results, and any failed prerequisite. Native macOS and long-duration acceptance remain unverified by this procedure.

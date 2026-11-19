@@ -1,6 +1,6 @@
-# sbx Ergonomics
+# Sandbox usage and lifecycle
 
-This document captures the intended user experience for `sbx` commands and configuration.
+Use this guide for current project configuration, VM reuse, runtime tools and recovery. Start with [installation](../README.md#install) and an existing [prepared image](build-local-debian-pi-image.md). Commands below run on the host unless a section says otherwise.
 
 ## Goals
 
@@ -16,7 +16,7 @@ This document captures the intended user experience for `sbx` commands and confi
 
 The nearest `.sbx.toml` describes the sandbox associated with a project. When `[sbx].name` is configured, all config-consuming commands, including stop/remove, default to it unless an explicit name is given. Nested configs select the nearest project; ancestor configs are not merged. Session-directory mapping uses the most-specific host mount; overlapping guest targets remain user-controlled and can intentionally expose different content. No guest-shadowing guard is applied. Relative paths belong to the config file that supplies them, while CLI-relative paths belong to invocation cwd.
 
-These commands should work without a positional `NAME` from the project directory:
+These commands use the configured sandbox without a positional `NAME` from the project directory. **`recreate` and `rm` delete the disk:** preserve guest-only data and private gateway evidence before using them, especially with `--force`.
 
 ```bash
 sbx run
@@ -30,7 +30,7 @@ sbx network auth-port
 sbx network close-auth-port
 ```
 
-If a command needs a sandbox name and neither a positional name nor `[sbx].name` is available, `sbx` should print a clear error explaining that the command requires a VM name argument or `[sbx].name`.
+Commands that require an existing sandbox report a missing-name error when neither a positional name nor `[sbx].name` is available. Creation can select a generated name and write it into project configuration.
 
 ## Command model
 
@@ -81,7 +81,9 @@ Persistent security and forwarding policy lives in config so recreation is repro
 
 ## Existing VM reuse
 
-An existing named VM is reused as-is. Changing `.sbx.toml` does not implicitly mutate an existing VM's durable state. Apply user/tool provisioning changes explicitly with `sbx run --reprovision`.
+An existing named VM retains its disk and installed software; configuration changes never implicitly recreate or shrink it. Apply user/tool provisioning changes explicitly with `sbx run --reprovision`.
+
+`memory` (128–32768 MiB) and `cpus` (1–32) apply on the next sbx-managed stop/start. A running VM keeps its existing values and sbx prints restart guidance. Mount changes likewise need stop/start; changing the runtime user or disk size requires explicit recreation after preserving guest-only data. Memory above 16384 MiB depends on sbx's SmolVM 0.0.28 compatibility patch: load such VMs through sbx, not plain SmolVM.
 
 For example, if `.sbx.toml` changes from:
 
@@ -95,9 +97,9 @@ to:
 disk_size = 10240
 ```
 
-an already-created VM may still have an 81920 MiB disk. `sbx run` should reuse that VM rather than implicitly shrinking or recreating it.
+an already-created VM may still have an 81920 MiB disk. `sbx run` reuses that VM rather than implicitly shrinking or recreating it.
 
-`sbx doctor` should surface this mismatch:
+`sbx doctor` reports resource mismatches; for example:
 
 ```text
 sbx config/state:
@@ -106,7 +108,26 @@ sbx config/state:
   Existing VMs are reused as-is. Run `sbx recreate the-quest --force` to apply config changes.
 ```
 
-When using a local image, `sbx doctor` should also warn if `[sbx].disk_size` is smaller than the local image rootfs. `sbx run` should fail early with the same explanation: set `disk_size` to at least the image rootfs size, remove `disk_size`, or rebuild the configured local image with a smaller rootfs.
+When using a local image, `sbx doctor` also warns if `[sbx].disk_size` is smaller than the local image rootfs. `sbx run` fails early with the same explanation: set `disk_size` to at least the image rootfs size, remove `disk_size`, or rebuild the configured local image with a smaller rootfs.
+
+## Runtime tool installation
+
+`runtime_install` accepts `pi`, `specify`, `claude`, `opencode` and `codex`. It is independent of the selected `agent`. Example project fragment:
+
+```toml
+[sbx]
+runtime_install = ["pi", "specify"]
+```
+
+For an existing VM, request provisioning explicitly:
+
+```bash
+sbx run --runtime-install pi --runtime-install specify --no-attach
+```
+
+CLI selections replace the configured list for that invocation and imply reprovisioning. Installation is additive: removing an item never uninstalls guest software, and existing commands are not silently upgraded or overwritten. Claude/OpenCode additionally require a bounded version probe even for existing commands; broken binaries fail rather than count as installed. Npm lifecycle scripts execute third-party code as the runtime user under `$HOME/.local`; Specify uses uv. No agent is baked into the reusable image.
+
+Software survives stop/start, but VM removal/recreation deletes guest-only state. Provisioning with `--no-attach` does not prove the selected agent can launch. See [guest setup](#guest-setup-lifecycle) and [image troubleshooting](build-local-debian-pi-image.md#troubleshooting).
 
 ## Guest setup lifecycle
 
@@ -161,11 +182,11 @@ An explicit `sbx stop` is a direct request, not an idle-only policy. It may stop
 
 ## Shell completion
 
-Completion should be static and project-context oriented.
+Completion is static and project-context oriented.
 
-`sbx completion bash`, `sbx completion zsh`, and `sbx completion fish` should complete commands, options, and small enum values such as agents and shell names.
+`sbx completion bash`, `sbx completion zsh`, and `sbx completion fish` complete commands, options, and small enum values such as agents and shell names.
 
-Completion should not need VM-name lookup. The project context should make VM names optional for normal workflows.
+Completion does not require live VM-name lookup. Project context makes VM names optional for normal workflows.
 
 ## Auto-create `.sbx.toml`
 

@@ -1,68 +1,38 @@
 # Gateway development
 
-Use Go 1.26.5 with `GOTOOLCHAIN=local`; mediator dependencies come from the root uv lock.
-Linux is the tested runtime. Darwin amd64/arm64 are build and wheel-resolution checks only;
-gateway runtime confinement on macOS is explicitly unverified and weaker than Linux.
+This page covers implementation boundaries and specialized stability validation. Shared setup/build/test commands live in [development](../docs/development.md#gateway-validation); user policy, support and audit semantics live in the [gateway guide](../docs/rootless-network-gateway.md). Check [dependency upgrade gates](../docs/dependency-upgrade.md) before changing pins. Cross-builds and wheel resolution do not establish native macOS execution.
 
-The worker and QEMU resolve from explicit `SBX_GATEWAY_BIN` and `SBX_QEMU_BIN`
-paths before portable installation/PATH candidates. The mediator uses the installed
-`sbx` interpreter and packaged launcher; `mitmdump` resolves from the initiating CLI's
-normal `PATH` ordering, which the supervisor retains without other environment values.
-No gateway path uses sudo, capabilities, setuid helpers, TAP, or host firewall changes.
+## Runtime boundaries
 
-On Linux without accessible KVM, gateway-backed x86 guests use QEMU's supported
-TCG `max` CPU, not legacy `qemu64`: current Claude/OpenCode native binaries can
-otherwise fail with SIGILL. Automatic x86 machine selection uses q35 so stopped
-VMs do not intermittently lose timer calibration on restart; saved configurations
-are not rewritten. Explicit machine selection is preserved; ARM, KVM and
-non-gateway argv are otherwise unchanged. Record the CPU profile when comparing
-performance. Record the installed runtime's filesystem too: the validation
-workspace's shared filesystem adds seconds of Python import latency. The strict
-readiness gate is measured with a clean wheel installation on native local storage,
-not by hiding import time or using a warm process. Workspace-install failures remain
-separate evidence; this is not a universal filesystem-independent startup guarantee.
+Each VM has a persistent unprivileged supervisor and separate worker/mediator pair. QEMU belongs to the VM lifecycle. No production gateway path needs sudo, host capabilities, TAP or firewall changes. Privileged **test setup and observation** are separate and documented in the development guide.
 
-Claude/OpenCode provisioning also requires a successful, bounded 15-second
-`--version` check as the configured guest user, including for an existing command.
-A broken existing binary fails clearly rather than being silently reinstalled.
-The SDK's Claude preset/configuration handling and official npm installers remain
-in use. No login or inference is part of this check.
+The worker and QEMU resolve from explicit `SBX_GATEWAY_BIN` / `SBX_QEMU_BIN` before installation/PATH candidates. The mediator launcher uses the installed sbx interpreter, then resolves `mitmdump` through the initiating CLI's preserved PATH (or uses its packaged mitmweb wrapper). Other host environment values are not inherited implicitly. Provider environments are a separate, explicit inherited-descriptor boundary.
 
-The worker requires an inherited `--dns-state-fd` for a private append-only generation
-journal. The controller binds its header to VM/generation/policy digest; workers restore
-cached identities and register wildcard addresses before reading guest traffic. Mapping
-publication follows append/sync, and file locking excludes overlapping workers. Tests
-must pass the journal descriptor too; there is no empty-state recovery fallback. The
-configured DNS ceiling refuses new mappings rather than recycling guest-cached IPs.
+The final QEMU argv has one stream NIC, not SLIRP/TAP/bridge or a second fallback path. On Linux x86 without accessible KVM, automatic gateway-backed guests use q35/TCG `max`; explicit machine selections and unrelated backend paths remain preserved. Record CPU profile, filesystem and artifact identity in measurements, rather than attributing every timing difference to gateway code.
 
-QEMU framing deadlines bound partial headers/payloads and blocked writes, not ordinary
-between-frame inactivity. Fast framing tests use short transfer deadlines rather than
-waiting ten minutes to exercise this behavior.
+## Worker, DNS and capabilities
 
-Linux workers must be built with `CGO_ENABLED=0`: `no_new_privs` and Landlock are
-applied using Go's all-thread syscall barrier, covering existing OS threads and
-future threads through inheritance. A cgo-linked worker fails startup instead of
-claiming process-wide confinement. Kernels without Landlock still report it unavailable.
-After QEMU connects, the worker probes the guest with ARP so idle guests can complete
-replacement readiness without relaxing the authenticated-frame requirement.
+The controller passes an immutable digested policy, authenticated incarnation token, owned listeners, supervisor-lifetime descriptor and private append-only DNS journal via inherited FDs. Tests must pass `--dns-state-fd`; missing/empty initialized state is not recreated automatically.
 
-The mediator bounds glibc arena reservations before exec to preserve thread capacity
-under its unchanged 512 MiB address-space limit. Its 300-second TCP inactivity timeout
-matches the worker's HTTP idle limit; it is not a connection-establishment timeout.
+Workers validate journal VM/generation/policy identity and restore every cached mapping before traffic. Mapping publication follows append/sync; exclusive file locking excludes overlapping workers. Capacity refuses new names instead of recycling guest-cached addresses. Explicit literal IPv4 registrations are separate, unique exact addresses and must match the controller's `direct_ip_routes` readiness count. Numeric DNS queries do not acquire synthetic identities.
 
-SOCKS capability version 2 places the logical hostname in the username and signed
-flow/rule/time/nonce/port metadata in the password. Both fields fit RFC 1929's
-255-byte limit, including the largest accepted DNS name and rule ID. VM and worker
-identities remain bound into the signature without being repeated on the wire.
+SOCKS capability version 2 binds logical DNS/IP destination, port, flow/rule, time/nonce, VM and incarnation. Destination travels in the username, signed compact metadata in the password; both fit RFC 1929's 255-byte limit even for the largest accepted DNS host/rule. Tokens are single-use, not host credentials or outbound request signatures.
 
-Preset creation captures the original host provider environment before sanitizing
-guest provisioning. Only baseline HOME/PATH/TZ and explicitly inherited variables
-reach the supervisor through its private provider descriptor; guest sanitization stays unchanged.
+QEMU deadlines bound incomplete frame transfers and blocked writes, not quiet time between frames. Tests use shortened deadlines rather than waiting ten minutes. Replacement probes the guest with ARP and still requires an authenticated genuine frame before network readiness.
+
+## Confinement and bounded mediation
+
+Production Linux workers require `CGO_ENABLED=0`. The all-thread syscall barrier applies no-new-privileges/Landlock to existing threads and future threads by inheritance; cgo-linked workers fail rather than claim process-wide confinement. Unavailable Landlock remains explicitly reported. Do not disable nondumpability for resource observation.
+
+The mediator bounds glibc arena reservations before exec under its 512 MiB address-space limit. HTTP inactivity is 300 seconds, not a ten-second connect timeout. Its native async request hook must keep blocking broker/provider waits off the master loop and retain capacity reservations until outstanding work actually ends. Authorization, credential context, authority and headers are rechecked after awaits.
+
+Numeric routing and logical authorization are separate immutable bindings. Keep mitmproxy's public routing setters/pool behavior, fresh DNS validation on new named connections, numeric IP identity for IP-SAN verification, matching wire authority and connected-peer validation. Never relabel an open connection, bypass certificate verification or silently replay an unknown request.
+
+The [audit contract](../docs/rootless-network-gateway.md#host-audit-log-and-guest-denials) has one five-second lock/transport/durable-ACK budget, a 4 KiB ACK cap and sync-before-HTTP-forwarding. Outcomes remain asynchronous; logging/display windows are not an exactly-once guarantee. [Credential providers](../docs/network-credentials.md#process-and-trust-boundaries) keep their separate supervisor-owned cache and bounded helper lifecycle.
 
 ## Actual-VM stability validation
 
-From the implementation root, use the installed wheel's interpreter and an already
-running TCG VM with the prepared Debian tools and non-root `agent` account:
+From the repository root, use the clean-installed wheel's interpreter and an existing TCG VM with the prepared Debian tools and non-root `agent` account:
 
 ```sh
 "$INSTALLED_PYTHON" gateway/scripts/task19_stability.py \
@@ -71,52 +41,12 @@ running TCG VM with the prepared Debian tools and non-root `agent` account:
   --ingress-port "$HOST_PORT_FOR_GUEST_3000" --artifacts "$FRESH_PRIVATE_DIRECTORY"
 ```
 
-The synthetic origin must implement the endpoints and fake command/CodeArtifact
-credentials in `GUEST_WORKLOAD`; the guest receives only `GWC_TOKEN`/`GWC_AWS`
-opaque placeholders. Use a populated Git fixture, an installable `gwv-package==0.1`,
-incremental SSE and WebSocket echo, never real accounts. Quick public tunnels may
-buffer SSE: verify origin pacing independently before attributing it to the gateway.
-Keep TLS verification enabled and isolate any test CA trust configuration.
+The owned synthetic origin must implement `GUEST_WORKLOAD` endpoints and fake command/CodeArtifact credentials. The guest receives only `GWC_TOKEN` / `GWC_AWS` placeholders. Use populated Git, an installable `gwv-package==0.1`, incremental SSE and WebSocket echo, not real accounts. Public tunnels can buffer SSE; verify origin pacing independently. Keep normal TLS verification and isolate test CA trust.
 
-The default smoke requires 600 real seconds, real guest work, host ingress and one
-worker replacement. Every pair receives the same 150-second representative warm-up
-and two-second quiet checkpoints; samples are taken every two seconds (a gap over
-ten seconds fails). PID/start-time identities prevent replacement from hiding growth.
-Nondumpable processes require the separately staged count-only observer described in
-`docs/development.md` (from the repository root). Missing metrics, failed work or short
-runs fail rather than reporting zero usage.
+The default smoke requires 600 real seconds, real mixed guest work, ingress and a replacement. Every pair gets the same 150-second representative warm-up and two-second sampling/quiet checkpoints. Gaps over ten seconds, missing observations, failed work or shortened runs fail. PID/start-time identities prevent replacement from hiding growth. Use the separate count-only observer from [development](../docs/development.md#linux-integration).
 
-For a one-hour run without replacement, add `--duration 3600 --no-replacement`.
-The approved 16 MiB RSS allowance is **one-time retained growth**, conditional on two
-independent long-soak passes plus two replacement smokes—not a recurring allowance
-or a change to the 256 MiB idle target / 512 MiB ceiling. Each final half-hour must
-have six five-minute RSS medians spanning at most 2 MiB and continuing mixed work.
-`--minimum-tail-iterations` freezes the calibration-derived workload floor before
-holdouts. A smoke pass alone does not establish resource acceptance.
+For a one-hour run without replacement, add `--duration 3600 --no-replacement`. The conditional 16 MiB RSS allowance is **one-time retained growth**, not recurring growth or a change to the 256 MiB idle target / 512 MiB ceiling. It requires two independent long-soak passes plus two replacement smokes. The final half-hour needs six five-minute RSS medians spanning at most 2 MiB with continuing mixed work; `--minimum-tail-iterations` freezes a calibration-derived work floor before holdouts.
 
-Threads retain zero-growth checks unless `--thread-budgets` supplies component caps
-with hash-verified ownership evidence (`ceiling`, `evidence`, `sha256`); observed maxima
-are not caps. Long-run thread high-water must also stop increasing. These are test
-harness controls, not new application configuration. See
-[`docs/rootless-network-gateway-resource-audit-20261118.md`](../docs/rootless-network-gateway-resource-audit-20261118.md)
-for calibration, artifact-specific results and unresolved worker/audit findings.
+Threads retain zero-growth checks unless `--thread-budgets` supplies ownership-derived caps with hash-verified evidence (`ceiling`, `evidence`, `sha256`). Observed maxima are not finite-pool proofs; long-run high-water must also stop increasing. These are validation controls, not user runtime options, a proven leak repair or automatic release clearance.
 
-## Audit timing for early adoption
-
-Audit transactions have one **five-second total budget** for lock/transport/durable
-acknowledgement. Slow sync pauses traffic rather than forwarding before persistence;
-errors or expiry still fail closed without replay. See
-[the adoption decision and reporting checklist](../docs/rootless-network-gateway-audit-five-seconds-20261118.md).
-
-## Toolchain checks
-
-```sh
-GOTOOLCHAIN=local go mod verify
-GOTOOLCHAIN=local go test ./...
-CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 GOTOOLCHAIN=local go build ./cmd/sbx-gateway
-CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 GOTOOLCHAIN=local go build ./cmd/sbx-gateway
-uv sync --directory .. --locked --no-build --python 3.12
-uv audit --directory .. --locked
-uv run --directory .. --locked python -c \
-  'from importlib.metadata import distributions; print("\\n".join(sorted("{}=={}: {}".format(d.metadata["Name"], d.version, d.metadata.get("License-Expression") or d.metadata.get("License") or "UNKNOWN") for d in distributions())))'
-```
+Keep failure/partial attempts, executed harness identity and origin counts. Before removing a fixture, stop writers, finish all bounded diagnostic readers and verify required archive members. Missing output is incomplete evidence, not a successful archive merely because tar exited zero. Never restart/replay failed admitted work just to recover logs.

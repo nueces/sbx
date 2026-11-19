@@ -15,9 +15,24 @@ Linux amd64 ships with a prebuilt worker in the Python package. Darwin amd64/arm
 
 See the [component diagram](rootless-network-gateway-components.mmd), [manual validation runbook](rootless-network-gateway-manual-validation.md), and [credential guide](network-credentials.md). The credential guide includes an inline request-flow diagram, a supported/unsupported authentication summary, and copyable GitHub/CodeArtifact examples showing how policy IDs, credentials, bindings, fetch timing, and guest headers fit together.
 
+## Support and prerequisites
+
+This guide describes the current development checkout. Gateway support is absent from the older `v0.2.5` release; use an installation containing the feature, as explained under [installation](../README.md#install). Start with a prepared image and working QEMU 7.2+ host setup from the [image guide](build-local-debian-pi-image.md).
+
+| Area | Status / boundary |
+| --- | --- |
+| Linux amd64 | Functional gateway and isolated TCG tests have passed. This is not blanket release or long-duration acceptance. |
+| macOS amd64 / arm64 | Workers cross-build; native runtime and weaker Darwin confinement remain unverified. |
+| Dependency security | Last recorded check: 2026-11-11. The Tornado/mitmproxy compatibility conflict remains unresolved here, not freshly re-audited; see [upgrade gates](dependency-upgrade.md). |
+| Intel macOS installation | Last checked 2026-11-11: the locked secure Cryptography release lacked a wheel. Cross-building Go does not clear this gate. |
+| Reliability / performance | Fresh complete final-artifact long-soak and reference-performance acceptance remain open. A functional smoke or bounded RSS snapshot is not full acceptance; a small stable thread increase is not itself proof of a leak. |
+| Distribution / images | Licensing/notices decisions and manual booted-image Landlock verification remain separate gates. |
+
+No dependency exception, shared launcher or release approval is implied. Runtime gateway processes need no sudo or network capabilities; image building and isolated integration-test setup have different prerequisites. [Contributor validation](development.md) documents those separately.
+
 ## Runtime provisioning
 
-The package installation provides mitmproxy and the mediator dependencies from the root lock. Gateway startup uses the installed `sbx` interpreter; it does not invoke uv, download Python or packages, or create a per-VM virtual environment. CPython 3.12 is the supported baseline; newer versions are best effort. Mitmproxy is pinned to the numbered PyPI release 12.3.1. The dependency audit currently blocks release on Tornado vulnerabilities; see [dependency upgrades](dependency-upgrade.md).
+The package installation provides mitmproxy and the mediator dependencies from the root lock. Gateway startup uses the installed `sbx` interpreter; it does not invoke uv, download Python or packages, or create a per-VM virtual environment. CPython 3.12 is the supported baseline; newer versions are best effort. Mitmproxy is pinned to the numbered PyPI release 12.3.1. The last recorded audit blocks release on Tornado vulnerabilities; this is not a fresh security assessment. See [dependency upgrades](dependency-upgrade.md).
 
 Installed-file and dependency integrity are left to the package installer and OS. Gateway startup still probes required QEMU capabilities. No source build, compiler, runtime download, TAP/TUN device, sudo, capability, setuid helper, or host firewall rule is part of runtime setup. `SBX_GATEWAY_BIN` remains available for selecting a separately built worker. The mediator always uses the installed `sbx` interpreter and packaged launcher; `mitmdump` resolves through the initiating CLI's normal `PATH` ordering, which the persistent supervisor retains without inheriting any other environment values.
 
@@ -69,9 +84,87 @@ guest_port = 3000
 
 Old `[sbx].port_forwards` entries remain accepted and are normalized into ingress rules.
 
-Exact IPv4 literals in `hosts` opt into direct-IP routing for `tcp-forward` or credential-free `http-mediated` policies. See [direct IPv4 examples and certificate requirements](network-credentials.md#direct-ipv4-policies). No DNS query is required, and a DNS policy does not implicitly authorize its resolved IPs. Mediated IP HTTPS requires normal IP-SAN certificate verification; private mediated HTTP, IP host-credential bindings, IPv6 literals and IP-based TLS passthrough are not supported. Upgrade and stop/start to activate the matching worker artifacts. Linux direct-IP acceptance and installed artifact identities are recorded in the [validation report](rootless-network-gateway-direct-ip-20261119.md).
-
 All supported policy modes use TCP. Overlapping host/port scopes are rejected even when their mode names differ: for example, HTTP mediation for `*.example.com:443` cannot coexist with raw TCP for `db.example.com:443`. Distinct ports or disjoint host scopes remain valid. Merely adding `[network]` still enables default-deny outbound networking.
+
+## Network policies
+
+Policy examples below are network fragments: merge them into your `.sbx.toml` rather than repeat existing tables. `[network]` enables default-deny networking; without it the normal backend uses SLIRP. All destinations use the same policy table with an explicit mode:
+
+```toml
+[[network.policy]]
+id = "example-api"
+mode = "http-mediated"
+hosts = ["api.example.com"]
+ports = [443]
+methods = ["GET", "POST"]
+path_prefixes = ["/v1/"]
+```
+
+- `http-mediated`: inspect HTTP/HTTPS; permits `methods`, `path_prefixes` and an ordered unique `hooks` list containing only approved built-in names. Empty methods or paths allow all within the destination policy.
+- `tls-passthrough`: preserve end-to-end TLS for any TLS-wrapped application protocol, authorized through exact DNS SNI. No HTTP inspection or host credential injection.
+- `tcp-forward`: forward opaque TCP without inspecting HTTP or TLS.
+
+For example:
+
+```toml
+[[network.policy]]
+id = "private-ldaps"
+mode = "tls-passthrough"
+hosts = ["ldap.example.com"]
+ports = [636]
+
+[[network.policy]]
+id = "postgres"
+mode = "tcp-forward"
+hosts = ["db.example.com"]
+ports = [5432]
+```
+
+`hosts` is always a list. One-label wildcards such as `*.example.com` match neither the apex nor `a.b.example.com`; only credential-free HTTP and raw TCP permit them. TLS passthrough and credential-bound policies require exact DNS hosts. Share a policy only when every host has identical authorization. Different permissions need separate policies. Expanded internal rules retain the public policy ID used by bindings and diagnostics.
+
+`allow_ranges` is valid only for TLS passthrough and raw TCP. Each normalized CIDR explicitly permits an otherwise forbidden resolved address; it does not authorize additional hosts. Mediated HTTP rejects this option and remains public-unicast-only. Literal TCP additionally follows the hard exclusions below.
+
+Methods normalize to uppercase. Paths repeatedly percent-decode within a fixed bound, reject invalid encoding, control characters, backslashes and dot segments, then match the whole prefix or a slash-delimited descendant. Credential bindings may narrow but never widen their parent policies; see [bindings](network-credentials.md#bindings).
+
+## Direct IPv4 policies
+
+An IPv4 literal in `hosts` is the opt-in; there is no global bypass. Only listed addresses and ports become reachable. A DNS policy does not grant direct access to its resolved IPs, and `allow_ranges` does not grant access to neighboring addresses in its CIDR.
+
+Private TCP needs an exact IP plus an explicit safety exception (network fragment):
+
+```toml
+[[network.policy]]
+id = "database-ip"
+mode = "tcp-forward"
+hosts = ["10.20.30.40"]
+ports = [5432]
+allow_ranges = ["10.20.30.40/32"]
+```
+
+Raw TCP may carry TLS, but the guest application must verify its service certificate. The gateway does not inspect it, inject host credentials, or provide the durable HTTP-admission guarantee.
+
+For HTTP inspection use credential-free mediation. Replace this illustrative address with the public IPv4 of a service you own (network fragment):
+
+```toml
+[[network.policy]]
+id = "public-ip-api"
+mode = "http-mediated"
+hosts = ["93.184.216.34"]
+ports = [443]
+methods = ["GET", "HEAD"]
+path_prefixes = ["/v1/"]
+```
+
+Mediated HTTP/HTTPS remains public-unicast-only, without private-range exceptions. For HTTPS, the trusted upstream certificate must contain the exact IP as an **IP-address SAN**, not a DNS SAN containing numeric text or only a matching Common Name. The existing per-VM CA supplies an IP SAN on the guest-facing leaf. Ordinary IP clients omit SNI; nonempty SNI on an IP admission is rejected, while DNS HTTPS still requires matching SNI. `Host`/HTTP2 authority must match the IP and effective port. Never disable verification or use a DNS Host override to select a virtual host through an IP policy.
+
+```text
+DNS policy: guest -> synthetic address -> DNS identity checks -> validated upstream IP
+IP policy:  guest -> configured IPv4  -> exact IP/port checks -> that same upstream IP
+```
+
+Both mediated paths require durable admission before forwarding HTTP. Literal routes do not perform DNS or consume synthetic mappings; replacement restores exact registrations. They cannot select DNS-bound host credentials or widen redirects. IPv6 literals, numeric aliases (integer/hex/short IPv4), CIDR hosts and IP TLS passthrough are unsupported. Unconfigured IPs/ports are denied.
+
+Direct destinations in `0.0.0.0/8`, loopback, link-local, the guest/gateway subnet, synthetic pool, multicast and reserved non-unicast space remain forbidden even with broad range exceptions. Upgrade and stop/start to activate matching worker artifacts; an old worker without the required direct-IP readiness count fails clearly. Native macOS remains unverified.
 
 ## Admission and retained state
 
@@ -129,14 +222,6 @@ Admission without an outcome means **execution unknown**, not success, failure o
 
 Guest-facing policy/credential denials now use HTTP 403 with a fixed empty body. Capacity, malformed/header-size and provider/upstream failures retain their distinct status codes, also with empty bodies; internal reason codes are host-only.
 
-## Task 19 status
-
-The following records the initial checkpoint. The newer [merge-readiness campaign](rootless-network-gateway-merge-readiness.md) requires all targets; the initial deferrals no longer clear that campaign.
-
-Passed: the bounded ten-minute mediator stability smoke completed with bounded RSS, FDs, processes, and threads. This smoke does not launch QEMU; TCG coverage comes from the separate single- and multi-VM harnesses.
-
-Deferred, not passed: readiness p95, absolute throughput, sustained 128-active HTTP request performance, and repeat four-VM TCG performance. Current preference for the follow-up is a warm launcher/forkserver with separate per-VM children; do **not** collapse VMs into one shared mitmproxy process without a new design decision.
-
 ## SmolVM migration condition
 
 `sbx` keeps its typed external-network facade until a released SmolVM version exposes the same QEMU Unix-stream backend API. Migrate only after the upstream release preserves the single-NIC/no-SLIRP invariant and the existing QEMU argv tests pass unchanged.
@@ -163,14 +248,16 @@ Deferred, not passed: readiness p95, absolute throughput, sustained 128-active H
 
 1. Build Linux amd64 and Darwin amd64/arm64 workers.
 2. Verify the root lock resolves wheel-only for supported Linux and Darwin targets and passes `uv audit`.
-3. Run Section 22 functional/security acceptance under explicit TCG.
+3. Run the fast, mediator, Go/race and explicit-TCG integration checks in [development](development.md), then the [operator smoke](rootless-network-gateway-manual-validation.md). Record long-duration/performance and native-platform results separately; missing required results remain open.
 4. Run help/completion/doc example parse checks, tests, ruff, Go tests, audits, and `git diff --check`.
 5. Record macOS as unverified unless it was actually run.
 
 ## Rollback checklist
 
-1. Disable `[network]` gateway mode in affected configs.
-2. Stop affected VMs: `sbx stop NAME`.
-3. Remove stale gateway state under the user sbx state directory if diagnostics report it unsafe.
-4. Reinstall the previous `sbx` package/tag.
-5. Preserve `audit.log` and bounded mediator/worker logs for investigation; they should be secret-redacted. Treat `web-auth.json` as an authentication secret, not a shareable diagnostic.
+1. Stop affected VMs with their existing configuration: `sbx stop NAME`. Do not restart failed admitted transactions merely to collect evidence.
+2. Preserve the private audit, DNS journal, state, diagnostic logs and needed guest-only data before any removal/reset or downgrade. Include runtime evidence before stop where safely obtainable; stop removes ephemeral CA/auth files and live endpoints. If export fails, retain the stopped VM and disk.
+3. Verify the archive contents and hashes. An `admitted` request without an outcome remains unknown; never replay it automatically.
+4. Only after preservation, explicitly reset/remove owned state when required by the selected version's format. Do not delete a directory just because its metadata is corrupt or unsafe. VM removal deletes retained evidence and guest-only data.
+5. Reinstall the selected previous package/tag and review its configuration compatibility before restarting. Disabling `[network]` switches back to unrestricted-by-this-gateway SLIRP; that is an explicit security-policy change, never an automatic recovery step.
+
+Audit URLs/query strings can contain secrets even though known provider values and placeholders are redacted. Keep archives private and never publish raw state, logs, CA keys or UI login URLs without review.

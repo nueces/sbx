@@ -4,8 +4,8 @@ runtime_install = ["pi"]
 # Add "specify" to install the Specify CLI with uv during provisioning.
 # runtime_install = ["pi", "specify", "claude", "opencode", "codex"]
 # Installation is independent from launch choice: agent = "opencode" is also supported.
-name = "pi"
-image = "~/.smolvm/images/debian-sbx"
+name = "the-quest"
+image = "~/.smolvm/images/sbx"
 memory = 2048
 cpus = 2
 # Defaults to the current host username when omitted.
