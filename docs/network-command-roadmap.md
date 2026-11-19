@@ -52,6 +52,31 @@ sbx network status --host-port=53692
 
 Status reports VM/network information, callback ownership and gateway status when applicable. Do not assume a fixed guest IP or SSH port: use the running VM's output. A busy/untracked callback port is not owned by sbx and is not proof that authentication will work. See [tunnel ownership and replacement](auth-ports.md#persistent-manual-forwarding).
 
+## Gateway UI
+
+For normal traffic-viewer access, enable the UI in your existing `[network]` table (configuration fragment):
+
+```toml
+[network]
+mitmweb = true
+```
+
+Apply the setting and request the login URL from the host:
+
+```bash
+sbx stop
+sbx create
+sbx network ui
+# Or select an explicit sandbox:
+sbx network ui the-quest
+```
+
+Success prints one authenticated URL and exits 0. Open it manually in your host browser. **The URL contains a login token:** do not share it or redirect it into shared logs. The explicit command prints it even when stdout is redirected; routine status/diagnostics never do.
+
+The command is read-only: it does not enable the UI, start/restart the sandbox, open a browser or probe HTTP. It uses the running gateway even if requested configuration differs. A stopped gateway needs a start; a recovering gateway must become ready. Missing UI files mean disabled **or unavailable**, not proof of either: check the setting, stop/start explicitly, and use diagnostics if it remains unavailable. Operational failures leave stdout empty and exit 1; missing name or invalid config exits 2.
+
+Recovery changes the port/token. Rerun `sbx network ui` for the current URL; replacement detected during lookup fails rather than knowingly returning an old URL. A later replacement can still invalidate a successful lookup. The private `web-auth.json` remains an internal implementation detail. See the [UI reference](rootless-network-gateway.md#optional-read-only-mitmweb-ui) for authentication, read-only enforcement and sensitive metadata.
+
 ## Gateway diagnostics
 
 ```bash

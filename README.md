@@ -135,7 +135,7 @@ sbx network status
 sbx network diagnostics
 ```
 
-A foreground forward lasts until Ctrl-C. Optional `[network].mitmweb = true` enables a private authenticated read-only UI; diagnostics show its private authentication-file path. Do not expose the UI or publish raw diagnostics/state without reviewing sensitive content. The [networking command reference](docs/network-command-roadmap.md) covers both modes.
+A foreground forward lasts until Ctrl-C. Optional `[network].mitmweb = true` enables a private authenticated read-only UI; stop/start applies that setting. Run `sbx network ui` (or `sbx network ui NAME`) to print its current login URL, then open it manually. **The URL contains a login token: do not share it or capture it in shared logs.** The command never opens a browser, enables the UI or restarts a sandbox. Diagnostics remain for troubleshooting and never print the token. The [networking command reference](docs/network-command-roadmap.md#gateway-ui) covers setup and failure guidance.
 
 ## Completion and command help
 

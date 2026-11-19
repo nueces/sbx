@@ -2144,6 +2144,14 @@ def build_parser() -> argparse.ArgumentParser:
     network_status.add_argument("--json", action="store_true", help="Print JSON.")
     network_status.set_defaults(func=network.cmd_status)
 
+    network_ui = network_sub.add_parser(
+        "ui",
+        help="Print the authenticated read-only gateway UI URL (contains a login token).",
+        description="Print the authenticated read-only gateway UI URL (contains a login token).",
+    )
+    network_ui.add_argument("name", nargs="?", help="Sandbox name or ID. Defaults to [sbx].name.")
+    network_ui.set_defaults(func=network.cmd_ui)
+
     network_diagnostics = network_sub.add_parser(
         "diagnostics",
         help="Show redacted gateway configuration and state diagnostics.",

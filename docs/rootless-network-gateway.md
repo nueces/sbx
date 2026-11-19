@@ -186,6 +186,8 @@ A quiet QEMU stream has no between-frame idle deadline. The existing 600-second 
 
 ## Optional read-only mitmweb UI
 
+Set this in your existing `[network]` table (fragment; do not create a duplicate table):
+
 ```toml
 [network]
 mitmweb = true
@@ -193,7 +195,19 @@ mitmweb = true
 
 The boolean defaults to `false` (`mitmdump`); `true` runs a hardened mitmweb wrapper using the installed package interpreter. Changing it requires stop/start, just like a policy change. No browser opens automatically. Each mediator owns a distinct OS-assigned `127.0.0.1` port and retains mitmweb authentication. The UI is stopped with the mediator, including on supervisor death; recovery creates a new port and authentication token.
 
-Use `sbx network diagnostics NAME` for the address and private `web-auth.json` path. Read that owner-only file on the host to obtain the login URL, then open it manually. Never share that URL, copy it into project config, or expose/forward the UI to the guest or a public interface. Diagnostics and process arguments never print its token. Read the file again after recovery.
+After changing the setting, run on the host from your configured project:
+
+```bash
+sbx stop
+sbx create
+sbx network ui
+```
+
+`sbx network ui NAME` selects an explicit sandbox. Success prints exactly the current authenticated login URL; open it manually in your host browser. **The URL is a credential:** never share it, capture it in shared logs, copy it into project config, or expose/forward the UI to the guest or a public interface. Printing is an explicit disclosure, including when stdout is redirected. Rerun the command after recovery to obtain the new URL; a URL can become stale immediately after lookup.
+
+The command requires a live ready supervisor, validates private UI metadata and refuses detected replacement during lookup. It never starts/restarts anything, changes policy, launches a browser or probes the HTTP endpoint. If the UI is disabled or its files are missing, check `mitmweb = true` and apply stop/start; if already enabled, use `sbx network diagnostics NAME` for troubleshooting. A recovering gateway must become ready before lookup succeeds. Operational failures leave stdout empty and exit 1; a missing name or invalid configuration exits 2.
+
+`web-auth.json` remains an internal owner-only authentication artifact, not the normal user interface. Status/diagnostics may show the non-secret address and authentication-file path, but never read or print its token. The URL is not passed to another process.
 
 The UI shows completed **metadata snapshots** with full request URLs and targets, including query strings, plus the separate canonical policy path, method, destination, status and outcome. It retains at most 256 whole events within an 8 MiB serialized-event budget, evicting oldest whole snapshots rather than trimming fields; the persistent audit log is independent of that display window. It never retains live proxy flows, request/response headers, bodies, WebSocket messages, provider values, or guest placeholders. Flow export contains the same sanitized snapshots. Editing, importing, replay, arbitrary commands and option mutations return HTTP 403; this is an observer, not an interactive proxy debugger. TLS passthrough and traffic denied before HTTP mediation do not produce HTTP snapshots.
 

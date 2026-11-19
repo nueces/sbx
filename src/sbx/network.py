@@ -427,6 +427,23 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ui(args: argparse.Namespace) -> int:
+    name = vm_name_from_arg_or_config(args, getattr(args, "config_data", None), "network ui")
+    if name is None:
+        return 2
+    try:
+        url = gateway.ui_url(name)
+    except (gateway.GatewayStateError, OSError):
+        message = "gateway UI state is unsafe or corrupt"
+    except gateway.GatewayLifecycleError as exc:
+        message = str(exc)
+    else:
+        print(url)
+        return 0
+    print(f"sbx: {message}. Use 'sbx network diagnostics' for details.", file=sys.stderr)
+    return 1
+
+
 def cmd_diagnostics(args: argparse.Namespace) -> int:
     name = vm_name_from_arg_or_config(
         args, getattr(args, "config_data", None), "network diagnostics"
