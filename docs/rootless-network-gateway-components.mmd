@@ -7,13 +7,15 @@ flowchart LR
     Ingress[Controller-owned<br/>ingress listeners]
     Worker[Per-VM sbx-gateway worker<br/>gVisor netstack]
     Mediator[Per-VM mitmproxy mediator<br/>HTTP, hooks, credential injection]
-    Provider[Credential provider]
-    Upstream[(Approved upstream)]
+    Broker[Supervisor-owned credential broker<br/>memory-only cache]
+    Provider[Bounded host provider helper<br/>op, AWS CLI, installed plugin]
     CA[Per-VM CA<br/>private key host-only]
+    QEMU[QEMU / SmolVM<br/>one Unix-stream NIC]
   end
 
+  Upstream[(Authorized remote upstream)]
+
   subgraph VM[Disposable VM]
-    QEMU[QEMU / SmolVM<br/>one Unix-stream NIC]
     Guest[Guest network stack and workload]
     GuestCA[Public CA certificate]
   end
@@ -24,13 +26,17 @@ flowchart LR
   Supervisor -->|spawn, authenticate, monitor| Mediator
   Supervisor -->|pre-opened Unix socket| QEMU
   Supervisor -->|reserved descriptors| Ingress
+  Supervisor -->|owns, optional startup fetch| Broker
 
   Guest <-->|Ethernet: DHCP, DNS, TCP| QEMU
   QEMU <-->|length-framed Ethernet<br/>Unix stream| Worker
 
   Worker -->|destination-bound<br/>single-use SOCKS capability| Mediator
-  Mediator -->|approved HTTP/TLS| Upstream
-  Mediator <-->|bounded secret request/response| Provider
+  Mediator -->|HTTP only after durable admission ACK| Upstream
+  Mediator <-->|private bounded credential IPC| Broker
+  Broker <-->|describe / fetch| Provider
+  Mediator -->|admission and outcome records| Supervisor
+  Supervisor -->|admission ACK after flush and sync| Mediator
   Worker -->|exact TLS passthrough<br/>or approved raw TCP| Upstream
 
   Ingress -->|owned listener descriptor| Worker

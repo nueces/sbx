@@ -13,7 +13,7 @@ channel; QEMU remains owned by the VM lifecycle.
 
 Linux amd64 ships with a prebuilt worker in the Python package. Darwin amd64/arm64 workers are built for release artifacts, but macOS runtime is **unverified** and has weaker confinement than Linux. End users do not need Go.
 
-See the [component diagram](rootless-network-gateway-components.mmd), [manual validation runbook](rootless-network-gateway-manual-validation.md), and implemented [network credential model](network-credentials.md).
+See the [component diagram](rootless-network-gateway-components.mmd), [manual validation runbook](rootless-network-gateway-manual-validation.md), and [credential guide](network-credentials.md). The credential guide includes an inline request-flow diagram, a supported/unsupported authentication summary, and copyable GitHub/CodeArtifact examples showing how policy IDs, credentials, bindings, fetch timing, and guest headers fit together.
 
 ## Runtime provisioning
 

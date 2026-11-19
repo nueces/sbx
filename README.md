@@ -203,7 +203,7 @@ Gateway mode replaces SLIRP with a default-deny path through a per-VM worker and
 
 Set `[network].mitmweb = true` for an authenticated, read-only host-loopback metadata UI (off by default). `sbx network diagnostics NAME` reports its address, private login-file path, and generation audit-log path. Live credentials, headers and bodies are never retained in the UI.
 
-See [`docs/rootless-network-gateway.md`](docs/rootless-network-gateway.md) for configuration, current dependency-audit release blockers, security status, performance deferrals, release, and rollback notes.
+See [`docs/rootless-network-gateway.md`](docs/rootless-network-gateway.md) for configuration, current dependency-audit release blockers, security status, performance deferrals, release, and rollback notes. The [credential guide](docs/network-credentials.md) includes a request-flow diagram, supported authentication methods and limits, and GitHub/CodeArtifact configuration and guest examples.
 
 ## Other operations
 
