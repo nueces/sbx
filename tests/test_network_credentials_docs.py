@@ -40,6 +40,18 @@ def test_credential_guide_toml_fences_parse():
         tomllib.loads(source)
 
 
+def test_direct_ip_examples_are_explicit_and_credential_free():
+    section = (
+        GUIDE.read_text().split("## Direct IPv4 policies\n", 1)[1].split("## Credentials\n", 1)[0]
+    )
+    examples = re.findall(r"```toml\n(.*?)```", section, re.DOTALL)
+    assert len(examples) == 2
+    for source in examples:
+        config = _validate(tomllib.loads(source))
+        assert not config.credentials and len(config.rules) == 1
+        assert gateway._valid_ip(config.rules[0].host)
+
+
 def test_full_credential_example_uses_shipped_methods_and_explicit_bindings():
     config = _validate(_example("Full example"))
     credentials = {credential.id: credential for credential in config.credentials}

@@ -189,6 +189,9 @@ func (c *Config) normalize() error {
 		if len(slices.Compact(r.AllowRanges)) != len(r.AllowRanges) {
 			return fmt.Errorf("rule %q: duplicate allowed range", r.ID)
 		}
+		if ip, err := netip.ParseAddr(r.Host); err == nil && !r.AllowsDirectIP(ip) {
+			return fmt.Errorf("rule %q: direct-IP destination is forbidden or requires a TCP allowed range", r.ID)
+		}
 		for _, port := range r.Ports {
 			transport := r.Protocol
 			if transport == "http" || transport == "tls" {
@@ -286,7 +289,13 @@ func forbiddenIP(ip netip.Addr) bool {
 func normalizeHost(value string) (string, error) {
 	host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(value), "."))
 	if addr, err := netip.ParseAddr(host); err == nil {
-		return addr.Unmap().String(), nil
+		if !addr.Is4() {
+			return "", errors.New("direct-IP policies support IPv4 only")
+		}
+		return addr.String(), nil
+	}
+	if numericHost.MatchString(host) {
+		return "", errors.New("ambiguous IP address")
 	}
 	wildcard := strings.HasPrefix(host, "*.")
 	if wildcard {
@@ -306,6 +315,9 @@ func normalizeHost(value string) (string, error) {
 		}
 	}
 	if wildcard {
+		if _, err := netip.ParseAddr(host); err == nil || numericHost.MatchString(host) {
+			return "", errors.New("wildcard IP address")
+		}
 		if !strings.Contains(host, ".") {
 			return "", errors.New("wildcard must retain a registrable suffix")
 		}

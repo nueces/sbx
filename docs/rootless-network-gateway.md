@@ -69,6 +69,8 @@ guest_port = 3000
 
 Old `[sbx].port_forwards` entries remain accepted and are normalized into ingress rules.
 
+Exact IPv4 literals in `hosts` opt into direct-IP routing for `tcp-forward` or credential-free `http-mediated` policies. See [direct IPv4 examples and certificate requirements](network-credentials.md#direct-ipv4-policies). No DNS query is required, and a DNS policy does not implicitly authorize its resolved IPs. Mediated IP HTTPS requires normal IP-SAN certificate verification; private mediated HTTP, IP host-credential bindings, IPv6 literals and IP-based TLS passthrough are not supported. Upgrade and stop/start to activate the matching worker artifacts. Linux direct-IP acceptance and installed artifact identities are recorded in the [validation report](rootless-network-gateway-direct-ip-20261119.md).
+
 All supported policy modes use TCP. Overlapping host/port scopes are rejected even when their mode names differ: for example, HTTP mediation for `*.example.com:443` cannot coexist with raw TCP for `db.example.com:443`. Distinct ports or disjoint host scopes remain valid. Merely adding `[network]` still enables default-deny outbound networking.
 
 ## Admission and retained state
@@ -142,9 +144,9 @@ Deferred, not passed: readiness p95, absolute throughput, sustained 128-active H
 ## Security notes
 
 - The guest's effective DNS resolver must be the gateway at `192.0.2.1`. UDP DNS sent elsewhere has no forwarding path; TCP port 53 is denied unless an explicit TCP policy allows it. DNS-over-HTTPS and DNS-over-TLS are ordinary HTTPS/TLS traffic, so do not allow their providers unless intended. Addresses learned through another resolver do not grant egress by themselves.
-- Unknown destinations, direct IP egress, alternate DNS, UDP/443/QUIC, identity mismatches, crashes, and unsupported protocols fail closed.
+- Unknown destinations, unconfigured direct IP egress, alternate DNS, UDP/443/QUIC, identity mismatches, crashes, and unsupported protocols fail closed.
 - Raw TCP/TLS forwarding denies non-public/special-use addresses by default, including `100.64.0.0/10` and Alibaba metadata `100.100.100.200`, reserved/documentation ranges and IPv6 transition/special-use space. Explicit `allow_ranges` exceptions remain available for those forwarding modes; IPv4-mapped addresses are checked as IPv4.
-- Mediated HTTP resolves the admitted hostname once per new upstream connection, validates every answer as public unicast (including IPv4-mapped addresses), and pins a validated numeric destination. Loopback/private/link-local/metadata, reserved/non-public and multicast answers are denied, including mixed public/private results. TLS identity remains the logical hostname. HTTP mode does not allow private-range exceptions; local protocol tests use a test-only launcher, not a production option.
+- DNS-named mediated HTTP resolves the admitted hostname once per new upstream connection, validates every answer as public unicast (including IPv4-mapped addresses), and pins a validated numeric destination. Loopback/private/link-local/metadata, reserved/non-public and multicast answers are denied, including mixed public/private results. TLS identity remains the logical hostname. HTTP mode does not allow private-range exceptions; local protocol tests use a test-only launcher, not a production option.
 - Secrets stay host-side; the guest receives placeholders only, scoped by destination and approved fields.
 - Linux uses rootless hardening where available. macOS is portable by design but unverified and less confined.
 - Same-UID host processes remain a residual risk; use a separate OS account if that matters.

@@ -146,7 +146,7 @@ func TestDialRejectsForbiddenAddressUnlessExplicit(t *testing.T) {
 			conn.Close()
 		}
 	}()
-	conn, err := f.dial(context.Background(), config.Rule{AllowRanges: []string{"127.0.0.0/8"}}, "127.0.0.1", uint16(port))
+	conn, err := f.dial(context.Background(), config.Rule{Protocol: "tcp", AllowRanges: []string{"127.0.0.0/8"}}, "localhost", uint16(port))
 	if err != nil {
 		t.Fatal(err)
 	}

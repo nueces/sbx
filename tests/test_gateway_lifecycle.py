@@ -40,6 +40,62 @@ def lifecycle_config() -> gateway.GatewayConfig:
     return config
 
 
+@pytest.mark.parametrize("routes", [None, False, True, 0, 1, 1.0, 2])
+def test_direct_ip_requires_exact_worker_readiness_count(
+    lifecycle_config, tmp_path, monkeypatch, routes
+):
+    config = replace(
+        lifecycle_config, rules=(replace(lifecycle_config.rules[0], host="93.184.216.34"),)
+    )
+    instance, _runner, _listeners = controller(config, tmp_path, monkeypatch)
+    original = instance._read_worker_status
+
+    def readiness(expected, deadline=None):
+        payload = original(expected, deadline)
+        if expected == "ready" and routes is not None:
+            payload["direct_ip_routes"] = routes
+        return payload
+
+    monkeypatch.setattr(instance, "_read_worker_status", readiness)
+    try:
+        if type(routes) is int and routes == 1:
+            instance.prepare()
+        else:
+            with pytest.raises(gateway.GatewayAuthenticationError, match="direct-IP routes"):
+                instance.prepare()
+    finally:
+        instance.close()
+
+
+@pytest.mark.parametrize("routes", [1, 2])
+def test_direct_ip_readiness_is_rechecked_on_replacement(
+    lifecycle_config, tmp_path, monkeypatch, routes
+):
+    config = replace(
+        lifecycle_config, rules=(replace(lifecycle_config.rules[0], host="93.184.216.34"),)
+    )
+    instance, runner, _listeners = controller(config, tmp_path, monkeypatch)
+    original = instance._read_worker_status
+
+    def readiness(expected, deadline=None):
+        payload = original(expected, deadline)
+        if expected == "ready":
+            payload["direct_ip_routes"] = 1 if runner.worker_starts == 1 else routes
+        return payload
+
+    monkeypatch.setattr(instance, "_read_worker_status", readiness)
+    try:
+        instance.prepare()
+        if routes == 1:
+            instance.recover()
+            assert runner.worker_starts == 2
+        else:
+            with pytest.raises(gateway.GatewayLifecycleError, match="reconnection failed"):
+                instance.recover()
+    finally:
+        instance.close()
+
+
 class FakeListener:
     def __init__(self, *args: object, fail: bool = False, port: int = 45123) -> None:
         del args
@@ -2121,7 +2177,12 @@ def test_persistent_supervisor_survives_bootstrap_and_drains_data_plane(tmp_path
         {
             "network": {
                 "policy": [
-                    {"id": "discard", "mode": "tcp-forward", "hosts": ["127.0.0.1"], "ports": [9]},
+                    {
+                        "id": "discard",
+                        "mode": "tcp-forward",
+                        "hosts": ["discard.example"],
+                        "ports": [9],
+                    },
                     {
                         "id": "wildcard",
                         "mode": "tcp-forward",
@@ -2238,7 +2299,12 @@ def test_supervisor_death_closes_data_plane_and_fallback_reclaims_state(tmp_path
         {
             "network": {
                 "policy": [
-                    {"id": "discard", "mode": "tcp-forward", "hosts": ["127.0.0.1"], "ports": [9]}
+                    {
+                        "id": "discard",
+                        "mode": "tcp-forward",
+                        "hosts": ["discard.example"],
+                        "ports": [9],
+                    }
                 ]
             }
         },

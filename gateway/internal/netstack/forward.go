@@ -224,9 +224,18 @@ func (f *TCPForwarder) dial(ctx context.Context, rule config.Rule, host string, 
 	if rule.Protocol == "http" {
 		return f.mediator.Dial(ctx, rule, host, port)
 	}
-	addresses, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
-	if err != nil {
-		return nil, err
+	var addresses []netip.Addr
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if !rule.AllowsDirectIP(ip) {
+			return nil, errors.New("direct-IP destination denied")
+		}
+		addresses = []netip.Addr{ip}
+	} else {
+		var err error
+		addresses, err = net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+		if err != nil {
+			return nil, err
+		}
 	}
 	for _, ip := range addresses {
 		if !rule.AllowsIP(ip) {

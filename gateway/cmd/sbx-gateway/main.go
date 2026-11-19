@@ -97,6 +97,11 @@ func prepareDNS(network *gatewaynet.Network, cfg config.Config, journal *os.File
 	if err != nil {
 		return nil, err
 	}
+	for _, ip := range cfg.DirectIPs() {
+		if err := network.AddLocalAddress(net.IP(ip.AsSlice())); err != nil {
+			return nil, fmt.Errorf("register direct-IP address: %w", err)
+		}
+	}
 	for _, rule := range cfg.Rules {
 		if strings.Contains(rule.Host, "*") || net.ParseIP(rule.Host) != nil {
 			continue
@@ -263,6 +268,7 @@ func run() error {
 		"generation": cfg.Generation, "digest": cfg.Digest, "incarnation": *workerIncarnation,
 		"incarnation_proof": proof, "mediator": mediator != nil,
 		"ingress": len(registeredIngress), "hardening": hardeningStatus.Encode(),
+		"direct_ip_routes": len(cfg.DirectIPs()),
 	}); err != nil {
 		return fmt.Errorf("readiness: %w", err)
 	}

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -19,7 +20,7 @@ func query(name string, qtype uint16) []byte {
 	packet := make([]byte, 12)
 	packet[0], packet[1] = 1, 2
 	packet[5] = 1
-	for _, label := range []string{name[:3], name[4:]} {
+	for _, label := range strings.Split(name, ".") {
 		packet = append(packet, byte(len(label)))
 		packet = append(packet, label...)
 	}
@@ -46,6 +47,22 @@ func TestResolver(t *testing.T) {
 	}
 	if got := r.Reply(query("api.example", 28)); got == nil || binary.BigEndian.Uint16(got[6:8]) != 0 {
 		t.Fatal("AAAA behavior")
+	}
+}
+
+func TestNumericNamesNeverReceiveOrRestoreSyntheticIdentity(t *testing.T) {
+	r := New(allowAll{})
+	for _, kind := range []uint16{1, 28} {
+		reply := r.Reply(query("93.184.216.34", kind))
+		if reply == nil || reply[3]&15 != 5 || binary.BigEndian.Uint16(reply[6:8]) != 0 {
+			t.Fatalf("numeric query type %d was not refused", kind)
+		}
+	}
+	if r.Len() != 0 {
+		t.Fatal("numeric query allocated state")
+	}
+	if err := r.Restore([]Mapping{{Host: "93.184.216.34", IP: "198.18.0.1"}}); err == nil {
+		t.Fatal("restored numeric DNS identity")
 	}
 }
 

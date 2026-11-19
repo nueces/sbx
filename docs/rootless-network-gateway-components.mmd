@@ -31,7 +31,7 @@ flowchart LR
   Guest <-->|Ethernet: DHCP, DNS, TCP| QEMU
   QEMU <-->|length-framed Ethernet<br/>Unix stream| Worker
 
-  Worker -->|destination-bound<br/>single-use SOCKS capability| Mediator
+  Worker -->|DNS/IP destination-bound<br/>single-use SOCKS capability| Mediator
   Mediator -->|HTTP only after durable admission ACK| Upstream
   Mediator <-->|private bounded credential IPC| Broker
   Broker <-->|describe / fetch| Provider
@@ -46,7 +46,7 @@ flowchart LR
   CA -->|public certificate only| GuestCA
   GuestCA --> Guest
 
-  Worker -. default deny .-> Denied[Unknown host, direct IP,<br/>wrong port, unsupported UDP]
+  Worker -. default deny .-> Denied[Unknown host, unconfigured IP,<br/>wrong port, unsupported UDP]
   Mediator -. fail closed .-> Denied
 
   classDef security fill:#fee,stroke:#b33,color:#111;

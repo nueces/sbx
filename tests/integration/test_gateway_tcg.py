@@ -169,8 +169,10 @@ def start_mediator(
     open_files: int = 2048,
     *,
     policy: dict[str, Any] | None = None,
+    allow_fixture_loopback: bool = True,
+    mediator_dir: Path | None = None,
 ) -> tuple[subprocess.Popen[str], dict[str, object], Path]:
-    mediator_dir = GATEWAY_DIR / "mediator"
+    mediator_dir = mediator_dir or GATEWAY_DIR / "mediator"
     confdir = runtime / "mediator"
     confdir.mkdir(mode=0o700, exist_ok=True)
     default_policy = {
@@ -243,7 +245,7 @@ def start_mediator(
     process = subprocess.Popen(
         [
             sys.executable,
-            str(mediator_dir / "fixture_launch.py"),
+            *([str(mediator_dir / "fixture_launch.py")] if allow_fixture_loopback else []),
             str(mediator_dir / "launch.py"),
             "--vm-id",
             vm_id,
@@ -404,7 +406,12 @@ def start_worker(
     readable, _, _ = select.select([process.stdout], [], [], COMMAND_TIMEOUT)
     payload = process.stdout.readline() if readable else ""
     require(bool(payload), "worker authenticated readiness timed out")
-    ready = json.loads(payload)
+    try:
+        ready = json.loads(payload)
+    except json.JSONDecodeError:
+        terminate(process)
+        remaining, _ = process.communicate(timeout=PROCESS_STOP_TIMEOUT)
+        raise AssertionError(f"worker invalid readiness: {(payload + remaining)[-4000:]}") from None
     require(
         ready.get("status") == "ready"
         and ready.get("vm_id") == vm_id
@@ -414,6 +421,7 @@ def start_worker(
         and len(str(ready.get("incarnation_proof", ""))) == 64,
         "worker authenticated readiness mismatch",
     )
+    process.sbx_ready = ready  # type: ignore[attr-defined]
     return process
 
 

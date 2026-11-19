@@ -13,11 +13,12 @@ Start with the [full GitHub and CodeArtifact example](#full-example), then the [
 | Credential sources | Host commands returning [text](#text-output) or [JSON with expiry](#json-output), the shipped AWS CodeArtifact plugin, or explicitly installed trusted [plugins](#plugin-methods). No 1Password plugin ships with sbx; use the `op` command example. |
 | One credential, multiple policies | List policy IDs in one binding; use [separate bindings for different headers](#one-credential-different-headers). |
 | Multiple credentials on one request | [Separate credentials on distinct header names](#two-credentials-on-one-request); every matching binding must be satisfied. |
-| Narrower credential scope | Restrict a binding's methods and paths within its policies' permissions. Credential-bound policies require exact hosts and HTTPS. |
+| Narrower credential scope | Restrict a binding's methods and paths within its policies' permissions. Credential-bound policies require exact DNS hosts and HTTPS. |
+| Direct IPv4 networking without host credentials | Explicit [IP policies](#direct-ipv4-policies) for raw TCP or mediated HTTP/HTTPS; DNS policies do not grant direct access to their resolved IPs. |
 | Fetch timing | [`fetch = "lazy"` (default) or `"startup"`](#fetching-at-startup-for-authentication). Startup fetch failure aborts startup. |
 | Cache and refresh | [Per-credential in-memory caching and expiry refresh](#retrieval-and-refresh); the cache survives worker/mediator recovery, not a new supervisor session. |
 
-**Not supported:** host-side HTTP request signing (HMAC, AWS SigV4), arbitrary body/query substitution, automatic authentication-header insertion, host-managed mTLS client keys, or credential injection into plain HTTP, TLS passthrough, or raw TCP. Terminal password prompts are not supported; [startup fetching](#fetching-at-startup-for-authentication) can use compatible host GUI authentication or an existing host sign-in.
+**Not supported:** host-side HTTP request signing (HMAC, AWS SigV4), arbitrary body/query substitution, automatic authentication-header insertion, host-managed mTLS client keys, or credential injection into IP-literal policies, plain HTTP, TLS passthrough, or raw TCP. Terminal password prompts are not supported; [startup fetching](#fetching-at-startup-for-authentication) can use compatible host GUI authentication or an existing host sign-in.
 
 `fetch` controls **when to retrieve a value**, not how to authenticate a request. Signing with a placeholder and replacing it later cannot produce a valid request signature. A request-aware host signer would be a separate feature; credential-provider plugins only retrieve values. An already issued bearer JWT can be injected like any other token; this does not sign the surrounding HTTP request. The gateway's internal HMAC worker-readiness proof authenticates its own components and is not an outbound API signer.
 
@@ -122,9 +123,49 @@ Supported modes:
 
 `allow_ranges` is valid only for `tls-passthrough` and `tcp-forward`; each normalized CIDR explicitly permits an otherwise forbidden host-resolution result. Mediated HTTP rejects it and always rejects forbidden resolution ranges.
 
-`hosts` is always a list, including for one host. Existing one-label wildcards such as `*.example.com` are accepted only for credential-free `http-mediated` and `tcp-forward` policies; they match neither `example.com` nor `a.b.example.com`. TLS passthrough and credential-bound policies require exact hosts. Hosts may share a policy only when mode, ports, methods, paths, hooks, and other authorization are identical. Different authorization requires separate policies. sbx normalizes each host to an internal worker rule while preserving the public policy ID used by bindings and diagnostics. Overlapping destination patterns on the same transport and port are rejected rather than resolved by hidden precedence.
+`hosts` is always a list, including for one host. Existing one-label wildcards such as `*.example.com` are accepted only for credential-free `http-mediated` and `tcp-forward` policies; they match neither `example.com` nor `a.b.example.com`. TLS passthrough and credential-bound policies require exact DNS hosts. Only `tcp-forward` and credential-free `http-mediated` policies may select IPv4 literals. Hosts may share a policy only when mode, ports, methods, paths, hooks, and other authorization are identical. Different authorization requires separate policies. sbx normalizes each host to an internal worker rule while preserving the public policy ID used by bindings and diagnostics. Overlapping destination patterns on the same transport and port are rejected rather than resolved by hidden precedence.
 
-Methods are normalized to uppercase. Configuration and mediation use one path-prefix canonicalizer: repeatedly percent-decode with a fixed bound, reject invalid encoding, control characters, backslashes, and dot segments, then match either the complete prefix or a slash-delimited descendant. Binding methods and path prefixes must be subsets of their referenced policies. An omitted or empty parent list allows all, so a binding may still narrow it to specific methods or paths. Credential bindings are valid only for HTTPS traffic under `http-mediated` policies because `tls-passthrough` and `tcp-forward` payloads are not inspected.
+Methods are normalized to uppercase. Configuration and mediation use one path-prefix canonicalizer: repeatedly percent-decode with a fixed bound, reject invalid encoding, control characters, backslashes, and dot segments, then match either the complete prefix or a slash-delimited descendant. Binding methods and path prefixes must be subsets of their referenced policies. An omitted or empty parent list allows all, so a binding may still narrow it to specific methods or paths. Credential bindings are valid only for HTTPS traffic under DNS-host `http-mediated` policies because `tls-passthrough` and `tcp-forward` payloads are not inspected.
+
+## Direct IPv4 policies
+
+An IPv4 literal in `hosts` is the opt-in; there is no global direct-IP switch. Only the listed address and ports become reachable. A hostname policy does not grant direct access to its resolved addresses, and an `allow_ranges` CIDR does not grant access to other IPs inside that CIDR.
+
+Private TCP access needs both an exact IP and an explicit address-safety exception:
+
+```toml
+[[network.policy]]
+id = "database-ip"
+mode = "tcp-forward"
+hosts = ["10.20.30.40"]
+ports = [5432]
+allow_ranges = ["10.20.30.40/32"]
+```
+
+Raw TCP may carry TLS, but the gateway does not inspect it, inject host credentials, or verify its service certificate. The guest application must do its own TLS verification. Raw TCP is outside the durable HTTP-admission audit guarantee.
+
+For HTTP inspection, use `http-mediated`. This illustrative address must be replaced with the public IPv4 of your own service; it makes no claim about the service currently at that address:
+
+```toml
+[[network.policy]]
+id = "public-ip-api"
+mode = "http-mediated"
+hosts = ["93.184.216.34"]
+ports = [443]
+methods = ["GET", "HEAD"]
+path_prefixes = ["/v1/"]
+```
+
+Mediated HTTP/HTTPS remains public-unicast-only: private addresses and `allow_ranges` are not supported for this mode. For HTTPS, the upstream must have a trusted certificate with the exact IP as an **IP-address SAN**, not a DNS-name SAN containing numeric text or just a matching Common Name. The gateway automatically puts the IP SAN in its guest-facing leaf, using the existing per-VM CA. Normal IP clients omit SNI; DNS-name HTTPS still requires matching SNI. `Host`/HTTP2 authority must match the policy IP and effective port. Do not disable certificate verification or use a DNS Host header to select a virtual host through an IP policy.
+
+```text
+DNS policy: guest -> synthetic address -> DNS identity checks -> validated upstream IP
+IP policy:  guest -> configured IPv4  -> exact IP/port checks -> that same upstream IP
+```
+
+Both mediated paths still require durable admission before forwarding HTTP. Literal connections do not perform DNS or consume synthetic DNS mappings, and worker replacement restores their exact registrations. They do not select DNS-bound credentials or widen redirect permissions. Unknown IPs/ports, IPv6 literals, numeric aliases such as integer/hex/short IPv4, CIDR hosts, and IP-based `tls-passthrough` are rejected or denied. Loopback, link-local, the guest/gateway subnet, synthetic pool, unspecified, multicast and reserved non-unicast addresses cannot be enabled as direct destinations, even with a broad `allow_ranges`.
+
+Upgrade the installed package and stop/start the VM to activate support; an old worker without matching direct-IP readiness support fails clearly. The isolated real-VM regression uses controlled test origins, not the illustrative public service above. Native macOS runtime remains unverified.
 
 ## Credentials
 

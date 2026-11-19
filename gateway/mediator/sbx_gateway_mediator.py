@@ -490,6 +490,13 @@ class GatewayAddon:
     async def _resolve_destination(
         admission: Admission, preferred: tuple[str, int] | None = None
     ) -> tuple[str, int]:
+        literal = None
+        with suppress(ValueError):
+            literal = ipaddress.ip_address(admission.host)
+        if literal is not None:
+            if literal.version != 4 or not _destination_allowed(str(literal)):
+                raise DestinationDenied("destination_ip_denied")
+            return str(literal), admission.port
         try:
             answers = await asyncio.wait_for(
                 asyncio.get_running_loop().getaddrinfo(
@@ -511,10 +518,19 @@ class GatewayAddon:
         client_id = data.context.client.id
         admission = self._admissions.get(client_id)
         host = _normalize_host(data.client_hello.sni or "")
-        if admission is None or host != admission.host:
+        literal = None
+        if admission is not None:
+            with suppress(ValueError):
+                literal = ipaddress.ip_address(admission.host)
+        if (
+            admission is None
+            or (literal is None and host != admission.host)
+            or (literal is not None and (literal.version != 4 or bool(data.client_hello.sni)))
+        ):
             self._invalid_tls.add(client_id)
             data.context.client.error = "sbx gateway denied TLS identity"
             return
+        host = admission.host
         if client_id not in self._handshakes and len(self._handshakes) >= MAX_TLS_HANDSHAKES:
             self._invalid_tls.add(client_id)
             data.context.client.error = "sbx gateway TLS handshake capacity exhausted"

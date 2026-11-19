@@ -112,6 +112,21 @@ _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _TOKEN_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _RULE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_NUMERIC_HOST_RE = re.compile(r"(?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+))*$")
+_DIRECT_IP_DENIED = tuple(
+    ipaddress.ip_network(prefix)
+    for prefix in (
+        "0.0.0.0/8",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "192.0.2.0/24",
+        "198.18.0.0/15",
+        "224.0.0.0/4",
+        "240.0.0.0/4",
+    )
+)
+# Match the worker's additional special-use exclusions, including globally classified anycast.
+_SPECIAL_IPV4 = (ipaddress.ip_network("192.0.0.0/24"), ipaddress.ip_network("192.88.99.0/24"))
 
 
 @dataclass(frozen=True)
@@ -322,7 +337,7 @@ def _port(value: object, label: str, *, allow_zero: bool = False) -> int:
 def _normalize_host(value: object, label: str, *, exact: bool = False) -> str:
     if not isinstance(value, str) or not value or any(ord(ch) < 32 for ch in value):
         raise ConfigError(f"{label} must be a hostname")
-    host = value.strip().rstrip(".").lower()
+    host = value.strip().removesuffix(".").lower()
     wildcard = host.startswith("*.")
     if wildcard:
         if exact:
@@ -335,6 +350,8 @@ def _normalize_host(value: object, label: str, *, exact: bool = False) -> str:
             host = host.encode("idna").decode("ascii")
         except UnicodeError as exc:
             raise ConfigError(f"{label} is invalid") from exc
+        if _NUMERIC_HOST_RE.fullmatch(host):
+            raise ConfigError(f"{label} contains an ambiguous IP address") from None
         labels = host.split(".")
         if (
             not host
@@ -459,6 +476,25 @@ def _header(value: object, label: str) -> str:
     return f"{name}: {template}"
 
 
+def _validate_literal_policy(host: str, protocol: str, ranges: Sequence[str]) -> None:
+    if not _valid_ip(host):
+        return
+    address = ipaddress.ip_address(host)
+    if address.version != 4:
+        raise ConfigError("direct-IP policies support IPv4 only")
+    if any(address in prefix for prefix in _DIRECT_IP_DENIED):
+        raise ConfigError(
+            "direct-IP destination is reserved for local, internal or non-unicast use"
+        )
+    public = address.is_global and not any(address in prefix for prefix in _SPECIAL_IPV4)
+    if not public and (
+        protocol != "tcp" or not any(address in ipaddress.ip_network(value) for value in ranges)
+    ):
+        raise ConfigError(
+            "non-public direct IP requires tcp-forward with an explicit allow_ranges exception"
+        )
+
+
 def _policy(item: Mapping[str, Any], index: int) -> list[PolicyRule]:
     label = "[[network.policy]]"
     _reject_unknown(
@@ -505,6 +541,8 @@ def _policy(item: Mapping[str, Any], index: int) -> list[PolicyRule]:
             raise ConfigError(f"{label}.allow_ranges contains an invalid network") from exc
     if len(set(normalized_ranges)) != len(normalized_ranges):
         raise ConfigError(f"{label}.allow_ranges contains a duplicate network")
+    for host in hosts:
+        _validate_literal_policy(host, protocol, normalized_ranges)
     return [
         PolicyRule(
             policy_id if len(hosts) == 1 else f"{policy_id}-{host_index}",
@@ -843,6 +881,8 @@ def parse_config(config: Mapping[str, Any], *, platform: str | None = None) -> G
                     scopes.append((policy_id, header_name, methods, paths, credential.id))
     if any(rule.host.startswith("*.") and rule.policy_id in credential_policies for rule in rules):
         raise ConfigError("credential-bound policies require exact hosts")
+    if any(_valid_ip(rule.host) and rule.policy_id in credential_policies for rule in rules):
+        raise ConfigError("credential-bound policies require DNS hostnames, not IP literals")
 
     ingress = [
         _ingress(item, index)
@@ -2444,7 +2484,10 @@ class GatewayController:
                 _, writable, _ = select.select([], [mediator_policy_write], [], remaining)
                 if not writable:
                     raise GatewayLifecycleError("timed out transferring mediator policy")
-                view = view[os.write(mediator_policy_write, view) :]
+                try:
+                    view = view[os.write(mediator_policy_write, view) :]
+                except OSError:
+                    raise GatewayLifecycleError("mediator closed its policy channel") from None
             os.close(mediator_policy_write)
             mediator_policy_write = -1
             try:
@@ -2558,6 +2601,15 @@ class GatewayController:
             or not _hardening_ready(ready.get("hardening"), self.config.platform)
         ):
             raise GatewayAuthenticationError("worker readiness identity mismatch")
+        expected_routes = len({rule.host for rule in self.config.rules if _valid_ip(rule.host)})
+        if expected_routes and (
+            type(ready.get("direct_ip_routes")) is not int
+            or ready["direct_ip_routes"] != expected_routes
+        ):
+            raise GatewayAuthenticationError(
+                "worker lacks required direct-IP routes; "
+                "install matching gateway artifacts and stop/start"
+            )
 
     def _discard_data_plane(self) -> None:
         if self._audit_ack_read_fd is not None:

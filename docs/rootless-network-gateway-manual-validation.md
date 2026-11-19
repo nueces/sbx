@@ -16,7 +16,8 @@ flowchart LR
     Ingress[Controller-owned<br/>ingress listeners]
     Worker[Per-VM sbx-gateway worker<br/>gVisor netstack]
     Mediator[Per-VM mitmproxy mediator<br/>HTTP, hooks, credential injection]
-    Provider[Credential provider]
+    Broker[Supervisor-owned credential broker<br/>memory-only cache]
+    Provider[Bounded host credential helper]
     Upstream[(Approved upstream)]
     CA[Per-VM CA<br/>private key host-only]
   end
@@ -39,7 +40,9 @@ flowchart LR
 
   Worker -->|destination-bound<br/>single-use SOCKS capability| Mediator
   Mediator -->|approved HTTP/TLS| Upstream
-  Mediator <-->|bounded secret request/response| Provider
+  Mediator <-->|private bounded credential IPC| Broker
+  Supervisor -->|owns, optional startup fetch| Broker
+  Broker <-->|describe / fetch| Provider
   Worker -->|exact TLS passthrough<br/>or approved raw TCP| Upstream
 
   Ingress -->|owned listener descriptor| Worker
@@ -49,7 +52,7 @@ flowchart LR
   CA -->|public certificate only| GuestCA
   GuestCA --> Guest
 
-  Worker -. default deny .-> Denied[Unknown host, direct IP,<br/>wrong port, unsupported UDP]
+  Worker -. default deny .-> Denied[Unknown host, unconfigured IP,<br/>wrong port, unsupported UDP]
   Mediator -. fail closed .-> Denied
 
   classDef security fill:#fee,stroke:#b33,color:#111;
@@ -58,7 +61,13 @@ flowchart LR
   class Supervisor,Worker,Mediator,QEMU runtime;
 ```
 
-The standalone Mermaid source is [`rootless-network-gateway-components.mmd`](rootless-network-gateway-components.mmd).
+The current standalone Mermaid source, including supervisor-owned credential IPC, is [`rootless-network-gateway-components.mmd`](rootless-network-gateway-components.mmd).
+
+### Optional direct-IP check
+
+For the supported IPv4 modes, use the [direct-IP policy examples](network-credentials.md#direct-ipv4-policies) with a controlled service you own, then upgrade and stop/start before testing from the guest. Check allowed IP/port success, wrong port and unlisted IP denial, and the same behavior after worker replacement. For mediated HTTPS, require a trusted upstream IP SAN and normal guest CA verification; never use `curl -k`. Verify origin execution counts and admission/outcome records, not just the client exit status. DNS-named credentials must not become available through an IP Host/authority override.
+
+The automated production-address-path regression is `tests/integration/test_gateway_direct_ip.py`. It creates origins only in a disposable network namespace, retains the guest overlay until evidence archival verifies, and must not substitute a loopback-predicate exception for a production-path pass.
 
 ## 1. Prepare the smoke configuration
 

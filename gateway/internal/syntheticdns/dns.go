@@ -69,7 +69,8 @@ func (r *Resolver) Restore(mappings []Mapping) error {
 	pool := netip.MustParsePrefix("198.18.0.0/15")
 	for index, mapping := range mappings {
 		ip, err := netip.ParseAddr(mapping.IP)
-		if err != nil || !pool.Contains(ip) || mapping.Host != strings.ToLower(strings.TrimSuffix(mapping.Host, ".")) || !r.policy.AllowsHost(mapping.Host) || byName[mapping.Host] != nil || byIP[ip] != nil {
+		_, literalErr := netip.ParseAddr(mapping.Host)
+		if literalErr == nil || err != nil || !pool.Contains(ip) || mapping.Host != strings.ToLower(strings.TrimSuffix(mapping.Host, ".")) || !r.policy.AllowsHost(mapping.Host) || byName[mapping.Host] != nil || byIP[ip] != nil {
 			return errors.New("invalid synthetic DNS mapping")
 		}
 		item := &entry{host: mapping.Host, ip: ip, used: uint64(index + 1)}
@@ -107,6 +108,9 @@ func (r *Resolver) Release(ip netip.Addr) {
 
 func (r *Resolver) Resolve(host string) (netip.Addr, error) {
 	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if _, err := netip.ParseAddr(host); err == nil {
+		return netip.Addr{}, errors.New("IP literals do not receive synthetic DNS identities")
+	}
 	if !r.policy.AllowsHost(host) {
 		return netip.Addr{}, errors.New("destination denied")
 	}
@@ -159,6 +163,10 @@ func (r *Resolver) Reply(query []byte) []byte {
 	binary.BigEndian.PutUint16(response[6:8], 0)
 	binary.BigEndian.PutUint16(response[8:10], 0)
 	binary.BigEndian.PutUint16(response[10:12], 0)
+	if _, err := netip.ParseAddr(name); err == nil {
+		response[3] = 0x85
+		return response
+	}
 	if qtype != 1 {
 		return response
 	}

@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import random
@@ -131,7 +132,14 @@ class SocketReader:
         return self.until(b"\r\n")
 
 
-def _certificate_files(directory: Path, hostname: str = "localhost") -> tuple[Path, Path, Path]:
+def _certificate_files(
+    directory: Path,
+    hostname: str = "localhost",
+    *,
+    dns_san: bool = False,
+    expired: bool = False,
+    no_san: bool = False,
+) -> tuple[Path, Path, Path]:
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     root_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     now = datetime.now(UTC)
@@ -148,17 +156,22 @@ def _certificate_files(directory: Path, hostname: str = "localhost") -> tuple[Pa
         .sign(root_key, hashes.SHA256())
     )
     leaf_name = x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, hostname)])
+    alternative = x509.DNSName(hostname)
+    if not dns_san:
+        with suppress(ValueError):
+            alternative = x509.IPAddress(ipaddress.ip_address(hostname))
     leaf = (
         x509.CertificateBuilder()
         .subject_name(leaf_name)
         .issuer_name(root_name)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(now - timedelta(minutes=1))
-        .not_valid_after(now + timedelta(days=1))
-        .add_extension(x509.SubjectAlternativeName([x509.DNSName(hostname)]), critical=False)
-        .sign(root_key, hashes.SHA256())
+        .not_valid_before(now - timedelta(days=2))
+        .not_valid_after(now - timedelta(days=1) if expired else now + timedelta(days=1))
     )
+    if not no_san:
+        leaf = leaf.add_extension(x509.SubjectAlternativeName([alternative]), critical=False)
+    leaf = leaf.sign(root_key, hashes.SHA256())
     root_path, cert_path, key_path = (
         directory / "root.pem",
         directory / "server.pem",
@@ -183,8 +196,13 @@ class ProtocolFixture:
         certificate_host: str = "localhost",
         *,
         address: tuple[str, int] = ("127.0.0.1", 0),
+        dns_san: bool = False,
+        expired: bool = False,
+        no_san: bool = False,
     ) -> None:
-        self.root_ca, cert, key = _certificate_files(directory, certificate_host)
+        self.root_ca, cert, key = _certificate_files(
+            directory, certificate_host, dns_san=dns_san, expired=expired, no_san=no_san
+        )
         self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.context.load_cert_chain(cert, key)
         self.context.set_alpn_protocols(["h2", "http/1.1"])

@@ -199,7 +199,7 @@ These commands use the sandbox named in `.sbx.toml`. Use `--name OTHER_VM` only 
 
 ### Rootless network gateway
 
-Gateway mode replaces SLIRP with a default-deny path through a per-VM worker and mediator. Linux amd64 packages include the worker; macOS artifacts are built but runtime remains unverified.
+Gateway mode replaces SLIRP with a default-deny path through a per-VM worker and mediator. Exact [IPv4 policies](docs/network-credentials.md#direct-ipv4-policies) optionally allow raw TCP or credential-free mediated HTTP/HTTPS without DNS. Linux amd64 packages include the worker; macOS artifacts are built but runtime remains unverified.
 
 Set `[network].mitmweb = true` for an authenticated, read-only host-loopback metadata UI (off by default). `sbx network diagnostics NAME` reports its address, private login-file path, and generation audit-log path. Live credentials, headers and bodies are never retained in the UI.
 
