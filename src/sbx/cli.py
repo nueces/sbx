@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import platform
 import signal
 import sqlite3
 import subprocess
@@ -9,6 +10,7 @@ import tempfile
 import tomllib
 from collections.abc import Mapping, Sequence
 from contextlib import ExitStack, suppress
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -24,10 +26,13 @@ from sbx import (
     auth_ports,
     bootstrap,
     doctor,
+    gateway,
+    gateway_ca,
     guest_setup,
     lifecycle_warnings,
     runtime,
     session_state,
+    smolvm_network,
     smolvm_preset,
     vm_metadata,
     vm_state,
@@ -570,10 +575,41 @@ def _maybe_print_boot_timeout_running_hint(vm_id: str | None, boot_timeout: floa
 
 
 def _start_existing_vm_if_needed(
-    vm_id: str, status: str, boot_timeout: float, *, json_output: bool = False
+    vm_id: str,
+    status: str,
+    boot_timeout: float,
+    *,
+    json_output: bool = False,
+    gateway_config: gateway.GatewayConfig | None = None,
+    gateway_holder: list[gateway.GatewayController] | None = None,
 ) -> int:
-    if status == "running":
-        return 0
+    if status in {"running", "paused"}:
+        if gateway_config is not None:
+            try:
+                live = gateway.control_request(vm_id, "status")
+            except (gateway.GatewayLifecycleError, gateway.GatewayStateError):
+                live = None
+            if live is None or live.get("status") not in {"ready", "recovering"}:
+                print(
+                    f"sbx: VM '{vm_id}' is {status} without its configured gateway; "
+                    f"run `sbx stop {vm_id}` before retrying.",
+                    file=sys.stderr,
+                )
+                return 1
+            if live["config_digest"] != gateway_config.digest(vm_id, live["generation"]):
+                print(
+                    f"sbx: gateway configuration for VM '{vm_id}' changed; stop/start required.",
+                    file=sys.stderr,
+                )
+                return 1
+        elif gateway.active(vm_id):
+            print(
+                f"sbx: gateway configuration for VM '{vm_id}' was removed; stop/start required.",
+                file=sys.stderr,
+            )
+            return 1
+        if status == "running":
+            return 0
     if status == "error":
         print(f"sbx: VM '{vm_id}' is in error state.", file=sys.stderr)
         print(
@@ -600,7 +636,11 @@ def _start_existing_vm_if_needed(
                 print(f"sbx: Run `sbx recreate {vm_id} --force`.", file=sys.stderr)
                 return 1
     try:
-        guest_setup.start_vm(vm_id, boot_timeout=boot_timeout, status=status)
+        if gateway_config is not None and status != "paused":
+            with guest_setup.open_guest(vm_id) as vm:
+                _start_gateway_vm(vm, gateway_config, boot_timeout, gateway_holder)
+        else:
+            guest_setup.start_vm(vm_id, boot_timeout=boot_timeout, status=status)
     except Exception as exc:  # noqa: BLE001 - preserve CLI startup diagnostics.
         print(f"sbx: failed to start VM {vm_id!r}: {exc}", file=sys.stderr)
         if isinstance(exc, (TimeoutError, OperationTimeoutError)):
@@ -609,12 +649,114 @@ def _start_existing_vm_if_needed(
     return 0
 
 
-def _stop_vm_if_last_session(vm_id: str, *, stop_on_exit: bool) -> None:
+def _start_gateway_vm(
+    vm: smolvm.SmolVM,
+    config: gateway.GatewayConfig,
+    boot_timeout: float,
+    holder: list[gateway.GatewayController] | None,
+    *,
+    provider_environment: Mapping[str, str] | None = None,
+) -> None:
+    network_info = vm._info.network
+    if network_info is None or not 1 <= network_info.ssh_host_port <= 65535:
+        raise ConfigError("gateway VM SSH endpoint is unavailable")
+    if any(rule.id == "sbx-ssh" for rule in config.ingress):
+        raise ConfigError("gateway ingress ID 'sbx-ssh' is reserved")
+    config = replace(
+        config,
+        ingress=(
+            *config.ingress,
+            gateway.IngressRule(
+                id="sbx-ssh",
+                listen_host="127.0.0.1",
+                host_port=network_info.ssh_host_port,
+                guest_address=gateway.GUEST_ADDRESS,
+                guest_port=22,
+                source="controller",
+            ),
+        ),
+    )
+    controller = gateway.PersistentGatewayController(config, str(vm.vm_id))
+    controller.prepare(provider_environment=provider_environment)
+    try:
+        pid = smolvm_network.start_vm(
+            vm,
+            smolvm_network.ExternalNetworkBackend(
+                "unix-stream", controller.qemu_socket, "qemu-connects", controller.mac
+            ),
+            boot_timeout=boot_timeout,
+        )
+        controller.vm_network_ready(pid, boot_timeout)
+        vm.wait_for_ssh(timeout=boot_timeout)
+        resolver = vm.run(
+            "printf '%s\\n' 'nameserver 192.0.2.1' > /etc/resolv.conf", timeout=boot_timeout
+        )
+        if resolver.exit_code != 0:
+            raise ConfigError("could not configure the guest gateway resolver")
+        guest_setup.sync_network_credentials(str(vm.vm_id), controller.credential_placeholders)
+        ca = gateway_ca.finalize_ca_state(controller.directory)  # type: ignore[arg-type]
+        gateway_ca.install_guest_ca(str(vm.vm_id), ca)
+        controller.check()
+        guest_setup.retain_started_vm(vm)
+    except BaseException:
+        with suppress(Exception):
+            controller.drain()
+        with suppress(Exception):
+            vm.stop()
+        controller.rollback("startup_failed")
+        raise
+    if holder is not None:
+        holder.append(controller)
+
+
+def _stop_gateway(
+    vm_id: str, controller: gateway.GatewayController | None = None, *, only_if_idle: bool = False
+) -> int:
+    drain_error: Exception | None = None
+    attempted = False
+
+    def drain() -> None:
+        nonlocal drain_error, attempted
+        attempted = True
+        try:
+            gateway.drain(vm_id) if controller is None else controller.drain()
+        except (gateway.GatewayLifecycleError, gateway.GatewayStateError) as exc:
+            # An explicit stop must still stop QEMU when its gateway is unreachable.
+            drain_error = exc
+
+    try:
+        rc = guest_setup.stop_vm(vm_id, only_if_idle=only_if_idle, before_stop=drain)
+    except BaseException:
+        if attempted:
+            with suppress(Exception):
+                gateway.stop(vm_id) if controller is None else controller.close()
+        raise
+    if not attempted or rc != 0:
+        return rc
+    try:
+        gateway.stop(vm_id) if controller is None else controller.close()
+    except (gateway.GatewayLifecycleError, gateway.GatewayStateError) as exc:
+        print(f"sbx: failed to clean up gateway for VM {vm_id!r}: {exc}", file=sys.stderr)
+        return rc or 1
+    if drain_error is not None:
+        runtime.debug(f"gateway drain failed before VM stop: {drain_error}")
+    return rc
+
+
+def _stop_vm_if_last_session(
+    vm_id: str,
+    *,
+    stop_on_exit: bool,
+    gateway_controller: gateway.GatewayController | None = None,
+) -> None:
     if not stop_on_exit:
         runtime.debug(f"not stopping {vm_id}: stop_on_exit disabled")
         return
     try:
-        guest_setup.stop_vm(vm_id, only_if_idle=True)
+        if gateway_controller is not None or gateway.active(vm_id):
+            _stop_gateway(vm_id, gateway_controller, only_if_idle=True)
+        else:
+            guest_setup.stop_vm(vm_id, only_if_idle=True)
     except ConfigError as exc:
         print(f"sbx: warning: {exc}", file=sys.stderr)
 
@@ -652,6 +794,7 @@ def _post_start_actions(
     cwd: str | None = None,
     git_config_text: str | None = None,
     session_kind: str = "run",
+    gateway_controller: gateway.GatewayController | None = None,
     env_values: Mapping[str, str | None] | None = None,
     provision: bool = False,
     was_provisioned: bool = False,
@@ -816,7 +959,9 @@ def _post_start_actions(
                 remaining = session_state.unregister_session(vm_name)
             runtime.debug(f"unregistered session for {vm_name}; remaining={remaining}")
             if attempted_attach:
-                _stop_vm_if_last_session(vm_name, stop_on_exit=stop_on_exit)
+                _stop_vm_if_last_session(
+                    vm_name, stop_on_exit=stop_on_exit, gateway_controller=gateway_controller
+                )
 
 
 def _arg_or_config(
@@ -1057,6 +1202,8 @@ def _start_local_image(
     port_forwards: Sequence[str] = (),
     auth_forwards: list[tuple[int, int]] | None = None,
     operation: vm_metadata.Lifecycle | None = None,
+    gateway_config: gateway.GatewayConfig | None = None,
+    gateway_holder: list[gateway.GatewayController] | None = None,
 ) -> int:
     _warn_obsolete_manifest_fields(manifest)
 
@@ -1080,7 +1227,7 @@ def _start_local_image(
     if boot_args is None:
         boot_args = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/init"
 
-    private_key, public_key = smolvm.utils.ensure_ssh_key()
+    private_key, public_key = smolvm.utils.ensure_ssh_key(Path.home() / ".smolvm" / "keys")
     requested_name = _arg_or_config(args, "name", config, "sbx")
     memory = _validate_memory(_arg_or_config(args, "memory", config, "sbx", default=512))
     cpus_value = _arg_or_config(args, "cpus", config, "sbx")
@@ -1089,7 +1236,16 @@ def _start_local_image(
         _arg_or_config(args, "boot_timeout", config, "sbx", default=DEFAULT_BOOT_TIMEOUT)
     )
 
+    # Auto microvm can stall in timer calibration under x86 TCG; use the SDK's q35 path.
+    machine = (
+        "q35"
+        if platform.system() == "Linux"
+        and platform.machine() in {"x86_64", "amd64"}
+        and not os.access("/dev/kvm", os.R_OK | os.W_OK)
+        else "auto"
+    )
     vm_config: dict[str, Any] = {
+        "qemu_machine": machine,
         "memory": memory,
         "kernel_path": kernel_path,
         "initrd_path": initrd_path,
@@ -1129,7 +1285,10 @@ def _start_local_image(
             vm_metadata.claim_vm(
                 vm_name, _project_identity(args, config), run_user or "root", created=True
             )
-            guest_setup.start_vm(vm_name, boot_timeout=boot_timeout, status="created")
+            if gateway_config is None:
+                guest_setup.start_vm(vm_name, boot_timeout=boot_timeout, status="created")
+            else:
+                _start_gateway_vm(vm, gateway_config, boot_timeout, gateway_holder)
         finally:
             vm.close()
         config_created = _maybe_write_project_config(
@@ -1150,6 +1309,7 @@ def _start_local_image(
             cwd=cwd,
             git_config_text=git_config_text,
             env_values=env_values,
+            gateway_controller=gateway_holder[-1] if gateway_holder else None,
             provision=True,
             runtime_install=runtime_install,
             install_timeout=install_timeout,
@@ -1194,6 +1354,8 @@ def cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle | None 
 
 def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> int:
     config = args.config_data
+    gateway_config = getattr(args, "gateway_config", None)
+    gateway_holder: list[gateway.GatewayController] = []
     sbx_cfg = _sbx_config(config)
     project_identity = _project_identity(args, config)
     project_root = Path(project_identity["project_root"])
@@ -1226,7 +1388,7 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
         bool(getattr(args, "reprovision", False))
         or getattr(args, "runtime_install", None) is not None
     )
-    requested_os = str(_arg_or_config(args, "os", config, "sbx", default="ubuntu"))
+    requested_os = str(_arg_or_config(args, "os", config, "sbx", default="debian"))
     boot_timeout = _validate_boot_timeout(
         _arg_or_config(args, "boot_timeout", config, "sbx", default=DEFAULT_BOOT_TIMEOUT)
     )
@@ -1257,6 +1419,11 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
         _arg_or_config(args, "copy_host_credentials", config, "sbx", default=False)
     )
     env_values = _resolve_env_selection(sbx_cfg, args.env)
+    if gateway_config is not None and set(env_values) & (
+        {credential.environment for credential in gateway_config.credentials}
+        | {"SBX_NETWORK_CREDENTIAL_NAMES"}
+    ):
+        raise ConfigError("network credential environment collides with forwarded environment")
     runtime.debug(
         "run options: "
         f"agent={agent!r}, name={getattr(args, 'name', None)!r}, attach={attach!r}, "
@@ -1284,6 +1451,8 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
     requested_name = _arg_or_config(args, "name", config, "sbx")
     if requested_name:
         requested_name = guest_setup.validate_vm_name(str(requested_name))
+        if gateway_config is not None:
+            gateway.validate_runtime_paths(str(requested_name))
         existing_status = _get_existing_vm_status(str(requested_name))
         saved_identity = vm_metadata.load_vm(str(requested_name))
         claim_changes = saved_identity is not None and any(
@@ -1332,9 +1501,13 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
                 existing_status,
                 boot_timeout,
                 json_output=bool(args.json),
+                gateway_config=gateway_config,
+                gateway_holder=gateway_holder,
             )
             if start_rc != 0:
                 return start_rc
+            if gateway_config is None:
+                guest_setup.sync_network_credentials(str(requested_name), {})
             _maybe_write_project_config(
                 args, config, vm_name=str(requested_name), agent=str(agent), created=False
             )
@@ -1357,6 +1530,7 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
                 cwd=project_guest_cwd,
                 git_config_text=git_config_text,
                 env_values=env_values,
+                gateway_controller=gateway_holder[-1] if gateway_holder else None,
                 provision=reprovision,
                 was_provisioned=was_provisioned,
                 runtime_install=runtime_install,
@@ -1405,6 +1579,8 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
                 env_values=env_values,
                 port_forwards=port_forwards,
                 operation=operation,
+                gateway_config=gateway_config,
+                gateway_holder=gateway_holder,
             )
         except ConfigError as exc:
             print(f"sbx: {bootstrap.redact(str(exc), env_values.values())}", file=sys.stderr)
@@ -1425,7 +1601,9 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
     args.run_user = run_user
 
     temp_home_ctx = None
-    host_env = guest_setup.sanitize_forwarded_env(dict(os.environ), list(env_values))
+    provider_environment = dict(os.environ)
+    provider_environment.setdefault("HOME", str(Path.home()))
+    host_env = guest_setup.sanitize_forwarded_env(provider_environment.copy(), list(env_values))
     if copy_host_credentials:
         _warn_initial_state_copy(str(requested_name or "new VM"))
     else:
@@ -1450,6 +1628,17 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
             boot_timeout=boot_timeout,
             install_timeout=install_timeout,
             host_env=host_env,
+            start_vm=(
+                lambda created_vm: _start_gateway_vm(
+                    created_vm,
+                    gateway_config,
+                    boot_timeout,
+                    gateway_holder,
+                    provider_environment=provider_environment,
+                )
+            )
+            if gateway_config is not None
+            else None,
             before_provision=lambda new_vm_name: vm_metadata.claim_vm(
                 new_vm_name, project_identity, str(run_user or "root"), created=True
             ),
@@ -1501,6 +1690,7 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
         agent_name=str(agent),
         operation=operation,
         boot_prepared=True,
+        gateway_controller=gateway_holder[-1] if gateway_holder else None,
         created_config=None if args.json else config_created,
         boot_timeout=boot_timeout,
     )
@@ -1526,10 +1716,14 @@ def cmd_shell(args: argparse.Namespace) -> int:
 
 def _cmd_shell(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> int:
     config = args.config_data
+    gateway_config = getattr(args, "gateway_config", None)
+    gateway_holder: list[gateway.GatewayController] = []
     project_identity = _project_identity(args, config)
     name = runtime.vm_name_from_arg_or_config(args, config, "shell")
     if name is None:
         return 2
+    if gateway_config is not None:
+        gateway.validate_runtime_paths(name)
     try:
         env_values = _resolve_env_selection(_sbx_config(config))
     except ConfigError as exc:
@@ -1604,9 +1798,17 @@ def _cmd_shell(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
                 name, effective_mounts, writable_mounts=project_path is not None
             )
         _warn_running_resource_drift(name, memory=memory, cpus=cpus)
-    start_rc = _start_existing_vm_if_needed(name, existing_status, DEFAULT_BOOT_TIMEOUT)
+    start_rc = _start_existing_vm_if_needed(
+        name,
+        existing_status,
+        DEFAULT_BOOT_TIMEOUT,
+        gateway_config=gateway_config,
+        gateway_holder=gateway_holder,
+    )
     if start_rc != 0:
         return start_rc
+    if gateway_config is None:
+        guest_setup.sync_network_credentials(name, {})
     return _post_start_actions(
         vm_name=name,
         started_now=existing_status != "running",
@@ -1620,6 +1822,7 @@ def _cmd_shell(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
         session_kind="shell",
         env_values=env_values,
         require_provisioned=False,
+        gateway_controller=gateway_holder[-1] if gateway_holder else None,
         operation=operation,
     )
 
@@ -1629,7 +1832,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
     name = runtime.vm_name_from_arg_or_config(args, config, "stop")
     if name is None:
         return 2
-    return guest_setup.stop_vm(name)
+    return _stop_gateway(name)
 
 
 def cmd_remove(args: argparse.Namespace) -> int:
@@ -1645,9 +1848,11 @@ def cmd_remove(args: argparse.Namespace) -> int:
 
 
 def _delete_vm(vm_id: str, extra_args: Sequence[str] | None = None, *, quiet: bool = False) -> int:
+    extra = list(extra_args or [])
+    with suppress(gateway.GatewayLifecycleError, gateway.GatewayStateError):
+        gateway.drain(vm_id)
     if guest_setup.stop_if_owned(vm_id):
         return 1
-    extra = list(extra_args or [])
     completed = runtime.run_smolvm_capture(["sandbox", "delete", vm_id, *extra, "--json"])
     if completed is None:
         return 127
@@ -1658,9 +1863,18 @@ def _delete_vm(vm_id: str, extra_args: Sequence[str] | None = None, *, quiet: bo
         payload = json.loads(completed.stdout)
         failed = payload.get("data", {}).get("failed", [])
     except json.JSONDecodeError:
-        failed = []
+        # Malformed tool output cannot authorize deletion of persistent audit evidence.
+        print("sbx: invalid JSON VM removal response; gateway evidence retained.", file=sys.stderr)
+        if completed.stdout:
+            print(completed.stdout, end="")
+        return completed.returncode or 1
 
     if completed.returncode == 0:
+        try:
+            gateway.remove(vm_id)
+        except gateway.GatewayStateError as exc:
+            print(f"sbx: failed to clean up gateway for VM {vm_id!r}: {exc}", file=sys.stderr)
+            return 1
         with suppress(ConfigError):
             vm_metadata.remove_vm(vm_id)
         if not quiet:
@@ -1668,6 +1882,11 @@ def _delete_vm(vm_id: str, extra_args: Sequence[str] | None = None, *, quiet: bo
         return 0
 
     if any(item.get("error") == f"VM '{vm_id}' not found" for item in failed):
+        try:
+            gateway.remove(vm_id)
+        except gateway.GatewayStateError as exc:
+            print(f"sbx: failed to clean up gateway for VM {vm_id!r}: {exc}", file=sys.stderr)
+            return 1
         with suppress(ConfigError):
             vm_metadata.remove_vm(vm_id)
         if not quiet:
@@ -1691,6 +1910,10 @@ def cmd_recreate(args: argparse.Namespace) -> int:
     if not name:
         print("sbx: recreate requires a VM name argument or [sbx].name", file=sys.stderr)
         return 2
+    name = guest_setup.validate_vm_name(str(name))
+    gateway_config = getattr(args, "gateway_config", None)
+    if gateway_config is not None:
+        gateway.validate_runtime_paths(name)
 
     if not _confirm_destructive_action(f"Destroy and recreate VM '{name}'?", force=force):
         return 2
@@ -1921,6 +2144,23 @@ def build_parser() -> argparse.ArgumentParser:
     network_status.add_argument("--json", action="store_true", help="Print JSON.")
     network_status.set_defaults(func=network.cmd_status)
 
+    network_ui = network_sub.add_parser(
+        "ui",
+        help="Print the authenticated read-only gateway UI URL (contains a login token).",
+        description="Print the authenticated read-only gateway UI URL (contains a login token).",
+    )
+    network_ui.add_argument("name", nargs="?", help="Sandbox name or ID. Defaults to [sbx].name.")
+    network_ui.set_defaults(func=network.cmd_ui)
+
+    network_diagnostics = network_sub.add_parser(
+        "diagnostics",
+        help="Show redacted gateway configuration and state diagnostics.",
+    )
+    network_diagnostics.add_argument(
+        "name", nargs="?", help="Sandbox name or ID. Defaults to [sbx].name."
+    )
+    network_diagnostics.set_defaults(func=network.cmd_diagnostics)
+
     image = sub.add_parser("image", help="Advanced local image helpers.")
     image_sub = image.add_subparsers(dest="image_action", required=True)
     build_parser = image_sub.add_parser("build", help="Build the curated local image for sbx.")
@@ -1965,6 +2205,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         try:
             args.config_data = load_config(args.config)
+            args.gateway_config = gateway.parse_config(args.config_data)
         except ConfigError as exc:
             print(f"sbx: {exc}", file=sys.stderr)
             return 2

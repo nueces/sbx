@@ -5,13 +5,13 @@ import re
 import shlex
 import subprocess
 import sys
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, MutableMapping
 from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 
 import smolvm.facade
-from smolvm.vm import SmolVMManager
+from smolvm.vm import SmolVMManager, resolve_data_dir
 
 from sbx import bootstrap, runtime, session_state, vm_metadata
 from sbx.runtime import ConfigError, ssh_command
@@ -115,11 +115,18 @@ def resolve_env_entries(entries: list[str]) -> dict[str, str | None]:
     return values
 
 
+def drop_stale_sudo_environment(env: MutableMapping[str, str]) -> None:
+    if os.geteuid() != 0:
+        for key in ("SUDO_USER", "SUDO_UID", "SUDO_GID", "SUDO_HOME", "SUDO_COMMAND"):
+            env.pop(key, None)
+
+
 def sanitize_forwarded_env(env: dict[str, str], allowed: list[str]) -> dict[str, str]:
     allowed_set = set(allowed)
     for key in FORWARDABLE_ENV_VARS:
         if key not in allowed_set:
             env.pop(key, None)
+    drop_stale_sudo_environment(env)
     return env
 
 
@@ -127,7 +134,7 @@ def credential_free_env(temp_home: Path, *, forward_env: list[str]) -> dict[str,
     env = sanitize_forwarded_env(dict(os.environ), forward_env)
     real_home = Path.home()
     real_smolvm_cache = real_home / ".smolvm"
-    real_smolvm_data = Path(env.get("SMOLVM_DATA_DIR", real_home / ".local" / "state" / "smolvm"))
+    real_smolvm_data = resolve_data_dir()
     temp_home.mkdir(parents=True, exist_ok=True)
     real_smolvm_cache.mkdir(parents=True, exist_ok=True)
     real_smolvm_data.mkdir(parents=True, exist_ok=True)
@@ -193,6 +200,18 @@ def open_guest(vm_id: str):
         vm = smolvm.facade.SmolVM.from_id(vm_id, ssh_key_path=str(private_key))
         cleanup.callback(vm.close)
         yield vm
+
+
+def sync_network_credentials(vm_id: str, values: dict[str, str]) -> None:
+    with open_guest(vm_id) as vm:
+        current = vm.list_env_vars()
+        old_names = current.get("SBX_NETWORK_CREDENTIAL_NAMES", "").split(",")
+        if not values and not any(old_names):
+            return
+        vm.set_env_vars({**values, "SBX_NETWORK_CREDENTIAL_NAMES": ",".join(sorted(values))})
+        missing = [name for name in old_names if name and name not in values]
+        if missing:
+            vm.unset_env_vars(missing)
 
 
 def sync_forwarded_env(vm_id: str, env_values: Mapping[str, str | None], *, guest=None) -> None:
@@ -275,6 +294,16 @@ def start_vm(vm_id: str, *, boot_timeout: float, status: str = "stopped") -> Non
     _STARTED[key] = manager
 
 
+def retain_started_vm(vm) -> None:
+    # Reap external QEMU children even after their short-lived facade closes.
+    manager, key = _manager_for(str(vm.vm_id))
+    manager._process_handles.update(vm._sdk._process_handles)
+    vm._sdk._process_handles.clear()
+    manager._log_files.update(vm._sdk._log_files)
+    vm._sdk._log_files.clear()
+    _STARTED[key] = manager
+
+
 def _stop_manager(vm_id, manager, key) -> int:
     try:
         manager.stop(vm_id)
@@ -299,7 +328,9 @@ def stop_if_owned(vm_id: str) -> int:
     return _stop_manager(vm_id, manager, key)
 
 
-def stop_vm(vm_id: str, *, only_if_idle: bool = False) -> int:
+def stop_vm(
+    vm_id: str, *, only_if_idle: bool = False, before_stop: Callable[[], None] | None = None
+) -> int:
     with vm_metadata.Lifecycle() as operation:
         operation.lock(vm_id)
         if only_if_idle:
@@ -321,6 +352,8 @@ def stop_vm(vm_id: str, *, only_if_idle: bool = False) -> int:
             if only_if_idle and session_state.active_sessions(vm_id):
                 runtime.debug(f"not stopping {vm_id}: a session joined during flushing")
                 return 0
+            if before_stop is not None:
+                before_stop()
             manager, key = _manager_for(vm_id)
             return _stop_manager(vm_id, manager, key)
 

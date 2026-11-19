@@ -10,9 +10,9 @@ Example:
 working-dir/
 ├── .pi/                         # Pi project-local packages/settings for this working area
 ├── main/                        # main/master clone of the project repo
-├── specs/                       # optional specification worktree/area
-└── nueces/
-    └── 0000-feature-name/       # feature worktree created later by project tooling
+├── specification/               # optional specification worktrees
+└── feature/
+    └── example/                 # implementation worktree created later
 ```
 
 Important: the feature worktree usually does **not** exist when `sbx run` starts. Pi starts in `working-dir`, loads project-local resources from `working-dir/.pi`, and optional tooling such as spec-kit can create the feature directory/worktree later.
@@ -54,11 +54,13 @@ The main/master clone does not need Pi state or Pi package installs for this wor
 
 If `working-dir` is not itself a git repository, `working-dir/.pi` cannot be accidentally committed to the project repo.
 
-If `.pi/` is ever created inside a git worktree and should remain local-only, prefer that worktree's local exclude file instead of changing committed `.gitignore`:
+If `.pi/` is created inside a Git worktree and should stay local-only, use Git's resolved repository-local exclusion path rather than assuming `.git` is a directory:
 
 ```bash
-echo ".pi/" >> .git/info/exclude
+printf '.pi/\n' >> "$(git rev-parse --git-path info/exclude)"
 ```
+
+The exclusion is not committed and may be shared by linked worktrees of the same repository; it is not a per-worktree isolation guarantee. Review existing exclusions before appending another copy.
 
 ## sbx configuration
 

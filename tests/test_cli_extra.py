@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -97,9 +98,13 @@ def fake_smolvm_sdk(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str
         captured["vm_config"] = kwargs
         return kwargs
 
+    def fake_ssh_key(key_dir: Path) -> tuple[Path, Path]:
+        captured["ssh_key_dir"] = key_dir
+        return private_key, public_key
+
     monkeypatch.setattr(smolvm, "SmolVM", FakeSmolVM)
     monkeypatch.setattr(smolvm, "VMConfig", fake_vm_config)
-    monkeypatch.setattr(smolvm.utils, "ensure_ssh_key", lambda: (private_key, public_key))
+    monkeypatch.setattr(smolvm.utils, "ensure_ssh_key", lambda *_args: (private_key, public_key))
 
     def start_vm(vm_id, **kwargs):
         captured["started"] = True
@@ -491,11 +496,32 @@ def test_sync_existing_vm_mounts_missing_db_or_row_does_nothing(
     assert capsys.readouterr().out == ""
 
 
+@pytest.mark.parametrize(
+    "system,arch,kvm,expected_machine",
+    [
+        ("Linux", "x86_64", False, "q35"),
+        ("Linux", "x86_64", True, "auto"),
+        ("Linux", "aarch64", False, "auto"),
+        ("Darwin", "x86_64", False, "auto"),
+    ],
+)
 def test_start_local_image_happy_path(
     monkeypatch: pytest.MonkeyPatch,
     local_image_dir: Path,
     fake_smolvm_sdk: dict[str, object],
+    system: str,
+    arch: str,
+    kvm: bool,
+    expected_machine: str,
 ) -> None:
+    monkeypatch.setattr(cli.platform, "system", lambda: system)
+    monkeypatch.setattr(cli.platform, "machine", lambda: arch)
+    original_access = os.access
+    monkeypatch.setattr(
+        cli.os,
+        "access",
+        lambda path, mode: kvm if str(path) == "/dev/kvm" else original_access(path, mode),
+    )
     captured: dict[str, object] = {}
     calls: list[str] = []
     monkeypatch.setattr(
@@ -538,6 +564,7 @@ def test_start_local_image_happy_path(
     assert isinstance(vm_config, dict)
     assert vm_config["vm_id"] == "vm-from-cli"
     assert vm_config["boot_args"] == "boot args"
+    assert vm_config["qemu_machine"] == expected_machine
     assert vm_config["comm_channel"] == "ssh"
     assert vm_config["ssh_public_key"] == "ssh-ed25519 public"
     assert vm_config["port_forwards"] == [
@@ -1090,7 +1117,9 @@ def test_tunnel_and_session_state(monkeypatch: pytest.MonkeyPatch) -> None:
     assert session_state.active_sessions("vm1") == [{"pid": 123, "kind": "run"}]
 
     stopped: list[list[str]] = []
-    monkeypatch.setattr(cli.runtime, "run_smolvm", lambda argv: stopped.append(list(argv)) or 0)
+    monkeypatch.setattr(
+        cli.runtime, "run_smolvm", lambda argv, **kwargs: stopped.append(list(argv)) or 0
+    )
     cli._stop_vm_if_last_session("vm1", stop_on_exit=False)
     assert stopped == []
     session_state.save_sessions({})
@@ -1755,6 +1784,18 @@ def test_stop_vm_skips_when_other_sessions_active(monkeypatch: pytest.MonkeyPatc
     cli._stop_vm_if_last_session("vm1", stop_on_exit=True)
 
     assert stopped == []
+
+
+def test_delete_vm_malformed_success_preserves_gateway_evidence(monkeypatch):
+    monkeypatch.setattr(
+        cli.runtime,
+        "run_smolvm_capture",
+        lambda argv: subprocess.CompletedProcess(argv, 0, stdout="not-json", stderr=""),
+    )
+    removed = []
+    monkeypatch.setattr(cli.gateway, "remove", lambda vm_id: removed.append(vm_id))
+    assert cli._delete_vm("vm1") == 1
+    assert removed == []
 
 
 def test_delete_vm_success_path(

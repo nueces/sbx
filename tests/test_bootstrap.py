@@ -398,8 +398,10 @@ def test_guest_tools_preserve_existing_commands(guest_script, account_home, tool
         data(phase="tools", arguments=dict(tools=[tool], install_timeout=123))
     )
     guest.tools()
-    assert len(guest_script.commands) == 1
+    assert len(guest_script.commands) == (2 if tool in ("claude", "opencode") else 1)
     assert "command -v" in guest_script.commands[0][0][-1]
+    if tool in ("claude", "opencode"):
+        assert guest_script.commands[1][0][-1].endswith(f"exec {tool} --version")
 
 
 @pytest.mark.parametrize("tool", ["pi", "specify", "claude", "opencode", "codex"])
@@ -436,8 +438,22 @@ def test_guest_tools_keep_installer_security_context_and_deadline(
         }[tool]
         assert package in argv[-1]
         if tool != "pi":
-            assert len(calls) == 3
+            assert len(calls) == (4 if tool in ("claude", "opencode") else 3)
             assert f"command -v {tool}" in calls[2][0][-1]
+        if tool in ("claude", "opencode"):
+            version_argv, version_options = calls[3]
+            assert version_argv[:5] == [
+                "timeout",
+                "--signal=TERM",
+                "--kill-after=2s",
+                "15s",
+                "bash",
+            ]
+            assert version_argv[-1].endswith(f"exec {tool} --version")
+            assert version_options["user"] == os.getuid()
+            assert version_options["env"]["HOME"] == str(home)
+            assert version_options["pass_fds"] == (42,)
+            assert version_options["timeout"] == 20
         assert "NPM_CONFIG_USERCONFIG=/dev/stdin" in argv[-1]
         assert "NPM_CONFIG_GLOBALCONFIG=/dev/null" in argv[-1]
         assert "</dev/null" in argv[-1]
@@ -469,6 +485,101 @@ def test_new_runtime_installer_failures(guest_script, account_home, monkeypatch,
     )
     with pytest.raises(ValueError, match="npm failed" if failure == "install" else "not on.*PATH"):
         guest.tools()
+
+
+@pytest.mark.parametrize("tool", ["claude", "opencode"])
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("code", [-4, 132, 124, 1])
+def test_agent_version_failure_is_not_successful_provisioning(
+    guest_script, account_home, monkeypatch, tool, existing, code
+):
+    calls = []
+
+    def run(argv, **options):
+        calls.append(argv)
+        if len(calls) == 1:
+            return SimpleNamespace(returncode=0 if existing else 127, stdout="", stderr="")
+        return SimpleNamespace(
+            returncode=code if "--version" in argv[-1] else 0, stdout="", stderr=""
+        )
+
+    monkeypatch.setattr(guest_script.module.subprocess, "run", run)
+    guest = guest_script.module.Runtime(
+        data(phase="tools", arguments=dict(tools=[tool], install_timeout=123))
+    )
+    with pytest.raises(ValueError, match=rf"{tool} --version failed.*{code}"):
+        guest.tools()
+    assert sum("npm install" in argv[-1] for argv in calls) == (0 if existing else 1)
+
+
+@pytest.mark.parametrize("tool", ["claude", "opencode"])
+@pytest.mark.parametrize("output", ["stdout", "stderr"])
+def test_existing_agent_version_output_can_use_either_stream(
+    guest_script, account_home, monkeypatch, tool, output
+):
+    calls = []
+
+    def run(argv, **options):
+        calls.append(argv)
+        return SimpleNamespace(
+            returncode=0,
+            stdout="1.2.3" if output == "stdout" else "",
+            stderr="1.2.3" if output == "stderr" else "",
+        )
+
+    monkeypatch.setattr(guest_script.module.subprocess, "run", run)
+    guest = guest_script.module.Runtime(
+        data(phase="tools", arguments=dict(tools=[tool], install_timeout=123))
+    )
+    guest.tools()
+    assert len(calls) == 2 and calls[-1][-1].endswith(f"exec {tool} --version")
+
+
+@pytest.mark.parametrize("tool", ["claude", "opencode"])
+def test_agent_version_timeout_is_bounded_and_not_reinstalled(
+    guest_script, account_home, monkeypatch, tool
+):
+    calls = []
+
+    def run(argv, **options):
+        calls.append((argv, options))
+        if len(calls) == 1:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise subprocess.TimeoutExpired(argv, options["timeout"])
+
+    monkeypatch.setattr(guest_script.module.subprocess, "run", run)
+    guest = guest_script.module.Runtime(
+        data(phase="tools", arguments=dict(tools=[tool], install_timeout=123))
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        guest.tools()
+    assert len(calls) == 2 and calls[-1][1]["timeout"] == 20
+    assert calls[-1][0][3] == "15s"
+
+
+@pytest.mark.parametrize("tool", ["claude", "opencode"])
+def test_agent_version_failure_redacts_both_output_streams(
+    guest_script, account_home, monkeypatch, tool
+):
+    calls = []
+
+    def run(argv, **options):
+        calls.append(argv)
+        return SimpleNamespace(
+            returncode=0 if len(calls) == 1 else 1,
+            stdout="sensitive-token",
+            stderr="sensitive-token",
+        )
+
+    monkeypatch.setattr(guest_script.module.subprocess, "run", run)
+    guest = guest_script.module.Runtime(
+        data(phase="tools", arguments=dict(tools=[tool], install_timeout=123))
+    )
+    monkeypatch.setenv("TEST_TOOL_SECRET", "sensitive-token")
+    guest.env_names = ("TEST_TOOL_SECRET",)
+    with pytest.raises(ValueError, match=r"\[redacted\]") as error:
+        guest.tools()
+    assert "sensitive-token" not in str(error.value)
 
 
 @pytest.mark.parametrize("reverse", [False, True])

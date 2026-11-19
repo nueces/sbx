@@ -1,0 +1,55 @@
+flowchart LR
+  Operator[Operator / sbx CLI]
+
+  subgraph Host[Unprivileged host user]
+    Supervisor[Persistent per-VM supervisor<br/>state, lifecycle, recovery]
+    State[(Owner-only per-VM state)]
+    Ingress[Controller-owned<br/>ingress listeners]
+    Worker[Per-VM sbx-gateway worker<br/>gVisor netstack]
+    Mediator[Per-VM mitmproxy mediator<br/>HTTP, hooks, credential injection]
+    Broker[Supervisor-owned credential broker<br/>memory-only cache]
+    Provider[Bounded host provider helper<br/>op, AWS CLI, installed plugin]
+    CA[Per-VM CA<br/>private key host-only]
+    QEMU[QEMU / SmolVM<br/>one Unix-stream NIC]
+  end
+
+  Upstream[(Authorized remote upstream)]
+
+  subgraph VM[Disposable VM]
+    Guest[Guest network stack and workload]
+    GuestCA[Public CA certificate]
+  end
+
+  Operator -->|inherited bootstrap FDs| Supervisor
+  Supervisor -->|atomic metadata| State
+  Supervisor -->|spawn, authenticate, monitor| Worker
+  Supervisor -->|spawn, authenticate, monitor| Mediator
+  Supervisor -->|pre-opened Unix socket| QEMU
+  Supervisor -->|reserved descriptors| Ingress
+  Supervisor -->|owns, optional startup fetch| Broker
+
+  Guest <-->|Ethernet: DHCP, DNS, TCP| QEMU
+  QEMU <-->|length-framed Ethernet<br/>Unix stream| Worker
+
+  Worker -->|DNS/IP destination-bound<br/>single-use SOCKS capability| Mediator
+  Mediator -->|HTTP only after durable admission ACK| Upstream
+  Mediator <-->|private bounded credential IPC| Broker
+  Broker <-->|describe / fetch| Provider
+  Mediator -->|admission and outcome records| Supervisor
+  Supervisor -->|admission ACK after flush and sync| Mediator
+  Worker -->|exact TLS passthrough<br/>or approved raw TCP| Upstream
+
+  Ingress -->|owned listener descriptor| Worker
+  Worker -->|approved guest TCP| Guest
+
+  CA --> Mediator
+  CA -->|public certificate only| GuestCA
+  GuestCA --> Guest
+
+  Worker -. default deny .-> Denied[Unknown host, unconfigured IP,<br/>wrong port, unsupported UDP]
+  Mediator -. fail closed .-> Denied
+
+  classDef security fill:#fee,stroke:#b33,color:#111;
+  classDef runtime fill:#eef,stroke:#336,color:#111;
+  class Denied security;
+  class Supervisor,Worker,Mediator,QEMU runtime;

@@ -2,7 +2,7 @@ import subprocess
 
 import pytest
 
-from sbx.completion import SUPPORTED_SHELLS, completion_script
+from sbx.completion import NETWORK_COMMANDS, SUPPORTED_SHELLS, completion_script
 
 
 def test_completion_scripts_include_sbx_command() -> None:
@@ -11,6 +11,41 @@ def test_completion_scripts_include_sbx_command() -> None:
         assert "sbx" in script
         assert "run" in script
         assert "completion" in script
+
+
+@pytest.mark.parametrize("shell", SUPPORTED_SHELLS)
+def test_network_ui_completion_is_static_and_includes_help(shell) -> None:
+    script = completion_script(shell)
+    assert "ui" in NETWORK_COMMANDS
+    if shell == "bash":
+        assert '"$subcmd" == "ui"' in script
+    elif shell == "zsh":
+        assert '$words[3] == "ui"' in script
+    else:
+        assert "-a ui" in script
+        assert "__fish_seen_subcommand_from ui' -l help" in script
+
+
+def test_bash_network_ui_completion(tmp_path) -> None:
+    script = tmp_path / "completion.bash"
+    script.write_text(completion_script("bash"))
+    probe = f"""
+source {str(script)!r}
+COMP_WORDS=(sbx network u)
+COMP_CWORD=2
+COMP_LINE='sbx network u'
+COMP_POINT=${{#COMP_LINE}}
+_sbx_complete
+printf '%s\\n' "${{COMPREPLY[@]}}"
+COMP_WORDS=(sbx network ui --)
+COMP_CWORD=3
+COMP_LINE='sbx network ui --'
+COMP_POINT=${{#COMP_LINE}}
+_sbx_complete
+printf '%s\\n' "${{COMPREPLY[@]}}"
+"""
+    completed = subprocess.run(["bash", "-c", probe], check=True, text=True, capture_output=True)
+    assert completed.stdout.splitlines() == ["ui", "--help"]
 
 
 def test_completion_rejects_unknown_shell() -> None:

@@ -3,13 +3,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from sbx import guest_setup, network, runtime, session_state
+from sbx import gateway, guest_setup, network, runtime, session_state
 
 
 @pytest.fixture(autouse=True)
 def isolated_tunnel_state(monkeypatch, tmp_path):
     monkeypatch.setattr(network, "SBX_STATE_DIR", tmp_path / "state")
     monkeypatch.setattr(network, "TUNNELS_FILE", tmp_path / "state" / "tunnels.json")
+    monkeypatch.setattr(gateway, "GATEWAY_STATE_DIR", tmp_path / "state" / "gateway")
 
 
 @pytest.fixture
@@ -41,14 +42,17 @@ def fake_guest_lifecycle(monkeypatch, tmp_path):
             guest.closed += 1
 
     monkeypatch.setattr(guest_setup, "bootstrap_session", session)
+    monkeypatch.setattr(guest_setup, "sync_network_credentials", lambda *a, **kw: None)
     monkeypatch.setattr(guest_setup, "wait_for_control", lambda *a, **kw: None)
     monkeypatch.setattr(guest_setup, "start_vm", lambda *a, **kw: None)
 
-    def stop(name, *, only_if_idle=False):
+    def stop(name, *, only_if_idle=False, before_stop=None):
         if only_if_idle:
             with session_state.session_lock():
                 if session_state.active_sessions(name):
                     return 0
+        if before_stop is not None:
+            before_stop()
         return runtime.run_smolvm(["sandbox", "stop", name])
 
     monkeypatch.setattr(guest_setup, "stop_vm", stop)

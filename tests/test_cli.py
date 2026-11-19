@@ -66,7 +66,9 @@ def install_fake_smolvm(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path
         '"{\\"ok\\":false,\\"error\\":{\\"message\\":\\"VM \'$3\' not found\\"}}"\n'
         "  exit 1\n"
         "fi\n"
-        "printf '%s\\n' \"$*\"\n",
+        'if [ "$1" = sandbox ] && [ "$2" = delete ]; then\n'
+        "  printf '%s\\n' '{\"data\": {\"failed\": []}}'\n"
+        "else\n  printf '%s\\n' \"$*\"\nfi\n",
         encoding="utf-8",
     )
     smolvm.chmod(0o755)
@@ -105,6 +107,93 @@ def capture_preset(
         )
 
     monkeypatch.setattr(cli.smolvm_preset, "create_preset", fake_create)
+
+
+def test_preset_gateway_preserves_provider_environment_without_guest_exposure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    install_fake_smolvm(monkeypatch, tmp_path)
+    host_home = tmp_path / "real-home"
+    monkeypatch.setenv("HOME", str(host_home))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-provider-key")
+    monkeypatch.setenv("AWS_PROFILE", "review-profile")
+    config = tmp_path / "gateway.toml"
+    config.write_text(
+        "[sbx]\ngit_config = false\n[network]\n"
+        '[[network.credential]]\nid = "token"\nenvironment = "GATEWAY_TOKEN"\n'
+        'method = "command"\n[network.credential.options]\nargv = ["get-token"]\n'
+        'inherit_environment = ["ANTHROPIC_API_KEY", "AWS_PROFILE"]\n'
+    )
+    captured = {}
+
+    def start(vm, gateway_config, boot_timeout, holder, *, provider_environment):
+        assert os.environ["HOME"] != str(host_home)
+        assert "ANTHROPIC_API_KEY" not in os.environ
+        captured.update(provider_environment)
+
+    def create(_preset, **kwargs):
+        vm = SimpleNamespace(vm_id="vm1", close=lambda: None)
+        kwargs["before_provision"]("vm1")
+        with cli.smolvm_preset._environment(kwargs["host_env"]):
+            kwargs["start_vm"](vm)
+            assert "ANTHROPIC_API_KEY" not in os.environ
+            assert os.environ["HOME"] != str(host_home)
+        return vm
+
+    monkeypatch.setattr(cli, "_start_gateway_vm", start)
+    monkeypatch.setattr(cli.smolvm_preset, "create_preset", create)
+    assert cli.main(["--config", str(config), "create", "vm1", "--keep-running"]) == 0
+    assert captured["HOME"] == str(host_home)
+    assert captured["ANTHROPIC_API_KEY"] == "fake-provider-key"
+    assert captured["AWS_PROFILE"] == "review-profile"
+
+
+def test_cli_forwarded_environment_cannot_replace_credential_placeholder(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(
+        """
+[network]
+[[network.credential]]
+id = "token"
+environment = "TOKEN"
+method = "command"
+[network.credential.options]
+argv = ["token"]
+""",
+        encoding="utf-8",
+    )
+
+    assert cli.main(["--config", str(config), "run", "vm1", "--env", "TOKEN", "--no-attach"]) == 2
+    assert "collides with forwarded environment" in capsys.readouterr().err
+
+
+def test_recreate_validates_gateway_socket_path_before_destroying(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = cli.argparse.Namespace(
+        config_data={},
+        force=True,
+        name="gateway-credential-smoke",
+        gateway_config=object(),
+        json=False,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_delete_vm",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("must validate before deletion")
+        ),
+    )
+    monkeypatch.setattr(
+        cli.gateway,
+        "validate_runtime_paths",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(cli.ConfigError("bad runtime path")),
+    )
+
+    with pytest.raises(cli.ConfigError, match="bad runtime path"):
+        cli.cmd_recreate(args)
 
 
 def test_smolvm_runner_does_not_need_console_script_on_path() -> None:
@@ -659,7 +748,7 @@ memory = 8192
 disk_size = 32768
 cpus = 4
 backend = "qemu"
-os = "ubuntu"
+os = "debian"
 mount = ["{extra_mount}", ".:/workspace"]
 project_path = "{project}"
 writable_mounts = false
@@ -682,7 +771,7 @@ port_forwards = ["8080:80"]
     assert preset_kwargs["memory_mib"] == 8192
     assert preset_kwargs["disk_size_mib"] == 32768
     assert preset_kwargs["cpus"] == 4
-    assert preset_kwargs["guest_os"] == "ubuntu"
+    assert preset_kwargs["guest_os"] == "debian"
     assert preset_kwargs["install_timeout"] == 900
     assert preset_kwargs["boot_timeout"] == 75
     assert preset_kwargs["mounts"] == [
@@ -909,19 +998,26 @@ def test_shell_uses_configured_git_forwarding_policy(
     assert "git" not in captured
 
 
+@pytest.mark.parametrize("xdg", [False, True])
 def test_credential_free_env_preserves_real_smolvm_state(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    xdg: bool,
 ) -> None:
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("SMOLVM_DATA_DIR", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    state = home / ".local" / "state"
+    if xdg:
+        state = tmp_path / "xdg-state"
+        monkeypatch.setenv("XDG_STATE_HOME", str(state))
 
     env = guest_setup.credential_free_env(tmp_path / "temp-home", forward_env=[])
 
     assert env["HOME"] == str(tmp_path / "temp-home")
-    assert env["SMOLVM_DATA_DIR"] == str(home / ".local" / "state" / "smolvm")
+    assert env["SMOLVM_DATA_DIR"] == str(state / "smolvm")
     assert (tmp_path / "temp-home" / ".smolvm").is_symlink()
 
 
@@ -1259,7 +1355,13 @@ def test_run_existing_vm_starts_without_creating(
             stderr="",
         )
 
-    def fake_run(argv: list[str], *, check: bool = False, env: dict[str, str] | None = None) -> int:
+    def fake_run(
+        argv: list[str],
+        *,
+        check: bool = False,
+        env: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> int:
         calls.append(argv)
         return 0
 
