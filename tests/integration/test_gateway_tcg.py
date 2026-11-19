@@ -8,6 +8,7 @@ import http.client
 import json
 import os
 import platform
+import queue
 import select
 import selectors
 import shutil
@@ -40,6 +41,114 @@ INTEGRATION_TIMEOUT = 180
 MAX_TRANSCRIPT_BYTES = 1024 * 1024
 ROOT = Path(__file__).parents[2]
 GATEWAY_DIR = ROOT / "gateway"
+
+
+class DiagnosticCapture:
+    """One reader per pipe; incomplete diagnostics must never authorize removal."""
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+        self.paths: set[Path] = set()
+        self.threads: dict[int, list[threading.Thread]] = {}
+        self.readiness: dict[int, queue.Queue[bytes | AssertionError]] = {}
+        self.errors: list[str] = []
+        self.finished: set[threading.Thread] = set()
+        self.lock = threading.Lock()
+        self.bytes = 0
+
+    def _failed(self, path: Path, error: BaseException) -> None:
+        with self.lock:
+            self.errors.append(f"{path.name}: {type(error).__name__}: {error}")
+
+    def attach(self, process: subprocess.Popen[str], role: str, incarnation: str) -> None:
+        if role == "worker":
+            self.readiness[process.pid] = queue.Queue(maxsize=1)
+        self.threads[process.pid] = []
+        for name, source in (("stdout", process.stdout), ("stderr", process.stderr)):
+            if source is None:
+                continue
+            path = self.directory / f"{role}-{incarnation}-{name}.log"
+            self.paths.add(path)
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                try:
+                    destination = os.fdopen(fd, "wb", buffering=0)
+                except BaseException:
+                    os.close(fd)
+                    raise
+            except OSError as exc:
+                self._failed(path, exc)
+                raise
+            ready = (
+                self.readiness.get(process.pid) if role == "worker" and name == "stdout" else None
+            )
+            thread = threading.Thread(
+                target=self._copy,
+                args=(source, destination, path, ready),
+                daemon=True,
+                name=f"diagnostic-{role}-{incarnation}-{name}",
+            )
+            self.threads[process.pid].append(thread)
+            thread.start()
+
+    def _copy(self, source, destination, path, ready) -> None:
+        prefix = bytearray() if ready is not None else None
+        try:
+            while chunk := os.read(source.fileno(), 4096):
+                with self.lock:
+                    if self.bytes + len(chunk) > gateway_runtime.MAX_LOG_TOTAL_BYTES:
+                        raise OSError("diagnostic capture budget exceeded")
+                    self.bytes += len(chunk)
+                if destination.write(chunk) != len(chunk):
+                    raise OSError("incomplete diagnostic capture write")
+                if prefix is not None:
+                    prefix.extend(chunk)
+                    end = prefix.find(b"\n")
+                    if end >= 0 and end < 4096:
+                        ready.put_nowait(bytes(prefix[: end + 1]))
+                        prefix = None
+                    elif len(prefix) >= 4096:
+                        raise OSError("worker readiness exceeds capture bound")
+            if prefix is not None:
+                ready.put_nowait(
+                    bytes(prefix) if prefix else AssertionError("worker exited before readiness")
+                )
+                prefix = None
+        except Exception as exc:
+            self._failed(path, exc)
+            if prefix is not None:
+                ready.put_nowait(AssertionError("worker readiness capture failed"))
+        finally:
+            for stream in (source, destination):
+                try:
+                    stream.close()
+                except Exception as exc:
+                    self._failed(path, exc)
+        with self.lock:
+            self.finished.add(threading.current_thread())
+
+    def read_ready(self, process: subprocess.Popen[str]) -> bytes:
+        try:
+            value = self.readiness[process.pid].get(timeout=COMMAND_TIMEOUT)
+        except queue.Empty:
+            raise AssertionError("worker readiness capture timed out") from None
+        if isinstance(value, AssertionError):
+            raise value
+        return value
+
+    def finish(self, process: subprocess.Popen[str] | None = None) -> None:
+        deadline = time.monotonic() + PROCESS_STOP_TIMEOUT
+        groups = self.threads.values() if process is None else (self.threads[process.pid],)
+        for threads in groups:
+            for thread in threads:
+                thread.join(max(0, deadline - time.monotonic()))
+                if thread.is_alive() or thread not in self.finished:
+                    self._failed(self.directory, TimeoutError("diagnostic drain unfinished"))
+        if self.errors:
+            raise AssertionError(f"diagnostic capture failed: {self.errors}")
+        missing = [path.name for path in self.paths if not path.is_file() or path.is_symlink()]
+        if missing:
+            raise AssertionError(f"missing diagnostic capture files: {missing}")
 
 
 def tool(environment: str, *names: str) -> str:
@@ -171,6 +280,7 @@ def start_mediator(
     policy: dict[str, Any] | None = None,
     allow_fixture_loopback: bool = True,
     mediator_dir: Path | None = None,
+    capture: DiagnosticCapture | None = None,
 ) -> tuple[subprocess.Popen[str], dict[str, object], Path]:
     mediator_dir = mediator_dir or GATEWAY_DIR / "mediator"
     confdir = runtime / "mediator"
@@ -290,6 +400,8 @@ def start_mediator(
         env=child_environment(runtime) | {"PATH": os.environ.get("PATH", os.defpath)},
     )
     PROCESSES.append(process)
+    if capture is not None:
+        capture.attach(process, "mediator", incarnation)
     os.close(audit_write)
     os.close(ack_read)
     os.close(key_read)
@@ -302,6 +414,9 @@ def start_mediator(
     os.close(ready_read)
     if not payload:
         terminate(process)
+        if capture is not None:
+            capture.finish(process)
+            raise AssertionError(f"mediator readiness failed; diagnostics: {runtime}")
         stdout, stderr = process.communicate(timeout=PROCESS_STOP_TIMEOUT)
         files = sorted(path.name for path in confdir.iterdir())
         raise SystemExit(f"mediator readiness timed out ({files}): {(stdout + stderr)[-4000:]}")
@@ -322,6 +437,7 @@ def start_worker(
     vm_id: str = VM_ID,
     generation: str = "g1",
     ingress_ids: tuple[str, ...] = ("dev-server", "oauth-callback"),
+    capture: DiagnosticCapture | None = None,
 ) -> subprocess.Popen[str]:
     key_read, key_write = os.pipe()
     token_read, token_write = os.pipe()
@@ -402,16 +518,9 @@ def start_worker(
         os.close(lifetime_read)
     process.sbx_lifetime_write = lifetime_write  # type: ignore[attr-defined]
     PROCESSES.append(process)
-    assert process.stdout is not None
-    readable, _, _ = select.select([process.stdout], [], [], COMMAND_TIMEOUT)
-    payload = process.stdout.readline() if readable else ""
-    require(bool(payload), "worker authenticated readiness timed out")
-    try:
-        ready = json.loads(payload)
-    except json.JSONDecodeError:
-        terminate(process)
-        remaining, _ = process.communicate(timeout=PROCESS_STOP_TIMEOUT)
-        raise AssertionError(f"worker invalid readiness: {(payload + remaining)[-4000:]}") from None
+    if capture is not None:
+        capture.attach(process, "worker", incarnation)
+    ready = worker_readiness(process, capture)
     require(
         ready.get("status") == "ready"
         and ready.get("vm_id") == vm_id
@@ -423,6 +532,24 @@ def start_worker(
     )
     process.sbx_ready = ready  # type: ignore[attr-defined]
     return process
+
+
+def worker_readiness(process, capture=None):
+    if capture is not None:
+        payload = capture.read_ready(process)
+    else:
+        assert process.stdout is not None
+        readable, _, _ = select.select([process.stdout], [], [], COMMAND_TIMEOUT)
+        payload = process.stdout.readline() if readable else ""
+    require(bool(payload), "worker authenticated readiness timed out")
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError:
+        if capture is not None:
+            raise AssertionError("worker invalid readiness; see captured diagnostics") from None
+        terminate(process)
+        remaining, _ = process.communicate(timeout=PROCESS_STOP_TIMEOUT)
+        raise AssertionError(f"worker invalid readiness: {(payload + remaining)[-4000:]}") from None
 
 
 def terminate(process: subprocess.Popen[str] | None) -> None:

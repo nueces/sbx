@@ -198,13 +198,16 @@ class FakeRunner:
         if component == "mediator":
             process = FakeProcess(
                 b"mediator boom\n" if behavior == "mediator_log" else b"",
-                exited=behavior in {"mediator_exit", "mediator_log"},
+                exited=behavior in {"mediator_exit", "mediator_log", "mediator_policy_closed"},
             )
             ready_fd = kwargs["pass_fds"][1]
-            process.resources.append(os.fdopen(os.dup(kwargs["pass_fds"][2]), "rb", buffering=0))
+            if behavior != "mediator_policy_closed":
+                process.resources.append(
+                    os.fdopen(os.dup(kwargs["pass_fds"][2]), "rb", buffering=0)
+                )
             if behavior == "mediator_timeout":
                 process.resources.append(os.fdopen(os.dup(ready_fd), "wb", buffering=0))
-            elif behavior not in {"mediator_exit", "mediator_log"}:
+            elif behavior not in {"mediator_exit", "mediator_log", "mediator_policy_closed"}:
                 payload: object = {
                     "status": "ready",
                     "host": "0.0.0.0" if behavior == "mediator_identity" else "127.0.0.1",
@@ -998,6 +1001,30 @@ def test_every_child_startup_failure_rolls_back_fake_resources(
     assert instance.directory is not None and not instance.directory.exists()
     assert listeners[0].closed
     assert all(process.poll() is not None for process in runner.processes)
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+def test_closed_mediator_policy_reader_is_a_lifecycle_failure(
+    lifecycle_config, tmp_path, monkeypatch, replacement
+):
+    options = {"replacement_failure" if replacement else "failure": "mediator_policy_closed"}
+    instance, runner, listeners = controller(lifecycle_config, tmp_path, monkeypatch, **options)
+    try:
+        if replacement:
+            instance.prepare()
+        with pytest.raises(gateway.GatewayLifecycleError, match="policy channel"):
+            instance.recover() if replacement else instance.prepare()
+        assert all(process.poll() is not None for process in runner.processes)
+        assert listeners[0].closed
+        assert not instance.qemu_socket.exists()
+        if replacement:
+            state = gateway.read_state(instance.directory)
+            assert state["status"] == "failed"
+            assert state["last_failure"]["code"] == "reconnection_failed"
+        else:
+            assert not instance.directory.exists()
+    finally:
+        instance.close()
 
 
 def test_mediator_startup_failure_includes_bounded_log_detail(

@@ -23,6 +23,7 @@ from test_gateway_tcg import (
     LIFETIME_FDS,
     PLACEHOLDER,
     PROCESSES,
+    DiagnosticCapture,
     child_environment,
     echo_server,
     start_mediator,
@@ -112,14 +113,20 @@ class Console:
                 self.data.extend(os.read(self.process.stdout.fileno(), 65536))
             assert len(self.data) <= 1024 * 1024, "guest console exceeded bound"
 
+    def drain(self):
+        while chunk := os.read(self.process.stdout.fileno(), 65536):
+            self.data.extend(chunk)
+            assert len(self.data) <= 1024 * 1024, "guest console exceeded bound"
+
     def send(self, text):
         self.process.stdin.write(text.encode() + b"\n")
         self.process.stdin.flush()
 
 
-def archive(runtime, destination):
+def archive(runtime, destination, required=()):
     """Archive stopped disks/state before deleting anything, verifying each regular member."""
     paths = [p for p in runtime.rglob("*") if p.is_file() and not p.is_symlink()]
+    assert set(required) <= set(paths), "missing required diagnostic capture files"
     hashes = {}
     for path in paths:
         with path.open("rb") as source:
@@ -135,15 +142,28 @@ def archive(runtime, destination):
         assert set(bundle.getnames()) == set(hashes)
         for member in bundle:
             with bundle.extractfile(member) as source:
-                assert hashlib.file_digest(source, "sha256").hexdigest() == hashes[member.name]
+                assert hashlib.file_digest(source, "sha256").hexdigest() == hashes[member.name], (
+                    "archive member verification failed"
+                )
     (destination / "archive-members.json").write_text(json.dumps(hashes, indent=2))
     assert hashes
+
+
+def archive_and_remove(runtime, destination, capture):
+    try:
+        capture.finish()
+        archive(runtime, destination, capture.paths)
+    except BaseException:
+        print(f"evidence incomplete; runtime retained at {runtime}", file=sys.stderr)
+        raise
+    shutil.rmtree(runtime)
 
 
 def exercise(destination, parent_namespace, image, worker):
     assert os.getuid() != 0 and os.geteuid() == os.getuid()
     assert os.readlink("/proc/self/ns/net") != parent_namespace
     runtime = Path(tempfile.mkdtemp(prefix="gw-ip-"))
+    capture = DiagnosticCapture(runtime)
     stop = threading.Event()
     servers, console, qemu, listener = [], None, None, None
     echo = socket.socket()
@@ -267,6 +287,7 @@ def exercise(destination, parent_namespace, image, worker):
                 policy=mediator_policy,
                 allow_fixture_loopback=False,
                 mediator_dir=gateway.GATEWAY_MEDIATOR_DIR,
+                capture=capture,
             )
             process = start_worker(
                 worker,
@@ -280,6 +301,7 @@ def exercise(destination, parent_namespace, image, worker):
                 [],
                 vm_id="direct-ip",
                 ingress_ids=(),
+                capture=capture,
             )
             assert process.sbx_ready["direct_ip_routes"] == 2
             for child in (process, mediator):
@@ -406,8 +428,11 @@ def exercise(destination, parent_namespace, image, worker):
         before = journal.read_bytes()
         terminate(process)
         terminate(mediator)
+        capture.finish(process)
+        capture.finish(mediator)
         for thread in AUDIT_CONTROLLERS[confdir]._log_threads:
-            thread.join(3)
+            thread.join(5)
+            assert not thread.is_alive(), "audit drain unfinished before replacement"
         process, mediator, _ = pair("worker2")
         assert journal.read_bytes() == before
         console.send("continue")
@@ -428,35 +453,47 @@ def exercise(destination, parent_namespace, image, worker):
                     "https": secure.records,
                     "wire_sni": secure.snis,
                     "dns_sha256": hashlib.sha256(before).hexdigest(),
+                    "diagnostic_files": sorted(path.name for path in capture.paths),
+                    "gateway_module": str(Path(gateway.__file__).resolve()),
+                    "worker": str(worker),
+                    "mediator_directory": str(gateway.GATEWAY_MEDIATOR_DIR),
                 },
                 indent=2,
             )
         )
+        assert len(capture.paths) == 6, "missing incarnation diagnostics"
     finally:
-        stop.set()
-        for child in reversed(PROCESSES):
-            terminate(child)
-        for fd in LIFETIME_FDS:
-            with suppress(OSError):
-                os.close(fd)
-        for controller in AUDIT_CONTROLLERS.values():
-            for thread in controller._log_threads:
-                thread.join(3)
-        for controller in AUDIT_CONTROLLERS.values():
-            if controller._audit_stream is not None:
-                controller._audit_stream.close()
-        if console is not None:
-            (runtime / "guest-console.log").write_bytes(console.data)
-            console.selector.close()
-        echo.close()
-        if listener is not None:
-            listener.close()
-        for server in servers:
-            server.shutdown()
-            server.server_close()
-        # Stop retains the overlay; removal happens only after a verified evidence archive.
-        archive(runtime, destination)
-        shutil.rmtree(runtime)
+        try:
+            stop.set()
+            for child in reversed(PROCESSES):
+                terminate(child)
+            for fd in LIFETIME_FDS:
+                with suppress(OSError):
+                    os.close(fd)
+            for controller in AUDIT_CONTROLLERS.values():
+                for thread in controller._log_threads:
+                    thread.join(5)
+                    assert not thread.is_alive(), "audit drain unfinished"
+                if controller._audit_stream is not None:
+                    controller._audit_stream.close()
+            echo.close()
+            if listener is not None:
+                listener.close()
+            for server in servers:
+                server.shutdown()
+                server.server_close()
+            if console is not None:
+                try:
+                    console.drain()
+                finally:
+                    (runtime / "guest-console.log").write_bytes(console.data)
+                    console.selector.close()
+            # Neither partial capture nor a failed archive can authorize removal.
+            archive_and_remove(runtime, destination, capture)
+        except BaseException:
+            print(f"VM fixture cleanup failed; runtime retained at {runtime}", file=sys.stderr)
+            capture.finish()
+            raise
 
 
 def test_direct_ip_guest_without_dns_and_after_replacement(tmp_path):

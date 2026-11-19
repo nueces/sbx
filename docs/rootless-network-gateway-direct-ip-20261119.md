@@ -63,6 +63,8 @@ The next rule produced 1,048,686 bytes and was rejected instead of launching an 
 
 ## Archival and cleanup
 
+**Review correction:** The original archives verified files already on disk, but omitted worker/mediator diagnostic output left in subprocess pipes. Those missing streams cannot be recovered retroactively. The follow-up below fixes that omission without relabeling the earlier evidence.
+
 Guest console/network-state evidence, regular runtime/audit/DNS files and stopped disposable guest overlays were archived and every regular member verified before removal. Startup failures and superseded fixture runs remain distinguishable in five copied evidence sets. A test-image archive contains the backing rootfs, kernel and manifest so the retained overlays do not depend solely on a disposable `/tmp` base image.
 
 - Clean native installation: **4,356 regular files**, archive SHA-256 **`987d831025488d0821535647b9446514994179d06ba201be15e59a249d4df4df`**. Original installation prefix removed only after member verification.
@@ -70,6 +72,30 @@ Guest console/network-state evidence, regular runtime/audit/DNS files and stoppe
 - Owned namespace fixtures, QEMU/gateway processes, temporary observers and the retained pre-guest failed staging directory were cleaned up. Historical `/tmp/sbx-gwb/images/sbx` was not touched.
 
 The initial wheel command encountered the pre-existing `.venv` symlink loop; explicit interpreter/environment selection resolved it without changing `.venv`. An installation-command flag conflict and early test-fixture socket-mode/trust setup failures are retained separately; they are not hidden production passes.
+
+## Review follow-up — diagnostic capture and lifecycle regressions
+
+The follow-up to feature commit `f62c247` changes test helpers and tests only; production Python, mediator mirrors, all three workers and the candidate wheel remain byte-identical. The clean-installed runtime was compared against all **47** source/wheel file identities before removal. No worker rebuild or new wheel was needed.
+
+- A test-only capture argument preserves existing helper callers. In the direct-IP fixture, one reader per pipe starts before readiness validation and writes private, per-incarnation diagnostics. Worker readiness is handed to its validator through a bounded queue, while the same reader keeps the original line and later output. No competing `communicate()` consumes those streams.
+- Capture uses fixed-size reads and the existing 100 MiB aggregate log limit. Copy/close errors, oversized readiness, exhausted budget and incomplete reader shutdown are failures, not silent truncation. Both stopped incarnations must finish capture; QEMU's remaining console output is drained within the existing 1 MiB bound. Capture or archive failures retain the runtime directory and report its path.
+- Fast subprocess regressions check stdout/stderr markers, output beyond pipe capacity, trailing partial lines, first/replacement separation, private modes, startup failure, write/unexpected errors, size limits, missing files, unfinished readers, existing-file protection and corrupted archive verification. The archive checks verify contents, not just filenames.
+- The lifecycle fake now genuinely closes the mediator policy reader. Initial-startup and replacement regressions require a lifecycle error and complete rollback/failed-recovery cleanup. Replaying the former handler **in memory** produces two expected `BrokenPipeError` test failures; production source was never edited for that demonstration.
+
+Evidence: `local/direct-ip-review-fixes/` (separate from the original campaign).
+
+| Follow-up check | Result |
+| --- | --- |
+| Fast suite | **1,313 passed, one existing manual image-Landlock skip; 92.28% coverage**. |
+| Mediator suite | **193 passed + eight subtests**. |
+| Existing Linux integrations | **8 passed**, including four-VM TCG isolation. |
+| Source / clean-installed direct-IP QEMU | Both **PASS**, with six verified diagnostic files across two worker/mediator incarnations, unchanged DNS state, verified IP TLS and successful recovery. Installed module, worker and mediator paths were asserted to belong to the clean prefix. |
+| Controlled worker failure before readiness | Expected failing test; its verified archive contains the startup-failure marker and all three launched-pair diagnostic streams. |
+| Lint / changed-file format / diff checks | PASS. Whole-repo format checking still reports three untouched files; checking their committed HEAD contents reproduces the same failures. |
+
+Five distinct VM evidence sets were copied and member-verified before their temporary directories were removed. A fresh installation archive preserves **4,333 regular files**, SHA-256 **`0b771207197edf8410bce65e716c4a3a4e9a008eb779c06b6b7e5d708e39cf62`**; all members and symlinks were verified before deleting the installation prefix. The temporary count-only observer and owned processes were cleaned up. Shared/historical images and the original campaign remain untouched.
+
+The three pre-existing format failures are `.github/scripts/generate_complexity_report.py`, `tests/test_check_image_build_inputs.py` and `tests/test_project_shell.py`; they were not reformatted as part of this fix. Native macOS, new hour-long/performance runs and dependency/licensing release clearance remain outside this follow-up. No new commit, push, merge or release was performed.
 
 ## Limits and release posture
 
