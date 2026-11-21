@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import resource
 import subprocess
 import sys
 import tempfile
@@ -7,6 +8,15 @@ import unittest
 from pathlib import Path
 
 from hardening import Status, sanitized_environment
+
+
+def _large_default_thread_stack() -> None:
+    """Give glibc a 64 MiB default thread stack, larger than any common host's."""
+    hard = resource.getrlimit(resource.RLIMIT_STACK)[1]
+    size = 64 * 1024 * 1024
+    if hard != resource.RLIM_INFINITY:
+        size = min(size, hard)
+    resource.setrlimit(resource.RLIMIT_STACK, (size, hard))
 
 
 class HardeningTests(unittest.TestCase):
@@ -84,6 +94,7 @@ finally:
                 [sys.executable, "-c", script, str(confdir)],
                 cwd=Path(__file__).parent,
                 env=sanitized_environment(confdir, Status(False, False, False, False), {}),
+                preexec_fn=_large_default_thread_stack,
                 check=False,
                 capture_output=True,
                 text=True,

@@ -9,12 +9,14 @@ import platform
 import resource
 import stat
 import sys
+import threading
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
 MAX_LOG_BYTES = 100 * 1024 * 1024
 MAX_ADDRESS_SPACE = 512 * 1024 * 1024
+THREAD_STACK_BYTES = 1024 * 1024
 
 _PR_SET_DUMPABLE = 4
 _PR_SET_NO_NEW_PRIVS = 38
@@ -124,6 +126,9 @@ def _resource_limits(open_files: int) -> None:
     _lower_limit(resource.RLIMIT_NOFILE, max(32, open_files))
     _lower_limit(resource.RLIMIT_FSIZE, MAX_LOG_BYTES)
     _lower_limit(resource.RLIMIT_AS, MAX_ADDRESS_SPACE)
+    # glibc reserves RLIMIT_STACK of address space per thread (8-16 MiB on common
+    # hosts); pin it so the thread budget under RLIMIT_AS is host-independent.
+    threading.stack_size(THREAD_STACK_BYTES)
 
 
 def _prctl(option: int, value: int) -> None:
