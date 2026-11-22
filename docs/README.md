@@ -16,6 +16,7 @@ These pages describe the current source checkout. Start with [installation and t
 - [Networking commands: forwarding, status and diagnostics](network-command-roadmap.md)
 - [Gateway policy, direct IPv4, TLS, audit and recovery](rootless-network-gateway.md)
 - [Host-side credential providers and bindings](network-credentials.md)
+- [Gateway process resource limits and their reasons](rootless-network-gateway-limits.md)
 - [Isolated operator smoke and evidence preservation](rootless-network-gateway-manual-validation.md)
 - [Canonical host/guest component diagram](rootless-network-gateway-components.mmd)
 
