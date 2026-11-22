@@ -3,6 +3,7 @@ from pathlib import Path
 
 DEFAULT_BACKEND = "qemu"
 DEFAULT_BOOT_TIMEOUT = 60.0
+GATEWAY_UNIX_SOCKET_PATH_MAX_BYTES = 103
 SBX_STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "sbx"
 TUNNELS_FILE = SBX_STATE_DIR / "tunnels.json"
 SESSIONS_FILE = SBX_STATE_DIR / "sessions.json"

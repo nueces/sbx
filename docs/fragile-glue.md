@@ -1,6 +1,6 @@
 # Fragile glue ledger
 
-Track deliberate use of internal APIs, generated-file assumptions, or other integration seams that should be replaced when upstream support exists.
+Maintainer reference for deliberate private APIs and generated-file assumptions in the pinned SmolVM 0.0.28 integration. Review these boundaries on upgrades; they are not user configuration or claims about a newly inspected upstream release. Shared commands live in [development](development.md).
 
 ## SmolVM local rootfs and init seams
 
@@ -22,12 +22,21 @@ Exit: use a public SmolVM rootfs-only API that accepts caller-owned Dockerfile/c
 Used by `src/sbx/smolvm_preset.py`:
 
 ```python
-from smolvm.facade import _build_auto_config
-channel = vm._ensure_ssh_for_env()
+from smolvm.facade import _resolve_vm_name
 ```
 
-Why: SmolVM 0.0.28 has public VM lifecycle and preset application APIs, but no public operation that creates a named auto-configured VM with sbx's CPU/port-forward settings and supplies the communication channel required by `apply_preset()`. The preset API also reads `os.environ`, so sbx temporarily activates its credential-filtered environment during provisioning.
+Why: sbx uses SmolVM's naming helper to retain preset-generated VM names. VM configuration now comes from the prepared Debian `sbx` image, not SmolVM's stock-image auto-configuration. Preset application uses sbx's bootstrap session, skips OS-package setup already supplied by the base, and still temporarily activates the credential-filtered environment because the preset API reads `os.environ`.
 
-Fragility: both methods are private and may change. The SmolVM dependency remains pinned to `smolvm==0.0.28`, and all preset-specific private access is contained in `smolvm_preset.py`.
+Fragility: the naming helper is private and may change. All preset-specific private access remains contained in `smolvm_preset.py`.
 
 Exit: replace this module with an upstream public preset creation API that accepts explicit VM resources, mounts, port forwards, timeouts, and host credential/environment inputs; then remove this entry and the adjacent `ponytail:` comment.
+
+## SmolVM external QEMU network backend facade
+
+Used by `src/sbx/smolvm_network.py` for gateway-mode QEMU argv construction.
+
+Why: SmolVM 0.0.28's pure `build_qemu_argv()` supports only SLIRP/user and TAP backends. The sbx facade delegates stock argv construction to that function, then replaces its one typed network attachment with a worker-owned Unix stream. It rejects unexpected SmolVM argv shapes and supports only the pinned SmolVM release; non-gateway calls remain byte-for-byte stock SmolVM behavior.
+
+Required upstream API: It adds an optional typed `ExternalNetworkBackend(kind="unix-stream", socket_path=..., role="qemu-connects", mac=...)` input to SmolVM's QEMU argv builder/runtime path, preserving the existing NIC model and making the typed backend mutually exclusive with SLIRP, TAP, and host forwards. Required upstream tests are the same exact-argv, malformed-path, unsupported-backend, and unchanged-default cases in `tests/test_smolvm_network.py`. No SmolVM checkout or unreleased package is a runtime dependency.
+
+Exit: after a released SmolVM exposes that API, delegate to it, expand the accepted SmolVM version, and remove only the local argv replacement.

@@ -15,7 +15,7 @@ COMMANDS = (
     "doctor",
     "completion",
 )
-NETWORK_COMMANDS = ("forward", "auth-port", "close-auth-port", "status")
+NETWORK_COMMANDS = ("forward", "auth-port", "close-auth-port", "status", "ui")
 IMAGE_COMMANDS = ("build", "list", "ls")
 AGENTS = ("pi", "claude", "codex", "opencode")
 INSTALLERS = ("pi", "specify", "claude", "opencode", "codex")
@@ -201,7 +201,7 @@ _sbx_complete() {{
                 COMPREPLY=( $(compgen -W "{forward_options}" -- "$cur") )
             elif [[ "$subcmd" == "auth-port" ]]; then
                 COMPREPLY=( $(compgen -W "{auth_port_options}" -- "$cur") )
-            elif [[ "$subcmd" == "close-auth-port" ]]; then
+            elif [[ "$subcmd" == "close-auth-port" || "$subcmd" == "ui" ]]; then
                 COMPREPLY=( $(compgen -W "--help" -- "$cur") )
             elif [[ "$subcmd" == "status" ]]; then
                 COMPREPLY=( $(compgen -W "{network_status_options}" -- "$cur") )
@@ -319,7 +319,7 @@ _sbx() {{
             _describe 'option' forward_options
           elif [[ $words[3] == "auth-port" ]]; then
             _describe 'option' auth_port_options
-          elif [[ $words[3] == "close-auth-port" ]]; then
+          elif [[ $words[3] == "close-auth-port" || $words[3] == "ui" ]]; then
             _describe 'option' '(--help)'
           elif [[ $words[3] == "status" ]]; then
             _describe 'option' network_status_options
@@ -404,6 +404,7 @@ def fish_completion() -> str:
         ("forward", FORWARD_OPTIONS),
         ("auth-port", AUTH_PORT_OPTIONS),
         ("close-auth-port", ("--help",)),
+        ("ui", ("--help",)),
         ("status", NETWORK_STATUS_OPTIONS),
     ):
         for option in options:

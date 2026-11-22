@@ -121,6 +121,7 @@ def test_packaged_image_is_user_neutral() -> None:
         helper = (resources / "scripts/sbx-start-rootless-docker").read_text(encoding="utf-8")
         assert not (resources / "Containers/Agents/Pi.Containerfile").exists()
 
+    assert "    sudo \\\n" in base  # Supplies visudo for guest sudoers validation.
     assert "useradd" not in base
     assert "/home/agent" not in base + docker
     assert "USER agent" not in base + docker

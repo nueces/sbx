@@ -1,0 +1,265 @@
+package netstack
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"net"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/nueces/sbx/gateway/internal/capability"
+	"github.com/nueces/sbx/gateway/internal/config"
+)
+
+func TestForwarderQuotas(t *testing.T) {
+	total := NewFlowQuota(2)
+	f := &TCPForwarder{config: config.Config{Quotas: config.Quotas{FlowsPerDestination: 1}}, total: total, perDest: make(map[string]int)}
+	if !f.acquire("example.com") || f.acquire("example.com") {
+		t.Fatal("per-destination quota not enforced")
+	}
+	if total.Active() != 1 || f.Stats().PerDestinationRejected != 1 {
+		t.Fatal("per-destination quota was not classified or released")
+	}
+	if !f.acquire("other.example") || f.acquire("third.example") || total.Rejected() != 1 {
+		t.Fatal("total flow quota not enforced or classified")
+	}
+	f.release("other.example")
+	f.release("example.com")
+	if !f.acquire("example.com") {
+		t.Fatal("flow quota was not released")
+	}
+	f.release("example.com")
+}
+
+func tcpPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
+	t.Helper()
+	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted := make(chan *net.TCPConn, 1)
+	go func() { conn, _ := listener.AcceptTCP(); accepted <- conn }()
+	client, err := net.DialTCP("tcp", nil, listener.Addr().(*net.TCPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := <-accepted
+	listener.Close()
+	return client, server
+}
+
+func TestRelayStreamsAndHalfCloses(t *testing.T) {
+	guestApp, guestRelay := tcpPair(t)
+	upstreamRelay, upstreamApp := tcpPair(t)
+	result := make(chan [2]uint64, 1)
+	go func() { up, down := relay(guestRelay, upstreamRelay); result <- [2]uint64{up, down} }()
+	_, _ = guestApp.Write([]byte("upload"))
+	_ = guestApp.CloseWrite()
+	if got, _ := io.ReadAll(upstreamApp); string(got) != "upload" {
+		t.Fatalf("upload %q", got)
+	}
+	_, _ = upstreamApp.Write([]byte("download"))
+	_ = upstreamApp.CloseWrite()
+	if got, _ := io.ReadAll(guestApp); string(got) != "download" {
+		t.Fatalf("download %q", got)
+	}
+	if counts := <-result; counts != [2]uint64{6, 8} {
+		t.Fatalf("counts %v", counts)
+	}
+	guestApp.Close()
+	upstreamApp.Close()
+}
+
+func TestRelayIdleTracksBothDirections(t *testing.T) {
+	guestApp, guestRelay := tcpPair(t)
+	upstreamRelay, upstreamApp := tcpPair(t)
+	defer guestApp.Close()
+	defer upstreamApp.Close()
+	result := make(chan [2]uint64, 1)
+	go func() {
+		up, down := relayIdle(guestRelay, upstreamRelay, 200*time.Millisecond)
+		result <- [2]uint64{up, down}
+	}()
+	_ = guestApp.SetDeadline(time.Now().Add(3 * time.Second))
+	_ = upstreamApp.SetDeadline(time.Now().Add(3 * time.Second))
+	for range 20 {
+		if _, err := upstreamApp.Write([]byte("x")); err != nil {
+			t.Fatal(err)
+		}
+		var data [1]byte
+		if _, err := io.ReadFull(guestApp, data[:]); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := guestApp.Write([]byte("late")); err != nil {
+		t.Fatal(err)
+	}
+	var upload [4]byte
+	if _, err := io.ReadFull(upstreamApp, upload[:]); err != nil || string(upload[:]) != "late" {
+		t.Fatalf("active one-way traffic lost its reverse direction: %q, %v", upload, err)
+	}
+	_ = guestApp.CloseWrite()
+	_ = upstreamApp.CloseWrite()
+	select {
+	case counts := <-result:
+		if counts != [2]uint64{4, 20} {
+			t.Fatalf("counts %v", counts)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("completed relay did not stop")
+	}
+}
+
+func TestRelayIdleStillExpiresQuietConnections(t *testing.T) {
+	guestApp, guestRelay := tcpPair(t)
+	upstreamRelay, upstreamApp := tcpPair(t)
+	defer guestApp.Close()
+	defer upstreamApp.Close()
+	done := make(chan struct{})
+	go func() { relayIdle(guestRelay, upstreamRelay, 20*time.Millisecond); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("quiet relay exceeded its idle deadline")
+	}
+}
+
+func TestDialRejectsForbiddenAddressUnlessExplicit(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	port := listener.Addr().(*net.TCPAddr).Port
+	f := &TCPForwarder{}
+	if conn, err := f.dial(context.Background(), config.Rule{}, "127.0.0.1", uint16(port)); err == nil {
+		conn.Close()
+		t.Fatal("dialed forbidden loopback")
+	}
+	go func() {
+		conn, _ := listener.Accept()
+		if conn != nil {
+			conn.Close()
+		}
+	}()
+	conn, err := f.dial(context.Background(), config.Rule{Protocol: "tcp", AllowRanges: []string{"127.0.0.0/8"}}, "localhost", uint16(port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+}
+
+func fakeSOCKSServer(listener net.Listener, key []byte, result chan<- error) {
+	conn, err := listener.Accept()
+	if err != nil {
+		result <- err
+		return
+	}
+	defer conn.Close()
+	greeting := make([]byte, 3)
+	if _, err = io.ReadFull(conn, greeting); err != nil || string(greeting) != "\x05\x01\x02" {
+		result <- io.ErrUnexpectedEOF
+		return
+	}
+	_, _ = conn.Write([]byte{5, 2})
+	header := make([]byte, 2)
+	if _, err = io.ReadFull(conn, header); err != nil || header[0] != 1 {
+		result <- io.ErrUnexpectedEOF
+		return
+	}
+	username := make([]byte, int(header[1]))
+	_, err = io.ReadFull(conn, username)
+	var size [1]byte
+	if err == nil {
+		_, err = io.ReadFull(conn, size[:])
+	}
+	password := make([]byte, int(size[0]))
+	if err == nil {
+		_, err = io.ReadFull(conn, password)
+	}
+	parts := strings.Split(string(password), "|")
+	if err != nil || len(parts) != 8 {
+		result <- io.ErrUnexpectedEOF
+		return
+	}
+	port, err := strconv.ParseUint(parts[6], 10, 16)
+	if err != nil {
+		result <- err
+		return
+	}
+	verifier, _ := capability.New(key, "vm1", "worker1")
+	if _, err = verifier.Verify(string(username), string(password), string(username), uint16(port)); err != nil {
+		result <- err
+		return
+	}
+	_, _ = conn.Write([]byte{1, 0})
+	request := make([]byte, 5)
+	if _, err = io.ReadFull(conn, request); err != nil || string(request[:4]) != "\x05\x01\x00\x03" {
+		result <- io.ErrUnexpectedEOF
+		return
+	}
+	destination := make([]byte, int(request[4])+2)
+	if _, err = io.ReadFull(conn, destination); err != nil || string(destination[:len(destination)-2]) != string(username) {
+		result <- io.ErrUnexpectedEOF
+		return
+	}
+	_, _ = conn.Write([]byte{5, 0, 0, 1, 127, 0, 0, 1, 0, 0})
+	result <- nil
+}
+
+func TestMediatorDialUsesAuthenticatedDestinationBoundSOCKS(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	key := []byte(strings.Repeat("k", capability.KeySize))
+	result := make(chan error, 1)
+	go fakeSOCKSServer(listener, key, result)
+	mediator, err := NewMediator(listener.Addr().String(), key, "vm1", "worker1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	conn, err := mediator.Dial(ctx, config.Rule{ID: "web", Protocol: "http"}, "example.com", 443)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func FuzzReadSOCKSReply(f *testing.F) {
+	f.Add([]byte{5, 0, 0, 1, 127, 0, 0, 1, 0, 0})
+	f.Fuzz(func(t *testing.T, reply []byte) { _ = readSOCKSReply(bytes.NewReader(reply)) })
+}
+
+func TestMediatorCrashFailsClosed(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	listener.Close()
+	key := []byte(strings.Repeat("k", capability.KeySize))
+	mediator, err := NewMediator(address, key, "vm1", "worker1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if conn, err := mediator.Dial(ctx, config.Rule{ID: "web", Protocol: "http"}, "example.com", 443); err == nil {
+		conn.Close()
+		t.Fatal("mediator outage did not fail closed")
+	}
+	if _, err := NewMediator("0.0.0.0:8080", key, "vm1", "worker1"); err == nil {
+		t.Fatal("accepted non-loopback mediator")
+	}
+}

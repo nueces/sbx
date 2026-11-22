@@ -20,9 +20,62 @@ jobs:
           python-version: "3.12"
 
       - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: "0.11.30"
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.5"
+          cache-dependency-path: gateway/go.sum
+
+      - name: Verify gateway artifacts and installed mediator
+        run: |
+          set -euo pipefail
+          GO=go gateway/scripts/build_release_artifacts.sh
+          git diff --exit-code -- src/sbx/gateway_runtime
+          UV_TOOL_DIR="$RUNNER_TEMP/sbx-tool" UV_TOOL_BIN_DIR="$RUNNER_TEMP/sbx-bin" \
+            uv tool install --from . sbx --python 3.12
+          "$RUNNER_TEMP/sbx-bin/sbx" --version
+          test -x "$RUNNER_TEMP/sbx-bin/mitmdump"
+          test -x "$RUNNER_TEMP/sbx-bin/mitmweb"
+          worker=$("$RUNNER_TEMP/sbx-tool/sbx/bin/python" -c \
+            'from sbx.gateway import GATEWAY_WORKER; print(GATEWAY_WORKER)')
+          test -x "$worker"
+          test "$("$worker" 2>&1 || true)" = "sbx-gateway: --config must be an absolute path"
+          uv sync --locked --no-build --no-dev --no-install-project --python 3.12
+          python .github/scripts/audit_dependencies.py
+          uv run --extra dev pytest --no-cov gateway/mediator
+
+      - name: Run Go tests
+        run: GOTOOLCHAIN=local go -C gateway test ./...
 
       - name: Run tests
-        run: uv run --python 3.12 --extra dev pytest --no-cov
+        run: uv run --python 3.12 --extra dev pytest
+
+      - name: Install integration-test prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes qemu-system-x86
+          sudo install -d -m 0755 "$RUNNER_TEMP/sbx-resource-observer"
+          sudo install -m 0444 gateway/scripts/resource_usage.py "$RUNNER_TEMP/sbx-resource-observer/observer.py"
+
+      - name: Build integration-test guest
+        run: gateway/scripts/build_test_guest.sh
+
+      - name: Run integration tests
+        timeout-minutes: 10
+        env:
+          SBX_GATEWAY_BIN: ${{ github.workspace }}/src/sbx/gateway_runtime/bin/sbx-gateway-linux-amd64
+          SBX_GATEWAY_RESOURCE_OBSERVER: ${{ runner.temp }}/sbx-resource-observer/observer.py
+        run: uv run --python 3.12 --extra dev pytest --no-cov -s tests/integration
+
+      - name: Remove validation observer
+        if: always()
+        run: |
+          sudo rm -f "$RUNNER_TEMP/sbx-resource-observer/observer.py"
+          if [ -d "$RUNNER_TEMP/sbx-resource-observer" ]; then
+            sudo rmdir "$RUNNER_TEMP/sbx-resource-observer"
+          fi
 
       - name: Run ruff
         run: uv run --python 3.12 --extra dev ruff check .

@@ -1,0 +1,121 @@
+from __future__ import annotations
+
+import resource
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+from hardening import Status, sanitized_environment
+
+
+def _large_default_thread_stack() -> None:
+    """Give glibc a 64 MiB default thread stack, larger than any common host's."""
+    hard = resource.getrlimit(resource.RLIMIT_STACK)[1]
+    size = 64 * 1024 * 1024
+    if hard != resource.RLIM_INFINITY:
+        size = min(size, hard)
+    resource.setrlimit(resource.RLIMIT_STACK, (size, hard))
+
+
+class HardeningTests(unittest.TestCase):
+    def test_linux_profile_denies_privileged_syscall_files_and_core_dumps(self) -> None:
+        if sys.platform != "linux":
+            return
+        script = """
+import ctypes, os, resource, sys
+from pathlib import Path
+from hardening import apply
+confdir = Path(sys.argv[1]); confdir.mkdir(mode=0o700)
+status = apply(confdir, 128, Path(sys.executable))
+assert status.no_new_privs and status.seccomp and status.limits, status
+assert resource.getrlimit(resource.RLIMIT_CORE) == (0, 0)
+assert 'NoNewPrivs:\\t1' in Path('/proc/self/status').read_text()
+assert 'Seccomp:\\t2' in Path('/proc/self/status').read_text()
+if status.landlock:
+    try:
+        Path('/etc/passwd').read_bytes()
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError('Landlock allowed an unrelated file')
+libc = ctypes.CDLL(None, use_errno=True)
+number = 272 if os.uname().machine == 'x86_64' else 97
+assert libc.syscall(number, 0x20000) == -1 and ctypes.get_errno() == 1
+print(status.encode())
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(
+                [sys.executable, "-c", script, str(Path(directory) / "conf")],
+                cwd=Path(__file__).parent,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("no_new_privs,seccomp,", result.stdout)
+        self.assertIn(",rlimits", result.stdout)
+
+    def test_concurrent_threads_fit_within_address_space_limit(self) -> None:
+        if sys.platform != "linux":
+            return
+        script = """
+import resource, sys, threading
+from pathlib import Path
+import mitmproxy.tools.web.master
+from hardening import MAX_ADDRESS_SPACE, apply
+confdir = Path(sys.argv[1]); confdir.mkdir(mode=0o700)
+apply(confdir, 128, Path(sys.executable))
+release = threading.Event()
+ready = threading.Barrier(33)
+threads = []
+def hold():
+    allocation = bytearray(1024 * 1024)
+    ready.wait(timeout=5)
+    release.wait(timeout=10)
+try:
+    for _ in range(32):
+        thread = threading.Thread(target=hold)
+        thread.start()
+        threads.append(thread)
+    ready.wait(timeout=5)
+    assert resource.getrlimit(resource.RLIMIT_AS)[0] == MAX_ADDRESS_SPACE
+    print('32 concurrent threads within unchanged address-space limit')
+finally:
+    release.set()
+    for thread in threads:
+        thread.join(timeout=6)
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            confdir = Path(directory) / "conf"
+            result = subprocess.run(
+                [sys.executable, "-c", script, str(confdir)],
+                cwd=Path(__file__).parent,
+                env=sanitized_environment(confdir, Status(False, False, False, False), {}),
+                preexec_fn=_large_default_thread_stack,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("32 concurrent threads", result.stdout)
+
+    def test_environment_and_inherited_descriptors_are_minimal(self) -> None:
+        environment = sanitized_environment(
+            Path("/private/state"),
+            Status(True, True, False, True),
+            {"SBX_GATEWAY_KEY_FD": "7"},
+        )
+        self.assertNotIn("LD_PRELOAD", environment)
+        self.assertNotIn("PYTHONPATH", environment)
+        self.assertNotIn("HTTP_PROXY", environment)
+        self.assertEqual(environment["MALLOC_ARENA_MAX"], "2")
+        self.assertEqual(environment["HOME"], "/private/state")
+        self.assertEqual(environment["SBX_GATEWAY_KEY_FD"], "7")
+
+
+if __name__ == "__main__":
+    unittest.main()

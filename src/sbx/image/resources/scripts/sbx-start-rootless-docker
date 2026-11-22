@@ -59,7 +59,9 @@ awk -F: -v user="$DOCKER_USER" '$1 == user { found=1 } END { exit !found }' /etc
 awk -F: -v user="$DOCKER_USER" '$1 == user { found=1 } END { exit !found }' /etc/subgid \
   || printf '%s:100000:65536\n' "$DOCKER_USER" >> /etc/subgid
 
-printf 'nameserver 10.0.2.3\nnameserver 8.8.8.8\nnameserver 8.8.4.4\n' > "$RESOLV_CONF"
+if ! grep -Eq '^[[:space:]]*nameserver[[:space:]]+192\.0\.2\.1([[:space:]]|$)' "$RESOLV_CONF"; then
+  printf 'nameserver 10.0.2.3\nnameserver 8.8.8.8\nnameserver 8.8.4.4\n' > "$RESOLV_CONF"
+fi
 mkdir -p /sys/fs/cgroup /dev/net "$RUNTIME_DIR"
 mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
 mknod /dev/net/tun c 10 200 2>/dev/null || true

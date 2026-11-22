@@ -1,6 +1,6 @@
-# Current local image usage
+# Local image architecture
 
-This document records how `sbx` currently uses local SmolVM images. It is descriptive, not a proposal for future distribution changes.
+This explains the current local-image format, SDK boundary and isolated disks. For host prerequisites, build commands and guest troubleshooting, use the [image how-to](build-local-debian-pi-image.md). It is not a distribution proposal or a validation campaign.
 
 ## Summary
 
@@ -117,12 +117,13 @@ per-VM materialized disk:
 
 Changing or resizing one VM's materialized disk does not resize the base image or other VMs.
 
-If a base image is rebuilt, existing VMs may continue to use their already-materialized per-VM disks. To force a VM to pick up the rebuilt base image, remove/recreate that VM:
+If a base image is rebuilt, existing VMs may continue to use their already-materialized per-VM disks. To adopt the complete rebuilt base, first preserve guest-only data and private gateway evidence. **Recreation deletes the VM disk.** From the host, explicitly confirm recreation:
 
 ```bash
-sbx rm the-quest --force
-sbx run
+sbx recreate
 ```
+
+Saved kernel paths and the isolated rootfs have different lifetimes: replacing a kernel at the same path may affect the next boot without replacing the existing VM disk. Verify the actual boot configuration rather than treating a restart as a complete image upgrade.
 
 ## `disk_size` and filesystem growth
 

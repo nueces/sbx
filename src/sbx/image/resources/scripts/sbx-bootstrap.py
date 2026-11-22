@@ -11,6 +11,7 @@ import pwd
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -598,6 +599,36 @@ class Runtime:
         finally:
             temporary.unlink(missing_ok=True)
 
+    def _verify_runtime_tool(self, tool):
+        result = self.run(
+            [
+                "timeout",
+                "--signal=TERM",
+                "--kill-after=2s",
+                "15s",
+                "bash",
+                "-lc",
+                'export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"; '
+                f"exec {tool} --version",
+            ],
+            user=True,
+            timeout=20,
+            check=False,
+        )
+        if result.returncode:
+            hint = (
+                "; SIGILL: guest CPU may be incompatible"
+                if result.returncode in (-signal.SIGILL, 128 + signal.SIGILL)
+                else ""
+            )
+            details = self.redact(
+                "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+            )
+            raise ValueError(
+                f"{tool} --version failed (exit {result.returncode}){hint}"
+                + (f": {details}" if details else "")
+            )
+
     def tools(self):
         self.existing_account()
         timeout = self.args["install_timeout"]
@@ -613,6 +644,8 @@ class Runtime:
                 check=False,
             )
             if found.returncode == 0:
+                if tool in ("claude", "opencode"):
+                    self._verify_runtime_tool(tool)
                 continue
             if found.stderr.strip():
                 raise ValueError(self.redact(found.stderr.strip()))
@@ -662,6 +695,8 @@ class Runtime:
                         f"installed {tool}, but its executable is not on the runtime user's PATH; "
                         "inspect the npm install and retry provisioning"
                     )
+            if tool in ("claude", "opencode"):
+                self._verify_runtime_tool(tool)
 
     def execute(self):
         if self.phase == "mounts":

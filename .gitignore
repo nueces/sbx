@@ -20,3 +20,7 @@ wheels/
 
 # SBX
 .sbx.toml
+gateway/sbx-gateway
+
+# test and data for local tests
+local/
