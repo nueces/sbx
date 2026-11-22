@@ -118,7 +118,10 @@ class BenchmarkServer(ThreadingHTTPServer):
 
     def finish_request(self, request, client_address):
         if isinstance(request, ssl.SSLSocket):
-            request.do_handshake()
+            try:
+                request.do_handshake()
+            except (ssl.SSLError, OSError):
+                return None  # peer left before completing TLS; nothing to serve
             if request.selected_alpn_protocol() == "h2":
                 return self.serve_http2(request)
         return super().finish_request(request, client_address)
