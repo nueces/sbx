@@ -60,6 +60,7 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 norecursedirs = ["tests/integration"]
 addopts = "-q --cov=sbx --cov-report=term-missing --cov-fail-under=90"
 
