@@ -2607,7 +2607,7 @@ class GatewayController:
             )
             or ready.get("mediator") is not has_http
             or ready.get("ingress") != len(self.listener_rules)
-            or ready.get("egress_default", "deny") != self.config.default
+            or ready.get("egress_default") != self.config.default
             or not _hardening_ready(ready.get("hardening"), self.config.platform)
         ):
             raise GatewayAuthenticationError("worker readiness identity mismatch")

@@ -70,7 +70,7 @@ def test_direct_ip_requires_exact_worker_readiness_count(
 @pytest.mark.parametrize(
     ("configured", "reported", "accepted"),
     [
-        ("deny", None, True),
+        ("deny", None, False),
         ("deny", "deny", True),
         ("deny", "allow", False),
         ("allow", None, False),
@@ -274,6 +274,7 @@ class FakeRunner:
                 "incarnation_proof": hmac.new(token, message, hashlib.sha256).hexdigest(),
                 "mediator": True,
                 "ingress": 1,
+                "egress_default": policy.get("default", "deny"),
                 "hardening": "no_new_privs,seccomp,landlock-unavailable,rlimits",
             }
             network_ready = b'\n{"status":"network-ready","qemu_pid":12345}\n'
@@ -1536,7 +1537,7 @@ print(json.dumps({'status':'ready','version':1,'vm_id':sys.argv[3],
                   'generation':sys.argv[4],'digest':policy['digest'],
                   'incarnation':sys.argv[5],
                   'incarnation_proof':hmac.new(token,message,hashlib.sha256).hexdigest(),
-                  'mediator':True,'ingress':1,
+                  'mediator':True,'ingress':1,'egress_default':policy.get('default','deny'),
                   'hardening':'no_new_privs,seccomp,landlock-unavailable,rlimits'}), flush=True)
 print(json.dumps({'status':'network-ready','qemu_pid':os.getppid()}), flush=True)
 signal.pause()
@@ -1550,7 +1551,7 @@ print(json.dumps({'status':'ready','version':1,'vm_id':sys.argv[3],
                   'generation':sys.argv[4],'digest':policy['digest'],
                   'incarnation':sys.argv[5],
                   'incarnation_proof':hmac.new(token,message,hashlib.sha256).hexdigest(),
-                  'mediator':True,'ingress':1,
+                  'mediator':True,'ingress':1,'egress_default':policy.get('default','deny'),
                   'hardening':'no_new_privs,seccomp,landlock-unavailable,rlimits'}), flush=True)
 while True:
     print('{"status":"stats"}', flush=True)
