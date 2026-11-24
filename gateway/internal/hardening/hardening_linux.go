@@ -199,7 +199,7 @@ func landlockReadPaths(ruleset int, handled uint64) error {
 	return nil
 }
 
-func landlock(ports []uint16) (bool, error) {
+func landlock(ports []uint16, anyTCPPort bool) (bool, error) {
 	abi, _, syscallErr := unix.Syscall6(
 		unix.SYS_LANDLOCK_CREATE_RULESET, 0, 0, landlockCreateRulesetVersion, 0, 0, 0,
 	)
@@ -211,7 +211,8 @@ func landlock(ports []uint16) (bool, error) {
 	}
 	handledFS := landlockAccess(int(abi))
 	handledNet := uint64(0)
-	if abi >= 4 {
+	// Default-allow forwarding must reach any TCP port; address policy is enforced in Go.
+	if abi >= 4 && !anyTCPPort {
 		handledNet = landlockAccessNetConnectTCP
 	}
 	attr := landlockRulesetAttr{HandledAccessFS: handledFS, HandledAccessNet: handledNet}
@@ -252,7 +253,9 @@ func landlock(ports []uint16) (bool, error) {
 	return true, nil
 }
 
-func Apply(openFiles int, ports []uint16) (Status, error) {
+// Apply confines the worker. With anyTCPPort, Landlock still confines the filesystem
+// but does not restrict outbound TCP connect ports.
+func Apply(openFiles int, ports []uint16, anyTCPPort bool) (Status, error) {
 	if err := limits(openFiles); err != nil {
 		return Status{}, fmt.Errorf("resource limits: %w", err)
 	}
@@ -263,7 +266,7 @@ func Apply(openFiles int, ports []uint16) (Status, error) {
 	if _, _, err := syscall.AllThreadsSyscall6(unix.SYS_PRCTL, unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0, 0); err != 0 {
 		return Status{}, fmt.Errorf("all-thread no_new_privs: %w", err)
 	}
-	landlocked, err := landlock(ports)
+	landlocked, err := landlock(ports, anyTCPPort)
 	if err != nil {
 		return Status{}, fmt.Errorf("landlock: %w", err)
 	}

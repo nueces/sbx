@@ -37,6 +37,8 @@ const (
 	httpIdle               = 300 * time.Second
 )
 
+var errDefaultDenied = errors.New("no permitted default address")
+
 type FlowQuota struct {
 	tokens   chan struct{}
 	rejected atomic.Uint64
@@ -74,14 +76,20 @@ type TCPForwarder struct {
 	uploaded      atomic.Uint64
 	downloaded    atomic.Uint64
 	perDestDenied atomic.Uint64
+	// Default-allow forwarding only; never used for explicit rules.
+	lookup           func(ctx context.Context, network, host string) ([]netip.Addr, error)
+	defaultDial      func(ctx context.Context, network, address string) (net.Conn, error)
+	defaultForwarded atomic.Uint64
+	defaultDenied    atomic.Uint64
 }
 
 type ForwardStats struct {
 	Uploaded, Downloaded, PerDestinationRejected uint64
+	DefaultForwarded, DefaultDenied              uint64
 }
 
 func (f *TCPForwarder) Stats() ForwardStats {
-	return ForwardStats{f.uploaded.Load(), f.downloaded.Load(), f.perDestDenied.Load()}
+	return ForwardStats{f.uploaded.Load(), f.downloaded.Load(), f.perDestDenied.Load(), f.defaultForwarded.Load(), f.defaultDenied.Load()}
 }
 
 func NewMediator(address string, key []byte, vmID, incarnation string) (*Mediator, error) {
@@ -102,7 +110,9 @@ func (n *Network) ForwardTCP(cfg config.Config, resolver *syntheticdns.Resolver,
 	f := &TCPForwarder{
 		config: cfg, resolver: resolver, mediator: mediator, total: total,
 		perDest: make(map[string]int), dialer: net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second},
+		lookup: net.DefaultResolver.LookupNetIP,
 	}
+	f.defaultDial = f.dialer.DialContext
 	forwarder := tcp.NewForwarder(n.Stack, 0, cfg.Quotas.TCPFlows, f.handle)
 	n.Stack.SetTransportProtocolHandler(tcp.ProtocolNumber, forwarder.HandlePacket)
 	return f
@@ -120,21 +130,46 @@ func (f *TCPForwarder) handle(request *tcp.ForwarderRequest) {
 	if name, found := f.resolver.Acquire(ip); found {
 		host, synthetic = name, true
 	}
-	rule, allowed := f.config.Match("http", host, id.LocalPort)
-	if !allowed {
-		rule, allowed = f.config.Match("tls", host, id.LocalPort)
-	}
-	if !allowed {
-		rule, allowed = f.config.Match("tcp", host, id.LocalPort)
-	}
-	if !allowed || rule.Protocol == "http" && f.mediator == nil || !f.acquire(host) {
+	reject := func() {
 		if synthetic {
 			f.resolver.Release(ip)
 		}
 		request.Complete(true)
+	}
+	// Explicit policy is resolved completely before the default is considered, so a
+	// default can never hide an explicit rule of another protocol.
+	rule, matched := f.match(host, id.LocalPort)
+	if matched {
+		// A matched rule is enforced exactly; its failures never retry through the default.
+		if rule.Protocol == "http" && f.mediator == nil || !f.acquire(host) {
+			reject()
+			return
+		}
+		go f.forward(request, rule, false, host, id.LocalPort, ip, synthetic)
 		return
 	}
-	go f.forward(request, rule, host, id.LocalPort, ip, synthetic)
+	// Unissued synthetic, gateway-subnet and other protected literals fail here.
+	if !f.config.DefaultAllows() || !synthetic && !config.DefaultAllowsIP(ip) {
+		if f.config.DefaultAllows() {
+			f.defaultDenied.Add(1)
+		}
+		reject()
+		return
+	}
+	if !f.acquire(host) {
+		reject()
+		return
+	}
+	go f.forward(request, config.Rule{}, true, host, id.LocalPort, ip, synthetic)
+}
+
+func (f *TCPForwarder) match(host string, port uint16) (config.Rule, bool) {
+	for _, protocol := range []string{"http", "tls", "tcp"} {
+		if rule, ok := f.config.Match(protocol, host, port); ok {
+			return rule, true
+		}
+	}
+	return config.Rule{}, false
 }
 
 func (f *TCPForwarder) acquire(host string) bool {
@@ -162,7 +197,7 @@ func (f *TCPForwarder) release(host string) {
 	f.total.release()
 }
 
-func (f *TCPForwarder) forward(request *tcp.ForwarderRequest, rule config.Rule, host string, port uint16, syntheticIP netip.Addr, synthetic bool) {
+func (f *TCPForwarder) forward(request *tcp.ForwarderRequest, rule config.Rule, fallback bool, host string, port uint16, syntheticIP netip.Addr, synthetic bool) {
 	defer f.release(host)
 	if synthetic {
 		defer f.resolver.Release(syntheticIP)
@@ -176,6 +211,21 @@ func (f *TCPForwarder) forward(request *tcp.ForwarderRequest, rule config.Rule, 
 		return
 	}
 	guest := gonet.NewTCPConn(&wq, endpoint)
+	if fallback {
+		upstream, err := f.dialDefault(ctx, host, port)
+		if err != nil {
+			if errors.Is(err, errDefaultDenied) {
+				f.defaultDenied.Add(1)
+			}
+			guest.Close()
+			return
+		}
+		f.defaultForwarded.Add(1)
+		uploaded, downloaded := relayIdle(guest, upstream, rawTCPIdle)
+		f.uploaded.Add(uploaded)
+		f.downloaded.Add(downloaded)
+		return
+	}
 	if rule.Protocol == "tls" {
 		uploaded, downloaded, err := f.passthrough(ctx, guest, rule, host, port)
 		if err == nil {
@@ -247,6 +297,37 @@ func (f *TCPForwarder) dial(ctx context.Context, rule config.Rule, host string, 
 		}
 	}
 	return nil, fmt.Errorf("no permitted address for %s", host)
+}
+
+// dialDefault never contacts the mediator or credential broker. Every candidate,
+// literal or resolved, must pass the default address contract; only checked numeric
+// addresses are dialed, so DNS rebinding cannot reach protected addresses.
+func (f *TCPForwarder) dialDefault(ctx context.Context, host string, port uint16) (net.Conn, error) {
+	var addresses []netip.Addr
+	if ip, err := netip.ParseAddr(host); err == nil {
+		addresses = []netip.Addr{ip}
+	} else {
+		addresses, err = f.lookup(ctx, "ip", host)
+		if err != nil {
+			return nil, err
+		}
+	}
+	permitted := false
+	for _, ip := range addresses {
+		ip = ip.Unmap()
+		if !config.DefaultAllowsIP(ip) {
+			continue
+		}
+		permitted = true
+		conn, err := f.defaultDial(ctx, "tcp", net.JoinHostPort(ip.String(), strconv.Itoa(int(port))))
+		if err == nil {
+			return conn, nil
+		}
+	}
+	if !permitted {
+		return nil, fmt.Errorf("%w: %s", errDefaultDenied, host)
+	}
+	return nil, fmt.Errorf("no reachable default address for %s", host)
 }
 
 func (m *Mediator) Dial(ctx context.Context, rule config.Rule, host string, port uint16) (net.Conn, error) {

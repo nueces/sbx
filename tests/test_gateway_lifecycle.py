@@ -67,6 +67,43 @@ def test_direct_ip_requires_exact_worker_readiness_count(
         instance.close()
 
 
+@pytest.mark.parametrize(
+    ("configured", "reported", "accepted"),
+    [
+        ("deny", None, True),
+        ("deny", "deny", True),
+        ("deny", "allow", False),
+        ("allow", None, False),
+        ("allow", "deny", False),
+        ("allow", "allow", True),
+    ],
+)
+def test_worker_readiness_must_report_configured_egress_default(
+    lifecycle_config, tmp_path, monkeypatch, configured, reported, accepted
+):
+    config = replace(lifecycle_config, default=configured)
+    instance, _runner, _listeners = controller(config, tmp_path, monkeypatch)
+    original = instance._read_worker_status
+
+    def readiness(expected, deadline=None):
+        payload = original(expected, deadline)
+        if expected == "ready":
+            payload.pop("egress_default", None)
+            if reported is not None:
+                payload["egress_default"] = reported
+        return payload
+
+    monkeypatch.setattr(instance, "_read_worker_status", readiness)
+    try:
+        if accepted:
+            instance.prepare()
+        else:
+            with pytest.raises(gateway.GatewayAuthenticationError, match="identity mismatch"):
+                instance.prepare()
+    finally:
+        instance.close()
+
+
 @pytest.mark.parametrize("routes", [1, 2])
 def test_direct_ip_readiness_is_rechecked_on_replacement(
     lifecycle_config, tmp_path, monkeypatch, routes
@@ -690,6 +727,15 @@ def test_two_vm_resources_and_quota_failure_are_isolated(
     b_state = gateway.read_state(b.directory)
     assert b_state["counters"]["dns_rejected"] == 1
     assert b_state["last_failure"]["code"] == "quota_exhausted"
+    a._worker_buffer.extend(
+        b'{"status":"stats","default_forwarded":3,"default_denied":2,"dns_upstream_answers":5}\n'
+    )
+    a._drain_worker_stats()
+    a_counters = gateway.read_state(a.directory)["counters"]
+    assert a_counters["default_forwarded"] == 3
+    assert a_counters["default_denied"] == 2
+    assert a_counters["dns_upstream_answers"] == 5
+    # Default-route denials are policy outcomes, not resource exhaustion.
     assert gateway.read_state(a.directory)["last_failure"] is None
 
     a_pids = {process.pid for process in a.processes.values()}

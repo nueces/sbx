@@ -1,7 +1,7 @@
 package netstack
 
 import (
-	"encoding/binary"
+	"context"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -88,12 +88,17 @@ func (n *Network) ServeDNS(resolver *syntheticdns.Resolver) (*DNSService, error)
 			go func() {
 				defer func() { <-outstanding; service.active.Add(-1) }()
 				deadline := time.Now().Add(dnsQueryTimeout)
-				reply := resolver.Reply(packet)
+				queryCtx, cancel := context.WithDeadline(context.Background(), deadline)
+				answer := resolver.Answer(queryCtx, packet)
+				cancel()
+				reply := answer.Packet
 				if len(reply) == 0 || time.Now().After(deadline) {
 					return
 				}
-				if binary.BigEndian.Uint16(reply[6:8]) == 1 {
-					ip := net.IP(reply[len(reply)-4:]).String()
+				// Only synthetic identities become stack addresses; real default-allow
+				// answers are reached through promiscuous routing instead.
+				if answer.Synthetic.IsValid() {
+					ip := answer.Synthetic.String()
 					addresses.Lock()
 					if !known[ip] {
 						if err := n.AddLocalAddress(net.ParseIP(ip)); err != nil {

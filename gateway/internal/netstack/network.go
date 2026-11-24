@@ -78,6 +78,24 @@ func (n *Network) AddLocalAddress(ip net.IP) error {
 	return nil
 }
 
+// EnableDefaultRouting lets the TCP forwarder receive connections to arbitrary IPv4
+// destinations routed through the gateway. It is used only in default-allow mode:
+// deny mode keeps exact address registrations and silent drops. UDP without a
+// matching endpoint (only gateway DNS/DHCP exist) is dropped silently so promiscuous
+// mode does not emit unreachable replies on behalf of arbitrary destinations.
+func (n *Network) EnableDefaultRouting() error {
+	if err := n.Stack.SetPromiscuousMode(NICID, true); err != nil {
+		return errors.New(err.String())
+	}
+	if err := n.Stack.SetSpoofing(NICID, true); err != nil {
+		return errors.New(err.String())
+	}
+	n.Stack.SetTransportProtocolHandler(udp.ProtocolNumber, func(stack.TransportEndpointID, *stack.PacketBuffer) bool {
+		return true
+	})
+	return nil
+}
+
 // ProbeGuest wakes an idle guest so a replacement can authenticate its first frame.
 func (n *Network) ProbeGuest() error {
 	err := n.Stack.GetLinkAddress(NICID, tcpip.AddrFrom4Slice(net.ParseIP(GuestIP).To4()),

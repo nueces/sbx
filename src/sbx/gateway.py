@@ -198,6 +198,7 @@ class GatewayConfig:
     reconnection: Reconnection
     platform: str
     mitmweb: bool = False
+    default: str = "deny"
 
     def canonical(self, vm_id: str, generation: str) -> dict[str, Any]:
         _validate_id(vm_id, "VM identity")
@@ -211,7 +212,7 @@ class GatewayConfig:
             "version": 1,
             "vm_id": vm_id,
             "generation": generation,
-            "default": "deny",
+            "default": self.default,
             "platform": self.platform,
             "mitmweb": self.mitmweb,
             "rules": [asdict(rule) for rule in self.rules],
@@ -249,6 +250,11 @@ class GatewayConfig:
             "version": 1,
             "vm_id": vm_id,
             "generation": generation,
+        }
+        # Deny is encoded by omission; the key follows Go's struct order (digest, default, rules).
+        if self.default == "allow":
+            data["default"] = "allow"
+        data |= {
             "rules": rules,
             "ingress": [
                 {
@@ -769,8 +775,9 @@ def parse_config(config: Mapping[str, Any], *, platform: str | None = None) -> G
         raise ConfigError("gateway networking is supported only on Linux and unverified macOS")
     network = _mapping(config["network"], "[network]")
     _reject_unknown(network, _ALLOWED_NETWORK_KEYS, "[network]")
-    if network.get("default", "deny") != "deny":
-        raise ConfigError("[network].default must be 'deny'")
+    default = network.get("default", "deny")
+    if type(default) is not str or default not in {"deny", "allow"}:
+        raise ConfigError("[network].default must be 'deny' or 'allow'")
 
     mitmweb = network.get("mitmweb", False)
     if type(mitmweb) is not bool:
@@ -933,6 +940,7 @@ def parse_config(config: Mapping[str, Any], *, platform: str | None = None) -> G
         _reconnection(network.get("reconnection")),
         selected_platform,
         mitmweb,
+        default,
     )
 
 
@@ -2599,6 +2607,7 @@ class GatewayController:
             )
             or ready.get("mediator") is not has_http
             or ready.get("ingress") != len(self.listener_rules)
+            or ready.get("egress_default", "deny") != self.config.default
             or not _hardening_ready(ready.get("hardening"), self.config.platform)
         ):
             raise GatewayAuthenticationError("worker readiness identity mismatch")
@@ -2820,6 +2829,9 @@ class GatewayController:
                 "dns_mappings",
                 "bytes_in",
                 "bytes_out",
+                "default_forwarded",
+                "default_denied",
+                "dns_upstream_answers",
             )
             counters = {
                 name: payload[name]

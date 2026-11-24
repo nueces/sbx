@@ -14,4 +14,4 @@ func (s Status) Encode() string {
 }
 
 // Apply keeps Darwin builds portable; runtime confinement remains explicitly unverified.
-func Apply(_ int, _ []uint16) (Status, error) { return Status{}, nil }
+func Apply(_ int, _ []uint16, _ bool) (Status, error) { return Status{}, nil }

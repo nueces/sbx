@@ -17,6 +17,9 @@ import (
 
 const Version = 1
 
+// DefaultAllow is the only explicit worker default; an empty default means deny.
+const DefaultAllow = "allow"
+
 type Rule struct {
 	ID          string   `json:"id"`
 	Protocol    string   `json:"protocol"`
@@ -48,6 +51,7 @@ type Config struct {
 	VMID       string    `json:"vm_id"`
 	Generation string    `json:"generation"`
 	Digest     string    `json:"digest,omitempty"`
+	Default    string    `json:"default,omitempty"`
 	Rules      []Rule    `json:"rules"`
 	Ingress    []Ingress `json:"ingress"`
 	Quotas     Quotas    `json:"quotas"`
@@ -104,6 +108,10 @@ func (c *Config) normalize() error {
 	}
 	if !validID(c.VMID) || !validID(c.Generation) {
 		return errors.New("invalid VM identity or generation")
+	}
+	// Deny is encoded only by omission so each policy has one canonical digest.
+	if c.Default != "" && c.Default != DefaultAllow {
+		return errors.New("invalid network default")
 	}
 	if c.Quotas.TCPFlows < 1 || c.Quotas.TCPFlows > 512 || c.Quotas.FlowsPerDestination < 1 || c.Quotas.FlowsPerDestination > 64 || c.Quotas.IngressFlows < 1 || c.Quotas.IngressFlows > 64 || c.Quotas.DNSMappings < 1 || c.Quotas.DNSMappings > 1024 || c.Quotas.OpenFiles < 64 || c.Quotas.OpenFiles > 4096 {
 		return errors.New("quota outside allowed range")
@@ -216,6 +224,17 @@ func (c Config) ComputeDigest() (string, error) {
 	}
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+// DefaultAllows reports whether unmatched TCP uses raw default forwarding.
+func (c Config) DefaultAllows() bool { return c.Default == DefaultAllow }
+
+// EgressDefault is the readiness/diagnostic name of the configured default.
+func (c Config) EgressDefault() string {
+	if c.DefaultAllows() {
+		return "allow"
+	}
+	return "deny"
 }
 
 func (c Config) AllowsHost(host string) bool {

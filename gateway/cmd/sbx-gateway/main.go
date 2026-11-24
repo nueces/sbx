@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -119,6 +120,27 @@ func prepareDNS(network *gatewaynet.Network, cfg config.Config, journal *os.File
 	return resolver, nil
 }
 
+// hostLookup resolves unmatched default-allow names on the host, IPv4 only.
+func hostLookup(ctx context.Context, host string) ([]netip.Addr, error) {
+	return net.DefaultResolver.LookupNetIP(ctx, "ip4", host)
+}
+
+// enableDefaultAllow must run before DNS or TCP serving starts.
+func enableDefaultAllow(network *gatewaynet.Network, resolver *syntheticdns.Resolver, lookup syntheticdns.LookupFunc) error {
+	resolver.SetDefaultLookup(lookup, config.DefaultAllowsIP)
+	return network.EnableDefaultRouting()
+}
+
+func readinessPayload(cfg config.Config, incarnation, proof string, mediator bool, ingress int, hardening string) map[string]any {
+	return map[string]any{
+		"status": "ready", "version": 1, "vm_id": cfg.VMID,
+		"generation": cfg.Generation, "digest": cfg.Digest, "incarnation": incarnation,
+		"incarnation_proof": proof, "mediator": mediator,
+		"ingress": ingress, "hardening": hardening,
+		"direct_ip_routes": len(cfg.DirectIPs()), "egress_default": cfg.EgressDefault(),
+	}
+}
+
 func run() error {
 	socket := flag.String("socket", "", "controller-owned QEMU Unix socket path")
 	configPath := flag.String("config", "", "immutable worker JSON config")
@@ -216,6 +238,11 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("synthetic DNS state: %w", err)
 	}
+	if cfg.DefaultAllows() {
+		if err := enableDefaultAllow(network, resolver, hostLookup); err != nil {
+			return fmt.Errorf("default-allow routing: %w", err)
+		}
+	}
 	var mediator *gatewaynet.Mediator
 	allowedPorts := make([]uint16, 0, len(cfg.Rules)+1)
 	for _, rule := range cfg.Rules {
@@ -248,7 +275,7 @@ func run() error {
 			allowedPorts = append(allowedPorts, rule.Ports...)
 		}
 	}
-	hardeningStatus, err := hardening.Apply(cfg.Quotas.OpenFiles-cfg.Quotas.OpenFiles/2, allowedPorts)
+	hardeningStatus, err := hardening.Apply(cfg.Quotas.OpenFiles-cfg.Quotas.OpenFiles/2, allowedPorts, cfg.DefaultAllows())
 	if err != nil {
 		return fmt.Errorf("hardening: %w", err)
 	}
@@ -263,13 +290,7 @@ func run() error {
 	}
 	defer dns.Close()
 	forwarder := network.ForwardTCP(cfg, resolver, mediator, totalFlows)
-	if err := json.NewEncoder(os.Stdout).Encode(map[string]any{
-		"status": "ready", "version": 1, "vm_id": cfg.VMID,
-		"generation": cfg.Generation, "digest": cfg.Digest, "incarnation": *workerIncarnation,
-		"incarnation_proof": proof, "mediator": mediator != nil,
-		"ingress": len(registeredIngress), "hardening": hardeningStatus.Encode(),
-		"direct_ip_routes": len(cfg.DirectIPs()),
-	}); err != nil {
+	if err := json.NewEncoder(os.Stdout).Encode(readinessPayload(cfg, *workerIncarnation, proof, mediator != nil, len(registeredIngress), hardeningStatus.Encode())); err != nil {
 		return fmt.Errorf("readiness: %w", err)
 	}
 	conn, err := listener.Accept()
@@ -347,7 +368,7 @@ func run() error {
 		case <-ticker.C:
 			stats, flows := stream.Stats(), forwarder.Stats()
 			outputMu.Lock()
-			fmt.Fprintf(os.Stdout, "{\"status\":\"stats\",\"frames_read\":%d,\"frames_written\":%d,\"frames_rejected\":%d,\"tcp_active\":%d,\"tcp_rejected\":%d,\"destination_rejected\":%d,\"ingress_active\":%d,\"dns_active\":%d,\"dns_rejected\":%d,\"dns_mappings\":%d,\"bytes_in\":%d,\"bytes_out\":%d}\n", stats.Read, stats.Written, stats.Rejected, totalFlows.Active(), totalFlows.Rejected(), flows.PerDestinationRejected, ingress.Active(), dns.Active(), dns.Rejected(), resolver.Len(), flows.Uploaded, flows.Downloaded)
+			fmt.Fprintf(os.Stdout, "{\"status\":\"stats\",\"frames_read\":%d,\"frames_written\":%d,\"frames_rejected\":%d,\"tcp_active\":%d,\"tcp_rejected\":%d,\"destination_rejected\":%d,\"ingress_active\":%d,\"dns_active\":%d,\"dns_rejected\":%d,\"dns_mappings\":%d,\"bytes_in\":%d,\"bytes_out\":%d,\"default_forwarded\":%d,\"default_denied\":%d,\"dns_upstream_answers\":%d}\n", stats.Read, stats.Written, stats.Rejected, totalFlows.Active(), totalFlows.Rejected(), flows.PerDestinationRejected, ingress.Active(), dns.Active(), dns.Rejected(), resolver.Len(), flows.Uploaded, flows.Downloaded, flows.DefaultForwarded, flows.DefaultDenied, resolver.UpstreamAnswers())
 			outputMu.Unlock()
 		}
 	}

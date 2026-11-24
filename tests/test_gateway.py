@@ -133,7 +133,9 @@ def test_gateway_full_config_normalizes_and_preserves_legacy_ingress(
     ("network", "message"),
     [
         ({"unknown": True}, "unknown field"),
-        ({"default": "allow"}, "must be 'deny'"),
+        ({"default": "open"}, "must be 'deny' or 'allow'"),
+        ({"default": True}, "must be 'deny' or 'allow'"),
+        ({"default": "Allow"}, "must be 'deny' or 'allow'"),
         ({"http": [{"host": "*.com", "ports": [443]}]}, "unknown field"),
         (
             {
@@ -793,7 +795,7 @@ def test_invalid_gateway_config_stops_before_command_mutation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     config = tmp_path / "bad.toml"
-    config.write_text('[network]\ndefault = "allow"\n', encoding="utf-8")
+    config.write_text('[network]\ndefault = "open"\n', encoding="utf-8")
     called = False
 
     def mutate(_args: object) -> int:

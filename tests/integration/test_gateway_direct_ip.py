@@ -123,7 +123,7 @@ class Console:
         self.process.stdin.flush()
 
 
-def archive(runtime, destination, required=()):
+def archive(runtime, destination, required=(), name="direct-ip-evidence.tar.gz"):
     """Archive stopped disks/state before deleting anything, verifying each regular member."""
     paths = [p for p in runtime.rglob("*") if p.is_file() and not p.is_symlink()]
     assert set(required) <= set(paths), "missing required diagnostic capture files"
@@ -133,7 +133,7 @@ def archive(runtime, destination, required=()):
             hashes[str(path.relative_to(runtime))] = hashlib.file_digest(
                 source, "sha256"
             ).hexdigest()
-    target = destination / "direct-ip-evidence.tar.gz"
+    target = destination / name
     with tarfile.open(target, "w:gz") as bundle:
         for path in paths:
             bundle.add(path, arcname=str(path.relative_to(runtime)), recursive=False)
@@ -149,10 +149,10 @@ def archive(runtime, destination, required=()):
     assert hashes
 
 
-def archive_and_remove(runtime, destination, capture):
+def archive_and_remove(runtime, destination, capture, name="direct-ip-evidence.tar.gz"):
     try:
         capture.finish()
-        archive(runtime, destination, capture.paths)
+        archive(runtime, destination, capture.paths, name)
     except BaseException:
         print(f"evidence incomplete; runtime retained at {runtime}", file=sys.stderr)
         raise
