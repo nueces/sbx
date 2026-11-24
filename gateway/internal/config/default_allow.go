@@ -8,11 +8,10 @@ var defaultPrivate = []netip.Prefix{
 	netip.MustParsePrefix("192.168.0.0/16"),
 }
 
-// Known metadata/host-agent endpoints outside ranges already rejected by forbiddenIP.
+// Known metadata/host-agent endpoints outside ranges already rejected by forbiddenIP
+// (which covers CGNAT 100.64.0.0/10, including Alibaba metadata 100.100.100.200).
 var defaultDenied = []netip.Prefix{
-	netip.MustParsePrefix("168.63.129.16/32"),   // Azure wireserver
-	netip.MustParsePrefix("100.100.100.200/32"), // Alibaba metadata (also within CGNAT)
-	netip.MustParsePrefix("100.64.0.0/10"),      // CGNAT/shared address space
+	netip.MustParsePrefix("168.63.129.16/32"), // Azure wireserver
 }
 
 // DefaultAllowsIP reports whether default (unmatched) forwarding may reach ip.

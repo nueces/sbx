@@ -274,60 +274,60 @@ func (f *TCPForwarder) dial(ctx context.Context, rule config.Rule, host string, 
 	if rule.Protocol == "http" {
 		return f.mediator.Dial(ctx, rule, host, port)
 	}
-	var addresses []netip.Addr
-	if ip, err := netip.ParseAddr(host); err == nil {
-		if !rule.AllowsDirectIP(ip) {
-			return nil, errors.New("direct-IP destination denied")
-		}
-		addresses = []netip.Addr{ip}
-	} else {
-		var err error
-		addresses, err = net.DefaultResolver.LookupNetIP(ctx, "ip", host)
-		if err != nil {
-			return nil, err
-		}
+	if ip, err := netip.ParseAddr(host); err == nil && !rule.AllowsDirectIP(ip) {
+		return nil, errors.New("direct-IP destination denied")
 	}
-	for _, ip := range addresses {
-		if !rule.AllowsIP(ip) {
-			continue
-		}
-		conn, err := f.dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), strconv.Itoa(int(port))))
-		if err == nil {
-			return conn, nil
-		}
+	conn, _, err := dialPermitted(ctx, host, port, rule.AllowsIP, net.DefaultResolver.LookupNetIP, f.dialer.DialContext)
+	if err != nil {
+		return nil, err
 	}
-	return nil, fmt.Errorf("no permitted address for %s", host)
+	if conn == nil {
+		return nil, fmt.Errorf("no permitted address for %s", host)
+	}
+	return conn, nil
 }
 
 // dialDefault never contacts the mediator or credential broker. Every candidate,
 // literal or resolved, must pass the default address contract; only checked numeric
 // addresses are dialed, so DNS rebinding cannot reach protected addresses.
 func (f *TCPForwarder) dialDefault(ctx context.Context, host string, port uint16) (net.Conn, error) {
-	var addresses []netip.Addr
-	if ip, err := netip.ParseAddr(host); err == nil {
-		addresses = []netip.Addr{ip}
-	} else {
-		addresses, err = f.lookup(ctx, "ip", host)
-		if err != nil {
-			return nil, err
-		}
+	conn, permitted, err := dialPermitted(ctx, host, port, config.DefaultAllowsIP, f.lookup, f.defaultDial)
+	switch {
+	case err != nil:
+		return nil, err
+	case !permitted:
+		return nil, fmt.Errorf("%w: %s", errDefaultDenied, host)
+	case conn == nil:
+		return nil, fmt.Errorf("no reachable default address for %s", host)
 	}
-	permitted := false
+	return conn, nil
+}
+
+// dialPermitted resolves host (unless it is a literal IP) and dials, in order, only the
+// numeric addresses allow accepts. permitted reports whether any address passed allow;
+// conn is nil when none could be dialed. Only lookup failures are returned as err.
+func dialPermitted(
+	ctx context.Context, host string, port uint16, allow func(netip.Addr) bool,
+	lookup func(ctx context.Context, network, host string) ([]netip.Addr, error),
+	dial func(ctx context.Context, network, address string) (net.Conn, error),
+) (conn net.Conn, permitted bool, err error) {
+	addresses := []netip.Addr{}
+	if ip, parseErr := netip.ParseAddr(host); parseErr == nil {
+		addresses = append(addresses, ip)
+	} else if addresses, err = lookup(ctx, "ip", host); err != nil {
+		return nil, false, err
+	}
 	for _, ip := range addresses {
 		ip = ip.Unmap()
-		if !config.DefaultAllowsIP(ip) {
+		if !allow(ip) {
 			continue
 		}
 		permitted = true
-		conn, err := f.defaultDial(ctx, "tcp", net.JoinHostPort(ip.String(), strconv.Itoa(int(port))))
-		if err == nil {
-			return conn, nil
+		if conn, err := dial(ctx, "tcp", net.JoinHostPort(ip.String(), strconv.Itoa(int(port)))); err == nil {
+			return conn, true, nil
 		}
 	}
-	if !permitted {
-		return nil, fmt.Errorf("%w: %s", errDefaultDenied, host)
-	}
-	return nil, fmt.Errorf("no reachable default address for %s", host)
+	return nil, permitted, nil
 }
 
 func (m *Mediator) Dial(ctx context.Context, rule config.Rule, host string, port uint16) (net.Conn, error) {
