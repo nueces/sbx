@@ -8,7 +8,7 @@ class CustomBuildHook(BuildHookInterface):
         del version, build_data
         # Check only: editable builds run against the source tree, and hatchling already
         # copies the execute bit into the wheel.
-        for worker in (Path(self.root) / "src/sbx/gateway_runtime/bin").iterdir():
+        for worker in (Path(self.root) / "src/sbx/gateway_runtime/bin").glob("sbx-gateway-*"):
             if worker.stat().st_mode & 0o111 != 0o111:
                 raise RuntimeError(
                     f"{worker} is not executable; run gateway/scripts/build_release_artifacts.sh "

@@ -24,7 +24,7 @@ def workers(tmp_path, modes):
     bin_dir.mkdir(parents=True)
     paths = []
     for index, mode in enumerate(modes):
-        path = bin_dir / f"worker-{index}"
+        path = bin_dir / f"sbx-gateway-{index}"
         path.write_bytes(b"worker")
         path.chmod(mode)
         paths.append(path)
@@ -33,6 +33,7 @@ def workers(tmp_path, modes):
 
 def test_hook_accepts_executable_workers_without_changing_modes(monkeypatch, tmp_path):
     paths = workers(tmp_path, [0o555, 0o755])
+    (paths[0].parent / ".DS_Store").write_bytes(b"")  # stray non-binary files are ignored
     load_hook(monkeypatch, tmp_path).initialize("editable", {})
     assert [path.stat().st_mode & 0o777 for path in paths] == [0o555, 0o755]
 

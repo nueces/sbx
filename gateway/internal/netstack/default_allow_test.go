@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -190,13 +191,8 @@ func TestDefaultAllowForwardsArbitraryLiteralIPv4(t *testing.T) {
 	}
 	got := h.dialedAddresses()
 	want := []string{"93.184.216.34:8443", "10.1.2.3:8443", "192.168.7.8:8443", "172.16.9.9:8443"}
-	if len(got) != len(want) {
-		t.Fatalf("dialed %v", got)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("dialed %v, want %v", got, want)
-		}
+	if !slices.Equal(got, want) {
+		t.Fatalf("dialed %v, want %v", got, want)
 	}
 	if h.forwarder.Stats().DefaultForwarded != 4 || h.resolver.Len() != 0 {
 		t.Fatalf("stats %+v mappings %d", h.forwarder.Stats(), h.resolver.Len())

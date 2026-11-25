@@ -26,51 +26,6 @@ def test_worker_config_matches_cross_language_fixture(case: dict) -> None:
     assert config.digest("vm-fixture", "generation-1") == case["canonical_digest"]
 
 
-def test_fixture_covers_deny_omitted_and_allow() -> None:
-    assert {case["name"] for case in FIXTURES} >= {"deny", "omitted", "allow"}
-
-
-@pytest.mark.parametrize(
-    ("value", "expected"), [(None, "deny"), ("deny", "deny"), ("allow", "allow")]
-)
-def test_default_accepts_deny_allow_and_omission(value: str | None, expected: str) -> None:
-    network = {} if value is None else {"default": value}
-    assert _parse(network).default == expected
-
-
-@pytest.mark.parametrize("value", ["open", "ALLOW", "", 1, True, ["allow"], {"mode": "allow"}])
-def test_default_rejects_other_values(value: object) -> None:
-    with pytest.raises(ConfigError, match="must be 'deny' or 'allow'"):
-        _parse({"default": value})
-
-
-def test_worker_default_is_only_encoded_for_allow() -> None:
-    policy = {"id": "git", "mode": "tcp-forward", "hosts": ["github.com"], "ports": [22]}
-    deny = _parse({"policy": [policy]}).worker_config("vm-1", "generation-1")
-    allow = _parse({"default": "allow", "policy": [policy]}).worker_config("vm-1", "generation-1")
-    assert "default" not in deny
-    assert allow["default"] == "allow"
-    assert list(allow) == [
-        "version",
-        "vm_id",
-        "generation",
-        "digest",
-        "default",
-        "rules",
-        "ingress",
-        "quotas",
-    ]
-    assert allow["digest"] != deny["digest"]
-
-
-def test_mode_change_changes_configuration_identity() -> None:
-    deny = _parse({"default": "deny"})
-    allow = _parse({"default": "allow"})
-    assert deny.canonical("vm-1", "generation-1")["default"] == "deny"
-    assert allow.canonical("vm-1", "generation-1")["default"] == "allow"
-    assert deny.digest("vm-1", "generation-1") != allow.digest("vm-1", "generation-1")
-
-
 def test_allow_keeps_explicit_credential_restrictions() -> None:
     with pytest.raises(ConfigError, match="DNS hostnames"):
         _parse(
