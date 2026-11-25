@@ -206,22 +206,31 @@ func (f *TCPForwarder) forward(request *tcp.ForwarderRequest, rule config.Rule, 
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	var defaultUpstream net.Conn
+	if fallback {
+		// Dial before accepting, so a blocked or unreachable destination is refused
+		// with a reset instead of looking open to the guest.
+		var err error
+		if defaultUpstream, err = f.dialDefault(ctx, host, port); err != nil {
+			if errors.Is(err, errDefaultDenied) {
+				f.defaultDenied.Add(1)
+			}
+			request.Complete(true)
+			return
+		}
+	}
 	var wq waiter.Queue
 	endpoint, tcpErr := request.CreateEndpoint(&wq)
 	request.Complete(tcpErr != nil)
 	if tcpErr != nil {
+		if defaultUpstream != nil {
+			defaultUpstream.Close()
+		}
 		return
 	}
 	guest := gonet.NewTCPConn(&wq, endpoint)
 	if fallback {
-		upstream, err := f.dialDefault(ctx, host, port)
-		if err != nil {
-			if errors.Is(err, errDefaultDenied) {
-				f.defaultDenied.Add(1)
-			}
-			guest.Close()
-			return
-		}
+		upstream := defaultUpstream
 		f.defaultForwarded.Add(1)
 		uploaded, downloaded := relayIdle(guest, upstream, rawTCPIdle)
 		f.uploaded.Add(uploaded)

@@ -245,24 +245,30 @@ func TestDefaultAllowResolvesSyntheticNamesAndFiltersRebinding(t *testing.T) {
 		t.Fatalf("hostname default dialed %v", dialed)
 	}
 
-	// The handshake is accepted before resolution; the protected-only answer closes it.
-	conn, err = h.dial(rebind.String(), 443, time.Second)
-	if err == nil {
-		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-		if _, readErr := conn.Read(make([]byte, 1)); readErr == nil {
-			t.Fatal("rebinding destination relayed data")
-		}
+	// Resolution happens before the handshake completes; a protected-only answer is refused.
+	if conn, err := h.dial(rebind.String(), 443, time.Second); err == nil {
 		conn.Close()
+		t.Fatal("rebinding destination was admitted")
 	}
 	if dialed := h.dialedAddresses(); len(dialed) != 1 {
 		t.Fatalf("protected rebinding answer was dialed: %v", dialed)
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for h.forwarder.Stats().DefaultDenied == 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
 	if h.forwarder.Stats().DefaultDenied == 0 {
 		t.Fatal("rebinding denial not counted")
+	}
+}
+
+func TestDefaultAllowRefusesUnreachableDestinations(t *testing.T) {
+	h := newDefaultHarness(t, config.Config{}, true)
+	h.forwarder.defaultDial = func(context.Context, string, string) (net.Conn, error) {
+		return nil, errors.New("connection refused")
+	}
+	if conn, err := h.dial("10.0.0.5", 5432, 2*time.Second); err == nil {
+		conn.Close()
+		t.Fatal("a dead port on a permitted address looked open to the guest")
+	}
+	if stats := h.forwarder.Stats(); stats.DefaultForwarded != 0 || stats.DefaultDenied != 0 {
+		t.Fatalf("unreachable is neither forwarded nor a policy denial: %+v", stats)
 	}
 }
 

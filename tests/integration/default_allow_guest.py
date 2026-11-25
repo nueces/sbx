@@ -42,16 +42,8 @@ def refused(host, port):
         connection = socket.create_connection((host, port), timeout=3)
     except OSError:
         return
-    try:
-        # The gateway may accept before resolving; a denied flow is closed without data.
-        connection.settimeout(3)
-        connection.sendall(b"probe")
-        if connection.recv(64):
-            raise AssertionError(("unexpected TCP access", host, port))
-    except OSError:
-        return
-    finally:
-        connection.close()
+    connection.close()
+    raise AssertionError(("unexpected TCP access", host, port))
 
 
 def https(host, path, *, method="GET", expected=200):
@@ -107,12 +99,13 @@ def check(cached):
     https("api.example", "/outside", expected=403)
     https("api.example", "/v1/post", method="POST", expected=403)
 
-    # Protected destinations stay blocked.
+    # Protected destinations stay blocked, and dead ports do not look open.
     for host, port in (
         ("169.254.169.254", config["echo_port"]),
         ("100.100.100.200", config["echo_port"]),
         ("198.18.200.200", config["echo_port"]),
         ("192.0.2.1", 22),
+        (public, 1),  # allowed address, nothing listening: refused, not accepted then closed
     ):
         refused(host, port)
     return api[0]
