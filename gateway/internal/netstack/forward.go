@@ -148,11 +148,13 @@ func (f *TCPForwarder) handle(request *tcp.ForwarderRequest) {
 		go f.forward(request, rule, false, host, id.LocalPort, ip, synthetic)
 		return
 	}
+	if !f.config.DefaultAllows() {
+		reject()
+		return
+	}
 	// Unissued synthetic, gateway-subnet and other protected literals fail here.
-	if !f.config.DefaultAllows() || !synthetic && !config.DefaultAllowsIP(ip) {
-		if f.config.DefaultAllows() {
-			f.defaultDenied.Add(1)
-		}
+	if !synthetic && !config.DefaultAllowsIP(ip) {
+		f.defaultDenied.Add(1)
 		reject()
 		return
 	}

@@ -61,9 +61,6 @@ type Resolver struct {
 // It must be called before the resolver serves queries. Real answers never receive
 // synthetic identities, are never journaled and never consume mapping capacity.
 func (r *Resolver) SetDefaultLookup(lookup LookupFunc, permit func(netip.Addr) bool) {
-	if lookup == nil || permit == nil {
-		panic("default lookup requires a resolver and an address filter")
-	}
 	r.upstream = &defaultUpstream{lookup: lookup, permit: permit}
 }
 
