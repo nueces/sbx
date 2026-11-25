@@ -37,16 +37,18 @@ from sbx import gateway
 ROOT = Path(__file__).resolve().parents[2]
 PUBLIC, OTHER_PUBLIC = "93.184.216.34", "93.184.216.35"
 PRIVATE, OTHER_PRIVATE = "10.20.30.40", "10.20.30.41"
+BODY = b"direct-ip-ok" * 4096
 
 
 class Origin(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
-        self.server.records.append((self.path, self.headers.get("Host")))
-        body = b"direct-ip-ok" * 4096
+        self.server.records.append(
+            (self.command, self.path, self.headers.get("Host"), self.headers.get("Authorization"))
+        )
         self.send_response(200)
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(len(self.server.body)))
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(self.server.body)
 
     do_POST = do_GET
 
@@ -54,10 +56,10 @@ class Origin(BaseHTTPRequestHandler):
         pass
 
 
-def origin(runtime, name, *, tls=False, wrong_ip=False):
+def origin(runtime, name, *, body, tls=False, san=None):
     server = ThreadingHTTPServer(("0.0.0.0", 0), Origin)
     server.daemon_threads = True
-    server.records, server.snis = [], []
+    server.records, server.snis, server.body = [], [], body
     ca = None
     if tls:
         ca, key = runtime / f"{name}.pem", runtime / f"{name}-key.pem"
@@ -72,9 +74,9 @@ def origin(runtime, name, *, tls=False, wrong_ip=False):
                 "-days",
                 "1",
                 "-subj",
-                "/CN=direct-ip-test",
+                "/CN=gateway-integration-test",
                 "-addext",
-                f"subjectAltName=IP:{OTHER_PUBLIC if wrong_ip else PUBLIC}",
+                f"subjectAltName={san}",
                 "-keyout",
                 str(key),
                 "-out",
@@ -159,25 +161,280 @@ def archive_and_remove(runtime, destination, capture, name="direct-ip-evidence.t
     shutil.rmtree(runtime)
 
 
+def boot_guest(runtime, image, qemu_socket, share, tag):
+    """Boot the test guest on the gateway socket and start guest.py from the 9p share."""
+    manifest = json.loads(image.read_text())
+    kernel = (
+        image.parent / manifest["kernel"] if "kernel" in manifest else Path(manifest["kernel_path"])
+    )
+    rootfs = (
+        image.parent / manifest["rootfs"] if "rootfs" in manifest else Path(manifest["rootfs_path"])
+    )
+    (runtime / "image-reference.json").write_text(
+        json.dumps(
+            {"manifest": str(image), "rootfs": str(rootfs), "rootfs_size": rootfs.stat().st_size}
+        )
+    )
+    overlay = runtime / "guest.qcow2"
+    subprocess.run(
+        [
+            tool("SBX_QEMU_IMG_BIN", "qemu-img"),
+            "create",
+            "-f",
+            "qcow2",
+            "-F",
+            "raw",
+            "-b",
+            str(rootfs),
+            str(overlay),
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        timeout=10,
+    )
+    command = [
+        tool("SBX_QEMU_BIN", "qemu-system-x86_64"),
+        "-sandbox",
+        "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny",
+        "-nodefaults",
+        "-serial",
+        "stdio",
+        "-monitor",
+        "none",
+        "-nographic",
+        "-no-reboot",
+        "-machine",
+        "q35,accel=tcg",
+        "-cpu",
+        "max",
+        "-smp",
+        "1",
+        "-m",
+        "512",
+        "-kernel",
+        str(kernel),
+        "-append",
+        "console=ttyS0 reboot=k panic=1 root=/dev/vda rw init=/bin/sh",
+        "-drive",
+        f"file={overlay},if=none,format=qcow2,id=rootdisk",
+        "-device",
+        "virtio-blk-pci,drive=rootdisk",
+        "-netdev",
+        f"stream,id=net0,server=off,reconnect-ms=100,addr.type=unix,addr.path={qemu_socket}",
+        "-device",
+        "virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56",
+        "-fsdev",
+        f"local,id=share,path={share},security_model=none,readonly=on",
+        "-device",
+        f"virtio-9p-pci,fsdev=share,mount_tag={tag}",
+    ]
+    (runtime / "qemu-command.json").write_text(json.dumps(command))
+    qemu = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        env=child_environment(runtime),
+    )
+    PROCESSES.append(qemu)
+    console = Console(qemu)
+    console.until("job control turned off")
+    console.send(
+        "mount -t proc proc /proc; mount -t sysfs sysfs /sys; "
+        "mount -t devtmpfs devtmpfs /dev; mount -t tmpfs tmpfs /run; "
+        f"mkdir -p /run/{tag}; "
+        f"mount -t 9p -o trans=virtio,version=9p2000.L,ro {tag} /run/{tag}; "
+        "ip link set eth0 up; dhclient -1 eth0; "
+        f"python3 /run/{tag}/guest.py /run/{tag}/config.json"
+    )
+    return console
+
+
+def start_pair(
+    incarnation,
+    *,
+    runtime,
+    worker,
+    qemu_socket,
+    listener,
+    policy_path,
+    digest,
+    key,
+    vm_id,
+    trust,
+    upstream_port,
+    mediator_policy,
+    capture,
+):
+    """Start a production mediator and worker; both must run without privileges."""
+    mediator, ready, confdir = start_mediator(
+        runtime,
+        trust,
+        upstream_port,
+        key,
+        incarnation,
+        vm_id,
+        policy=mediator_policy,
+        allow_fixture_loopback=False,
+        mediator_dir=gateway.GATEWAY_MEDIATOR_DIR,
+        capture=capture,
+    )
+    process = start_worker(
+        worker,
+        qemu_socket,
+        listener,
+        policy_path,
+        digest,
+        ready,
+        key,
+        incarnation,
+        [],
+        vm_id=vm_id,
+        ingress_ids=(),
+        capture=capture,
+    )
+    for child in (process, mediator):
+        status = Path(f"/proc/{child.pid}/status").read_text()
+        assert "CapEff:\t0000000000000000" in status
+        assert "NoNewPrivs:\t1" in status
+    return process, mediator, confdir
+
+
+def stop_pair(process, mediator, confdir, capture):
+    """Stop a pair before its replacement, with its diagnostics and audit log drained."""
+    terminate(process)
+    terminate(mediator)
+    capture.finish(process)
+    capture.finish(mediator)
+    for thread in AUDIT_CONTROLLERS[confdir]._log_threads:
+        thread.join(5)
+        assert not thread.is_alive(), "audit drain unfinished before replacement"
+
+
+def teardown(runtime, destination, capture, console, *, closers, servers, evidence):
+    """Stop every fixture process, then archive evidence before removing the runtime."""
+    try:
+        for child in reversed(PROCESSES):
+            terminate(child)
+        for fd in LIFETIME_FDS:
+            with suppress(OSError):
+                os.close(fd)
+        for controller in AUDIT_CONTROLLERS.values():
+            for thread in controller._log_threads:
+                thread.join(5)
+                assert not thread.is_alive(), "audit drain unfinished"
+            if controller._audit_stream is not None:
+                controller._audit_stream.close()
+        for closer in closers:
+            if closer is not None:
+                closer.close()
+        for server in servers:
+            server.shutdown()
+            server.server_close()
+        if console is not None:
+            try:
+                console.drain()
+            finally:
+                (runtime / "guest-console.log").write_bytes(console.data)
+                console.selector.close()
+        # Neither partial capture nor a failed archive can authorize removal.
+        archive_and_remove(runtime, destination, capture, evidence)
+    except BaseException:
+        print(f"VM fixture cleanup failed; runtime retained at {runtime}", file=sys.stderr)
+        capture.finish()
+        raise
+
+
+DROP_PRIVILEGES = (
+    '; uid=$1; gid=$2; shift 2; exec setpriv --reuid="$uid" --regid="$gid" '
+    "--clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all "
+    '--no-new-privs /usr/bin/env "$@"'
+)
+
+
+def run_namespace_fixture(tmp_path, *, label, setup, unshare_flags, timeout, evidence, script):
+    """Run script's exercise() in fresh namespaces as the test user, without capabilities."""
+    assert sys.platform == "linux" and os.getuid() != 0
+    image = Path(
+        os.environ.get(
+            "SBX_GATEWAY_TEST_IMAGE",
+            Path.home() / ".smolvm/images/rootless-gateway-test/smolvm-image.json",
+        )
+    ).resolve()
+    assert image.is_file(), "build the required test guest first"
+    worker = Path(os.environ.get("SBX_GATEWAY_BIN", gateway.GATEWAY_WORKER)).resolve()
+    assert worker.is_file()
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    command = [
+        "sudo",
+        "-n",
+        "unshare",
+        *unshare_flags,
+        "--",
+        "/bin/sh",
+        "-c",
+        setup + DROP_PRIVILEGES,
+        f"{label}-fixture",
+        str(os.getuid()),
+        str(os.getgid()),
+        f"PATH={Path(sys.executable).parent}:{os.defpath}",
+        f"HOME={home}",
+        f"PYTHONPATH={os.environ.get('PYTHONPATH', '')}",
+        sys.executable,
+        str(script),
+        "--inside",
+        str(tmp_path),
+        os.readlink("/proc/self/ns/net"),
+        str(image),
+        str(worker),
+    ]
+    process = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True, cwd=ROOT
+    )
+    try:
+        output, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        subprocess.run(
+            ["sudo", "-n", "kill", "-TERM", "--", f"-{process.pid}"], timeout=10, check=False
+        )
+        output, _ = process.communicate(timeout=30)
+        raise AssertionError(f"{label} namespace test timed out: {output[-6000:]!r}") from None
+    (tmp_path / "namespace-driver.log").write_bytes(output)
+    assert process.returncode == 0, output[-8000:].decode(errors="replace")
+    assert (tmp_path / evidence).is_file()
+
+
+def namespace_main(exercise):
+    assert sys.argv[1] == "--inside"
+
+    def interrupted(_signal, _frame):
+        raise KeyboardInterrupt("namespace fixture interrupted")
+
+    signal.signal(signal.SIGTERM, interrupted)
+    exercise(Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4]), Path(sys.argv[5]))
+
+
 def exercise(destination, parent_namespace, image, worker):
     assert os.getuid() != 0 and os.geteuid() == os.getuid()
     assert os.readlink("/proc/self/ns/net") != parent_namespace
     runtime = Path(tempfile.mkdtemp(prefix="gw-ip-"))
     capture = DiagnosticCapture(runtime)
     stop = threading.Event()
-    servers, console, qemu, listener = [], None, None, None
+    servers, console, listener = [], None, None
     echo = socket.socket()
     echo.bind(("0.0.0.0", 0))
     echo.listen()
     threading.Thread(target=echo_server, args=(echo, stop), daemon=True).start()
     try:
-        plain, _ = origin(runtime, "plain")
+        plain, _ = origin(runtime, "plain", body=BODY)
         servers.append(plain)
-        secure, secure_ca = origin(runtime, "secure", tls=True)
+        secure, secure_ca = origin(runtime, "secure", body=BODY, tls=True, san=f"IP:{PUBLIC}")
         servers.append(secure)
-        wrong, wrong_ca = origin(runtime, "wrong", tls=True, wrong_ip=True)
+        wrong, wrong_ca = origin(runtime, "wrong", body=BODY, tls=True, san=f"IP:{OTHER_PUBLIC}")
         servers.append(wrong)
-        denied, _ = origin(runtime, "denied")
+        denied, _ = origin(runtime, "denied", body=BODY)
         servers.append(denied)
         trust = runtime / "upstream-trust.pem"
         trust.write_bytes(secure_ca.read_bytes() + wrong_ca.read_bytes())
@@ -277,37 +534,22 @@ def exercise(destination, parent_namespace, image, worker):
         listener.listen()
 
         def pair(incarnation):
-            mediator, ready, confdir = start_mediator(
-                runtime,
-                trust,
-                secure.server_port,
-                key,
+            process, mediator, confdir = start_pair(
                 incarnation,
-                "direct-ip",
-                policy=mediator_policy,
-                allow_fixture_loopback=False,
-                mediator_dir=gateway.GATEWAY_MEDIATOR_DIR,
-                capture=capture,
-            )
-            process = start_worker(
-                worker,
-                qemu_socket,
-                listener,
-                policy_path,
-                digest,
-                ready,
-                key,
-                incarnation,
-                [],
+                runtime=runtime,
+                worker=worker,
+                qemu_socket=qemu_socket,
+                listener=listener,
+                policy_path=policy_path,
+                digest=digest,
+                key=key,
                 vm_id="direct-ip",
-                ingress_ids=(),
+                trust=trust,
+                upstream_port=secure.server_port,
+                mediator_policy=mediator_policy,
                 capture=capture,
             )
             assert process.sbx_ready["direct_ip_routes"] == 2
-            for child in (process, mediator):
-                status = Path(f"/proc/{child.pid}/status").read_text()
-                assert "CapEff:\t0000000000000000" in status
-                assert "NoNewPrivs:\t1" in status
             return process, mediator, confdir
 
         process, mediator, confdir = pair("worker1")
@@ -330,116 +572,18 @@ def exercise(destination, parent_namespace, image, worker):
                 }
             )
         )
-        manifest = json.loads(image.read_text())
-        kernel = (
-            image.parent / manifest["kernel"]
-            if "kernel" in manifest
-            else Path(manifest["kernel_path"])
-        )
-        rootfs = (
-            image.parent / manifest["rootfs"]
-            if "rootfs" in manifest
-            else Path(manifest["rootfs_path"])
-        )
-        (runtime / "image-reference.json").write_text(
-            json.dumps(
-                {
-                    "manifest": str(image),
-                    "rootfs": str(rootfs),
-                    "rootfs_size": rootfs.stat().st_size,
-                }
-            )
-        )
-        overlay = runtime / "guest.qcow2"
-        subprocess.run(
-            [
-                tool("SBX_QEMU_IMG_BIN", "qemu-img"),
-                "create",
-                "-f",
-                "qcow2",
-                "-F",
-                "raw",
-                "-b",
-                str(rootfs),
-                str(overlay),
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            timeout=10,
-        )
-        command = [
-            tool("SBX_QEMU_BIN", "qemu-system-x86_64"),
-            "-sandbox",
-            "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny",
-            "-nodefaults",
-            "-serial",
-            "stdio",
-            "-monitor",
-            "none",
-            "-nographic",
-            "-no-reboot",
-            "-machine",
-            "q35,accel=tcg",
-            "-cpu",
-            "max",
-            "-smp",
-            "1",
-            "-m",
-            "512",
-            "-kernel",
-            str(kernel),
-            "-append",
-            "console=ttyS0 reboot=k panic=1 root=/dev/vda rw init=/bin/sh",
-            "-drive",
-            f"file={overlay},if=none,format=qcow2,id=rootdisk",
-            "-device",
-            "virtio-blk-pci,drive=rootdisk",
-            "-netdev",
-            f"stream,id=net0,server=off,reconnect-ms=100,addr.type=unix,addr.path={qemu_socket}",
-            "-device",
-            "virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56",
-            "-fsdev",
-            f"local,id=share,path={share},security_model=none,readonly=on",
-            "-device",
-            "virtio-9p-pci,fsdev=share,mount_tag=directip",
-        ]
-        (runtime / "qemu-command.json").write_text(json.dumps(command))
-        qemu = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            env=child_environment(runtime),
-        )
-        PROCESSES.append(qemu)
-        console = Console(qemu)
-        console.until("job control turned off")
-        console.send(
-            "mount -t proc proc /proc; mount -t sysfs sysfs /sys; "
-            "mount -t devtmpfs devtmpfs /dev; mount -t tmpfs tmpfs /run; "
-            "mkdir -p /run/directip; "
-            "mount -t 9p -o trans=virtio,version=9p2000.L,ro directip /run/directip; "
-            "ip link set eth0 up; dhclient -1 eth0; "
-            "python3 /run/directip/guest.py /run/directip/config.json"
-        )
+        console = boot_guest(runtime, image, qemu_socket, share, "directip")
         console.until("DIRECT_IP_INITIAL_OK")
         journal = runtime / "dns-mappings.jsonl"
         before = journal.read_bytes()
-        terminate(process)
-        terminate(mediator)
-        capture.finish(process)
-        capture.finish(mediator)
-        for thread in AUDIT_CONTROLLERS[confdir]._log_threads:
-            thread.join(5)
-            assert not thread.is_alive(), "audit drain unfinished before replacement"
+        stop_pair(process, mediator, confdir, capture)
         process, mediator, _ = pair("worker2")
         assert journal.read_bytes() == before
         console.send("continue")
         console.until("DIRECT_IP_RECOVERY_OK", timeout=60)
         assert journal.read_bytes() == before
-        assert [path for path, _ in plain.records] == ["/ip/plain", "/ip/plain"]
-        assert [path for path, _ in secure.records] == ["/ip/tls", "/ip/tls"]
+        assert [record[1] for record in plain.records] == ["/ip/plain", "/ip/plain"]
+        assert [record[1] for record in secure.records] == ["/ip/tls", "/ip/tls"]
         assert not wrong.records and not denied.records
         assert secure.snis and set(secure.snis) == {None}
         (runtime / "results.json").write_text(
@@ -463,107 +607,34 @@ def exercise(destination, parent_namespace, image, worker):
         )
         assert len(capture.paths) == 6, "missing incarnation diagnostics"
     finally:
-        try:
-            stop.set()
-            for child in reversed(PROCESSES):
-                terminate(child)
-            for fd in LIFETIME_FDS:
-                with suppress(OSError):
-                    os.close(fd)
-            for controller in AUDIT_CONTROLLERS.values():
-                for thread in controller._log_threads:
-                    thread.join(5)
-                    assert not thread.is_alive(), "audit drain unfinished"
-                if controller._audit_stream is not None:
-                    controller._audit_stream.close()
-            echo.close()
-            if listener is not None:
-                listener.close()
-            for server in servers:
-                server.shutdown()
-                server.server_close()
-            if console is not None:
-                try:
-                    console.drain()
-                finally:
-                    (runtime / "guest-console.log").write_bytes(console.data)
-                    console.selector.close()
-            # Neither partial capture nor a failed archive can authorize removal.
-            archive_and_remove(runtime, destination, capture)
-        except BaseException:
-            print(f"VM fixture cleanup failed; runtime retained at {runtime}", file=sys.stderr)
-            capture.finish()
-            raise
+        stop.set()
+        teardown(
+            runtime,
+            destination,
+            capture,
+            console,
+            closers=[echo, listener],
+            servers=servers,
+            evidence="direct-ip-evidence.tar.gz",
+        )
 
 
 def test_direct_ip_guest_without_dns_and_after_replacement(tmp_path):
-    assert sys.platform == "linux" and os.getuid() != 0
-    image = Path(
-        os.environ.get(
-            "SBX_GATEWAY_TEST_IMAGE",
-            Path.home() / ".smolvm/images/rootless-gateway-test/smolvm-image.json",
-        )
-    ).resolve()
-    assert image.is_file(), "build the required test guest first"
-    worker = Path(os.environ.get("SBX_GATEWAY_BIN", gateway.GATEWAY_WORKER)).resolve()
-    assert worker.is_file()
-    home = tmp_path / "home"
-    home.mkdir(mode=0o700)
     # Setup is confined to a fresh namespace; drop UID, groups and all capabilities before tests.
-    setup = (
-        "set -eu; ip link set lo up; "
+    run_namespace_fixture(
+        tmp_path,
+        label="direct-ip",
+        setup="set -eu; ip link set lo up; "
         + "; ".join(
             f"ip address add {address}/32 dev lo"
             for address in (PUBLIC, OTHER_PUBLIC, PRIVATE, OTHER_PRIVATE)
-        )
-        + '; uid=$1; gid=$2; shift 2; exec setpriv --reuid="$uid" --regid="$gid" '
-        "--clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all "
-        '--no-new-privs /usr/bin/env "$@"'
+        ),
+        unshare_flags=("--net",),
+        timeout=240,
+        evidence="direct-ip-evidence.tar.gz",
+        script=Path(__file__).resolve(),
     )
-    command = [
-        "sudo",
-        "-n",
-        "unshare",
-        "--net",
-        "--",
-        "/bin/sh",
-        "-c",
-        setup,
-        "direct-ip-fixture",
-        str(os.getuid()),
-        str(os.getgid()),
-        f"PATH={Path(sys.executable).parent}:{os.defpath}",
-        f"HOME={home}",
-        f"PYTHONPATH={os.environ.get('PYTHONPATH', '')}",
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "--inside",
-        str(tmp_path),
-        os.readlink("/proc/self/ns/net"),
-        str(image),
-        str(worker),
-    ]
-    process = subprocess.Popen(
-        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True, cwd=ROOT
-    )
-    try:
-        output, _ = process.communicate(timeout=240)
-    except subprocess.TimeoutExpired:
-        subprocess.run(
-            ["sudo", "-n", "kill", "-TERM", "--", f"-{process.pid}"], timeout=10, check=False
-        )
-        output, _ = process.communicate(timeout=30)
-        raise AssertionError(f"direct-IP namespace test timed out: {output[-6000:]!r}") from None
-    (tmp_path / "namespace-driver.log").write_bytes(output)
-    assert process.returncode == 0, output[-8000:].decode(errors="replace")
-    assert (tmp_path / "direct-ip-evidence.tar.gz").is_file()
 
 
 if __name__ == "__main__":
-    assert sys.argv[1] == "--inside"
-
-    def interrupted(_signal, _frame):
-        raise KeyboardInterrupt("namespace fixture interrupted")
-
-    signal.signal(signal.SIGTERM, interrupted)
-    exercise(Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4]), Path(sys.argv[5]))
+    namespace_main(exercise)

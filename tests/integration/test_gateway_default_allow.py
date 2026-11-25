@@ -4,100 +4,41 @@ import hashlib
 import json
 import os
 import shutil
-import signal
 import socket
-import ssl
 import subprocess
-import sys
 import tempfile
 import threading
 from contextlib import suppress
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from test_gateway_tcg import (
-    AUDIT_CONTROLLERS,
     FAKE_TOKEN,
-    LIFETIME_FDS,
     PLACEHOLDER,
-    PROCESSES,
     DiagnosticCapture,
-    child_environment,
     echo_server,
-    start_mediator,
-    start_worker,
-    terminate,
-    tool,
 )
 
 from sbx import gateway
-from test_gateway_direct_ip import Console, archive_and_remove
+from test_gateway_direct_ip import (
+    boot_guest,
+    namespace_main,
+    origin,
+    run_namespace_fixture,
+    start_pair,
+    stop_pair,
+    teardown,
+)
 
-ROOT = Path(__file__).resolve().parents[2]
 PUBLIC, PRIVATE = "93.184.216.34", "10.20.30.40"
 PROTECTED = ("169.254.169.254", "100.100.100.200")
 EVIDENCE = "default-allow-evidence.tar.gz"
+BODY = b"default-allow-ok"
 VM = "default-allow"
 HOSTS = f"""127.0.0.1 localhost
 {PUBLIC} api.example open.example git.example
 {PRIVATE} lan.example
 169.254.169.254 meta.example
 """
-
-
-class Origin(BaseHTTPRequestHandler):
-    def do_GET(self):  # noqa: N802
-        self.server.records.append(
-            (self.command, self.path, self.headers.get("Host"), self.headers.get("Authorization"))
-        )
-        body = b"default-allow-ok"
-        self.send_response(200)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    do_POST = do_GET
-
-    def log_message(self, *args):
-        pass
-
-
-def origin(runtime, name, *, tls=False):
-    server = ThreadingHTTPServer(("0.0.0.0", 0), Origin)
-    server.daemon_threads = True
-    server.records = []
-    ca = None
-    if tls:
-        ca, key = runtime / f"{name}.pem", runtime / f"{name}-key.pem"
-        subprocess.run(
-            [
-                tool("SBX_OPENSSL_BIN", "openssl"),
-                "req",
-                "-x509",
-                "-newkey",
-                "rsa:2048",
-                "-nodes",
-                "-days",
-                "1",
-                "-subj",
-                "/CN=default-allow-test",
-                "-addext",
-                "subjectAltName=DNS:api.example",
-                "-keyout",
-                str(key),
-                "-out",
-                str(ca),
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-        )
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        context.load_cert_chain(ca, key)
-        server.socket = context.wrap_socket(server.socket, server_side=True)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    return server, ca
 
 
 def nxdomain_server(stop):
@@ -131,85 +72,6 @@ def journal_hosts(path):
     return sorted(json.loads(line)["host"] for line in lines if line.strip())
 
 
-def boot_guest(runtime, image, qemu_socket, share):
-    manifest = json.loads(image.read_text())
-    kernel = (
-        image.parent / manifest["kernel"] if "kernel" in manifest else Path(manifest["kernel_path"])
-    )
-    rootfs = (
-        image.parent / manifest["rootfs"] if "rootfs" in manifest else Path(manifest["rootfs_path"])
-    )
-    (runtime / "image-reference.json").write_text(
-        json.dumps(
-            {"manifest": str(image), "rootfs": str(rootfs), "rootfs_size": rootfs.stat().st_size}
-        )
-    )
-    overlay = runtime / "guest.qcow2"
-    subprocess.run(
-        [
-            tool("SBX_QEMU_IMG_BIN", "qemu-img"),
-            "create",
-            "-f",
-            "qcow2",
-            "-F",
-            "raw",
-            "-b",
-            str(rootfs),
-            str(overlay),
-        ],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        timeout=10,
-    )
-    command = [
-        tool("SBX_QEMU_BIN", "qemu-system-x86_64"),
-        "-sandbox",
-        "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny",
-        "-nodefaults",
-        "-serial",
-        "stdio",
-        "-monitor",
-        "none",
-        "-nographic",
-        "-no-reboot",
-        "-machine",
-        "q35,accel=tcg",
-        "-cpu",
-        "max",
-        "-smp",
-        "1",
-        "-m",
-        "512",
-        "-kernel",
-        str(kernel),
-        "-append",
-        "console=ttyS0 reboot=k panic=1 root=/dev/vda rw init=/bin/sh",
-        "-drive",
-        f"file={overlay},if=none,format=qcow2,id=rootdisk",
-        "-device",
-        "virtio-blk-pci,drive=rootdisk",
-        "-netdev",
-        f"stream,id=net0,server=off,reconnect-ms=100,addr.type=unix,addr.path={qemu_socket}",
-        "-device",
-        "virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56",
-        "-fsdev",
-        f"local,id=share,path={share},security_model=none,readonly=on",
-        "-device",
-        "virtio-9p-pci,fsdev=share,mount_tag=defaultallow",
-    ]
-    (runtime / "qemu-command.json").write_text(json.dumps(command))
-    qemu = subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-        env=child_environment(runtime),
-    )
-    PROCESSES.append(qemu)
-    return qemu
-
-
 def exercise(destination, parent_namespace, image, worker):
     assert os.getuid() != 0 and os.geteuid() == os.getuid()
     assert os.readlink("/proc/self/ns/net") != parent_namespace
@@ -224,9 +86,9 @@ def exercise(destination, parent_namespace, image, worker):
     threading.Thread(target=echo_server, args=(echo, stop), daemon=True).start()
     try:
         dns = nxdomain_server(stop)
-        plain, _ = origin(runtime, "plain")
+        plain, _ = origin(runtime, "plain", body=BODY)
         servers.append(plain)
-        secure, secure_ca = origin(runtime, "secure", tls=True)
+        secure, secure_ca = origin(runtime, "secure", body=BODY, tls=True, san="DNS:api.example")
         servers.append(secure)
         echo_port = echo.getsockname()[1]
         config = gateway.parse_config(
@@ -317,39 +179,24 @@ def exercise(destination, parent_namespace, image, worker):
         listener.listen()
 
         def pair(incarnation):
-            mediator, ready, confdir = start_mediator(
-                runtime,
-                secure_ca,
-                secure.server_port,
-                key,
+            process, mediator, confdir = start_pair(
                 incarnation,
-                VM,
-                policy=mediator_policy,
-                allow_fixture_loopback=False,
-                mediator_dir=gateway.GATEWAY_MEDIATOR_DIR,
-                capture=capture,
-            )
-            process = start_worker(
-                worker,
-                qemu_socket,
-                listener,
-                policy_path,
-                digest,
-                ready,
-                key,
-                incarnation,
-                [],
+                runtime=runtime,
+                worker=worker,
+                qemu_socket=qemu_socket,
+                listener=listener,
+                policy_path=policy_path,
+                digest=digest,
+                key=key,
                 vm_id=VM,
-                ingress_ids=(),
+                trust=secure_ca,
+                upstream_port=secure.server_port,
+                mediator_policy=mediator_policy,
                 capture=capture,
             )
             assert process.sbx_ready["egress_default"] == "allow"
             assert process.sbx_ready["direct_ip_routes"] == 0
             assert "landlock" in process.sbx_ready["hardening"].split(",")
-            for child in (process, mediator):
-                status = Path(f"/proc/{child.pid}/status").read_text()
-                assert "CapEff:\t0000000000000000" in status
-                assert "NoNewPrivs:\t1" in status
             return process, mediator, confdir
 
         process, mediator, confdir = pair("worker1")
@@ -369,28 +216,12 @@ def exercise(destination, parent_namespace, image, worker):
                 }
             )
         )
-        qemu = boot_guest(runtime, image, qemu_socket, share)
-        console = Console(qemu)
-        console.until("job control turned off")
-        console.send(
-            "mount -t proc proc /proc; mount -t sysfs sysfs /sys; "
-            "mount -t devtmpfs devtmpfs /dev; mount -t tmpfs tmpfs /run; "
-            "mkdir -p /run/defaultallow; "
-            "mount -t 9p -o trans=virtio,version=9p2000.L,ro defaultallow /run/defaultallow; "
-            "ip link set eth0 up; dhclient -1 eth0; "
-            "python3 /run/defaultallow/guest.py /run/defaultallow/config.json"
-        )
+        console = boot_guest(runtime, image, qemu_socket, share, "defaultallow")
         console.until("DEFAULT_ALLOW_INITIAL_OK", timeout=180)
         journal = runtime / "dns-mappings.jsonl"
         before = journal.read_bytes()
         assert journal_hosts(journal) == ["api.example", "git.example"], journal_hosts(journal)
-        terminate(process)
-        terminate(mediator)
-        capture.finish(process)
-        capture.finish(mediator)
-        for thread in AUDIT_CONTROLLERS[confdir]._log_threads:
-            thread.join(5)
-            assert not thread.is_alive(), "audit drain unfinished before replacement"
+        stop_pair(process, mediator, confdir, capture)
         process, mediator, _ = pair("worker2")
         assert journal.read_bytes() == before
         console.send("continue")
@@ -425,54 +256,19 @@ def exercise(destination, parent_namespace, image, worker):
             )
         )
     finally:
-        try:
-            stop.set()
-            for child in reversed(PROCESSES):
-                terminate(child)
-            for fd in LIFETIME_FDS:
-                with suppress(OSError):
-                    os.close(fd)
-            for controller in AUDIT_CONTROLLERS.values():
-                for thread in controller._log_threads:
-                    thread.join(5)
-                    assert not thread.is_alive(), "audit drain unfinished"
-                if controller._audit_stream is not None:
-                    controller._audit_stream.close()
-            echo.close()
-            if dns is not None:
-                dns.close()
-            if listener is not None:
-                listener.close()
-            for server in servers:
-                server.shutdown()
-                server.server_close()
-            if console is not None:
-                try:
-                    console.drain()
-                finally:
-                    (runtime / "guest-console.log").write_bytes(console.data)
-                    console.selector.close()
-            # Neither partial capture nor a failed archive can authorize removal.
-            archive_and_remove(runtime, destination, capture, EVIDENCE)
-        except BaseException:
-            print(f"VM fixture cleanup failed; runtime retained at {runtime}", file=sys.stderr)
-            capture.finish()
-            raise
+        stop.set()
+        teardown(
+            runtime,
+            destination,
+            capture,
+            console,
+            closers=[echo, dns, listener],
+            servers=servers,
+            evidence=EVIDENCE,
+        )
 
 
 def test_default_allow_guest_with_scoped_credentials_and_replacement(tmp_path):
-    assert sys.platform == "linux" and os.getuid() != 0
-    image = Path(
-        os.environ.get(
-            "SBX_GATEWAY_TEST_IMAGE",
-            Path.home() / ".smolvm/images/rootless-gateway-test/smolvm-image.json",
-        )
-    ).resolve()
-    assert image.is_file(), "build the required test guest first"
-    worker = Path(os.environ.get("SBX_GATEWAY_BIN", gateway.GATEWAY_WORKER)).resolve()
-    assert worker.is_file()
-    home = tmp_path / "home"
-    home.mkdir(mode=0o700)
     fixture = tmp_path / "fixture-etc"
     fixture.mkdir()
     (fixture / "hosts").write_text(HOSTS)
@@ -480,8 +276,10 @@ def test_default_allow_guest_with_scoped_credentials_and_replacement(tmp_path):
     (fixture / "nsswitch.conf").write_text("hosts: files dns\n")
     # Setup is confined to fresh network and mount namespaces; the bind mounts and addresses are
     # invisible to the host. UID, groups and all capabilities are dropped before any test code.
-    setup = (
-        "set -eu; mount --make-rprivate /; ip link set lo up; "
+    run_namespace_fixture(
+        tmp_path,
+        label="default-allow",
+        setup="set -eu; mount --make-rprivate /; ip link set lo up; "
         + "; ".join(
             f"ip address add {address}/32 dev lo" for address in (PUBLIC, PRIVATE, *PROTECTED)
         )
@@ -489,58 +287,13 @@ def test_default_allow_guest_with_scoped_credentials_and_replacement(tmp_path):
         + "; ".join(
             f"mount --bind {fixture / name} /etc/{name}"
             for name in ("hosts", "resolv.conf", "nsswitch.conf")
-        )
-        + '; uid=$1; gid=$2; shift 2; exec setpriv --reuid="$uid" --regid="$gid" '
-        "--clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all "
-        '--no-new-privs /usr/bin/env "$@"'
+        ),
+        unshare_flags=("--net", "--mount"),
+        timeout=480,
+        evidence=EVIDENCE,
+        script=Path(__file__).resolve(),
     )
-    command = [
-        "sudo",
-        "-n",
-        "unshare",
-        "--net",
-        "--mount",
-        "--",
-        "/bin/sh",
-        "-c",
-        setup,
-        "default-allow-fixture",
-        str(os.getuid()),
-        str(os.getgid()),
-        f"PATH={Path(sys.executable).parent}:{os.defpath}",
-        f"HOME={home}",
-        f"PYTHONPATH={os.environ.get('PYTHONPATH', '')}",
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "--inside",
-        str(tmp_path),
-        os.readlink("/proc/self/ns/net"),
-        str(image),
-        str(worker),
-    ]
-    process = subprocess.Popen(
-        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True, cwd=ROOT
-    )
-    try:
-        output, _ = process.communicate(timeout=480)
-    except subprocess.TimeoutExpired:
-        subprocess.run(
-            ["sudo", "-n", "kill", "-TERM", "--", f"-{process.pid}"], timeout=10, check=False
-        )
-        output, _ = process.communicate(timeout=30)
-        raise AssertionError(
-            f"default-allow namespace test timed out: {output[-6000:]!r}"
-        ) from None
-    (tmp_path / "namespace-driver.log").write_bytes(output)
-    assert process.returncode == 0, output[-8000:].decode(errors="replace")
-    assert (tmp_path / EVIDENCE).is_file()
 
 
 if __name__ == "__main__":
-    assert sys.argv[1] == "--inside"
-
-    def interrupted(_signal, _frame):
-        raise KeyboardInterrupt("namespace fixture interrupted")
-
-    signal.signal(signal.SIGTERM, interrupted)
-    exercise(Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4]), Path(sys.argv[5]))
+    namespace_main(exercise)
