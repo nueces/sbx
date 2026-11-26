@@ -2049,6 +2049,36 @@ def test_supervisor_run_rejects_invalid_inherited_payload(tmp_path: Path) -> Non
         os.close(lock_fd)
 
 
+def test_supervisor_run_rejects_config_that_lost_a_field(
+    lifecycle_config: gateway.GatewayConfig,
+) -> None:
+    config = replace(lifecycle_config, default="allow")
+    payload = gateway_supervisor.config_payload(config)
+    del payload["default"]
+    metadata = {
+        "config": payload,
+        "requested_config_digest": config.digest("vm1", "generation1"),
+        "vm_id": "vm1",
+        "generation": "generation1",
+    }
+    parent, child = socket.socketpair()
+    config_read, config_write = os.pipe()
+    secret_read, secret_write = os.pipe()
+    os.write(config_write, json.dumps(metadata).encode())
+    os.close(config_write)
+    os.close(secret_write)
+    lock_fd = os.open("/dev/null", os.O_RDONLY)
+    try:
+        assert (
+            gateway_supervisor.run(os.dup(child.fileno()), config_read, secret_read, lock_fd) == 1
+        )
+        assert "does not match its digest" in gateway_supervisor.recv_frame(parent, 1)["error"]
+    finally:
+        parent.close()
+        child.close()
+        os.close(lock_fd)
+
+
 @pytest.mark.parametrize("sanitized", [False, True])
 @pytest.mark.parametrize("fetch", ["lazy", "startup"])
 def test_persistent_bootstrap_uses_fresh_subprocess_and_inherited_provider_fd(
@@ -2243,11 +2273,15 @@ def test_configuration_drift_uses_live_generation_digest(
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux gateway worker acceptance")
-def test_persistent_supervisor_survives_bootstrap_and_drains_data_plane(tmp_path: Path) -> None:
+@pytest.mark.parametrize("default", ["deny", "allow"])
+def test_persistent_supervisor_survives_bootstrap_and_drains_data_plane(
+    tmp_path: Path, default: str
+) -> None:
     del tmp_path
     config = gateway.parse_config(
         {
             "network": {
+                "default": default,
                 "policy": [
                     {
                         "id": "discard",
@@ -2261,7 +2295,7 @@ def test_persistent_supervisor_survives_bootstrap_and_drains_data_plane(tmp_path
                         "hosts": ["*.example.com"],
                         "ports": [443],
                     },
-                ]
+                ],
             }
         },
         platform="linux",

@@ -83,6 +83,7 @@ def config_from_payload(value: dict[str, Any]) -> gateway.GatewayConfig:
         gateway.Reconnection(**value["reconnection"]),
         value["platform"],
         value.get("mitmweb", False),
+        value.get("default", "deny"),
     )
 
 
@@ -482,6 +483,14 @@ def run(bootstrap_fd: int, config_fd: int, provider_fd: int, lock_fd: int) -> in
         if not isinstance(metadata, dict):
             raise gateway.GatewayLifecycleError("invalid inherited gateway configuration")
         config = config_from_payload(metadata["config"])
+        # The CLI digests the config it serializes; a mismatch means a field was lost in transit.
+        if (
+            config.digest(metadata["vm_id"], metadata["generation"])
+            != metadata["requested_config_digest"]
+        ):
+            raise gateway.GatewayLifecycleError(
+                "inherited gateway configuration does not match its digest"
+            )
         directory = Path(metadata["directory"])
         os.chdir(directory)
         source_environment = json.loads(_read_fd(provider_fd, gateway.MAX_CONFIG_BYTES))
