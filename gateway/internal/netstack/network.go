@@ -30,8 +30,9 @@ const (
 var GatewayMAC = tcpip.LinkAddress("\x52\x54\x00\x12\x34\x01")
 
 type Network struct {
-	Stack *stack.Stack
-	link  *channel.Endpoint
+	Stack          *stack.Stack
+	link           *channel.Endpoint
+	defaultRouting bool
 }
 
 func New() (*Network, error) {
@@ -84,6 +85,7 @@ func (n *Network) AddLocalAddress(ip net.IP) error {
 // matching endpoint (only gateway DNS/DHCP exist) is dropped silently so promiscuous
 // mode does not emit unreachable replies on behalf of arbitrary destinations.
 func (n *Network) EnableDefaultRouting() error {
+	n.defaultRouting = true
 	if err := n.Stack.SetPromiscuousMode(NICID, true); err != nil {
 		return errors.New(err.String())
 	}
@@ -110,6 +112,13 @@ func (n *Network) ProbeGuest() error {
 }
 
 func (n *Network) Inject(frame []byte) {
+	// Spoofing would otherwise make the stack claim every address, including the guest's own.
+	if n.defaultRouting && len(frame) >= header.EthernetMinimumSize+header.ARPSize && header.Ethernet(frame).Type() == header.ARPProtocolNumber {
+		request := header.ARP(frame[header.EthernetMinimumSize:])
+		if request.Op() == header.ARPRequest && !net.IP(request.ProtocolAddressTarget()).Equal(net.ParseIP(GatewayIP)) {
+			return
+		}
+	}
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(frame)})
 	n.link.InjectInbound(0, pkt)
 	pkt.DecRef()

@@ -503,3 +503,46 @@ func TestDefaultRouteNeverContactsMediator(t *testing.T) {
 		t.Fatalf("matched flow used the default dialer: %v", dialed)
 	}
 }
+
+func TestDefaultAllowAnswersARPOnlyForTheGateway(t *testing.T) {
+	network, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer network.Close()
+	if err := network.EnableDefaultRouting(); err != nil {
+		t.Fatal(err)
+	}
+	guestMAC := tcpip.LinkAddress("\x52\x54\x00\x12\x34\x56")
+	answered := func(target string) bool {
+		frame := make([]byte, header.EthernetMinimumSize+header.ARPSize)
+		header.Ethernet(frame).Encode(&header.EthernetFields{SrcAddr: guestMAC, DstAddr: header.EthernetBroadcastAddress, Type: header.ARPProtocolNumber})
+		request := header.ARP(frame[header.EthernetMinimumSize:])
+		request.SetIPv4OverEthernet()
+		request.SetOp(header.ARPRequest)
+		copy(request.HardwareAddressSender(), guestMAC)
+		copy(request.ProtocolAddressTarget(), net.ParseIP(target).To4()) // sender stays 0.0.0.0: a conflict probe
+		network.Inject(frame)
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+		for {
+			reply := network.Read(ctx)
+			if reply == nil {
+				return false
+			}
+			if len(reply) < len(frame) || header.Ethernet(reply).Type() != header.ARPProtocolNumber {
+				continue
+			}
+			arp := header.ARP(reply[header.EthernetMinimumSize:])
+			if arp.Op() == header.ARPReply && net.IP(arp.ProtocolAddressSender()).Equal(net.ParseIP(target)) {
+				return true
+			}
+		}
+	}
+	if !answered(GatewayIP) {
+		t.Fatal("gateway did not answer ARP for its own address")
+	}
+	if answered(GuestIP) {
+		t.Fatal("gateway claimed the guest's address; guest conflict detection would decline it")
+	}
+}
