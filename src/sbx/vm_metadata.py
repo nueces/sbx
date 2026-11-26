@@ -112,6 +112,8 @@ def claim_vm(
     run_user: str | None,
     *,
     created: bool,
+    image: str | Path | None = None,
+    agent: str | None = None,
 ) -> dict[str, Any]:
     saved = load_vm(vm_name)
     if saved is None:
@@ -128,6 +130,10 @@ def claim_vm(
             "run_user": run_user,
             "provisioned": False,
         }
+        if image is not None:
+            saved["image"] = str(image)
+        if agent is not None:
+            saved["agent"] = agent
         if _write(vm_name, saved, exclusive=True):
             return saved
         saved = load_vm(vm_name)

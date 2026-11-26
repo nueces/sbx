@@ -1,5 +1,7 @@
 import json
+import os
 import shutil
+import stat
 import subprocess
 from collections.abc import Callable, Mapping
 from contextlib import suppress
@@ -31,12 +33,46 @@ def ceil_mib(size_bytes: int) -> int:
     return (size_bytes + MIB - 1) // MIB
 
 
-def qcow2_virtual_size_mib(path: Path) -> int | None:
+def format_size(size_bytes: int | None) -> str:
+    if size_bytes is None:
+        return "-"
+    value = float(size_bytes)
+    units = ["B", "K", "M", "G", "T"]
+    while value >= 1024 and len(units) > 1:
+        value /= 1024
+        units.pop(0)
+    return f"{value:.1f}".removesuffix(".0") + units[0]
+
+
+def disk_usage_bytes(path: Path | None) -> int | None:
+    """Host-allocated bytes (sparse-aware) of a file or of all files under a directory.
+
+    Follows the given path if it is a symlink; entries inside are not followed.
+    """
+    if path is None:
+        return None
+    try:
+        info = path.stat()
+        if not stat.S_ISDIR(info.st_mode):
+            return info.st_blocks * 512 if stat.S_ISREG(info.st_mode) else 0
+        total = 0
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                file_info = os.lstat(os.path.join(root, name))
+                if stat.S_ISREG(file_info.st_mode):
+                    total += file_info.st_blocks * 512
+        return total
+    except OSError:
+        return None
+
+
+def qcow2_virtual_size_bytes(path: Path) -> int | None:
     qemu_img = shutil.which("qemu-img")
     if qemu_img is None:
         return None
+    # --force-share: a running QEMU holds a write lock on its disk.
     result = subprocess.run(
-        [qemu_img, "info", "--output=json", str(path)],
+        [qemu_img, "info", "--force-share", "--output=json", str(path)],
         check=False,
         text=True,
         capture_output=True,
@@ -48,16 +84,23 @@ def qcow2_virtual_size_mib(path: Path) -> int | None:
         virtual_size = int(info["virtual-size"])
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
-    return ceil_mib(virtual_size)
+    return virtual_size
+
+
+def rootfs_size_bytes(rootfs_path: Path | None) -> int | None:
+    if rootfs_path is None:
+        return None
+    if rootfs_path.suffix.lower() == ".qcow2":
+        return qcow2_virtual_size_bytes(rootfs_path)
+    try:
+        return rootfs_path.stat().st_size
+    except OSError:
+        return None
 
 
 def rootfs_size_mib(rootfs_path: Path) -> int | None:
-    if rootfs_path.suffix.lower() == ".qcow2":
-        return qcow2_virtual_size_mib(rootfs_path)
-    try:
-        return ceil_mib(rootfs_path.stat().st_size)
-    except OSError:
-        return None
+    size = rootfs_size_bytes(rootfs_path)
+    return ceil_mib(size) if size is not None else None
 
 
 def path_from_config(value: Any) -> Path | None:
