@@ -45,11 +45,14 @@ def format_size(size_bytes: int | None) -> str:
 
 
 def disk_usage_bytes(path: Path | None) -> int | None:
-    """Host-allocated bytes (sparse-aware) of a file or of all files under a directory."""
+    """Host-allocated bytes (sparse-aware) of a file or of all files under a directory.
+
+    Follows the given path if it is a symlink; entries inside are not followed.
+    """
     if path is None:
         return None
     try:
-        info = path.lstat()
+        info = path.stat()
         if not stat.S_ISDIR(info.st_mode):
             return info.st_blocks * 512 if stat.S_ISREG(info.st_mode) else 0
         total = 0

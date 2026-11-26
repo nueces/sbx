@@ -22,12 +22,17 @@ def test_disk_usage_is_sparse_aware(tmp_path: Path) -> None:
     with sparse.open("wb") as handle:
         handle.truncate(1024 * MIB)
     (tmp_path / "kernel").write_bytes(b"x" * 10_000)
+    (tmp_path / "rootfs-link").symlink_to(sparse)  # nested links are not counted
+    dir_link = tmp_path.parent / f"{tmp_path.name}-link"
+    dir_link.symlink_to(tmp_path, target_is_directory=True)
 
     file_usage = lifecycle_warnings.disk_usage_bytes(sparse)
     dir_usage = lifecycle_warnings.disk_usage_bytes(tmp_path)
 
     assert file_usage is not None and file_usage < MIB
     assert dir_usage is not None and dir_usage >= file_usage + 10_000
+    assert lifecycle_warnings.disk_usage_bytes(dir_link) == dir_usage
+    assert lifecycle_warnings.disk_usage_bytes(tmp_path / "rootfs-link") == file_usage
     assert lifecycle_warnings.disk_usage_bytes(tmp_path / "missing") is None
     assert lifecycle_warnings.rootfs_size_bytes(sparse) == 1024 * MIB
 
