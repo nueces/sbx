@@ -33,6 +33,10 @@ def _environment(values: Mapping[str, str]) -> Iterator[None]:
         os.environ.update(original)
 
 
+def base_image_dir() -> Path:
+    return (resolve_image_dir() / "sbx").resolve()
+
+
 def _build_base_config(
     *,
     vm_name: str | None,
@@ -41,7 +45,7 @@ def _build_base_config(
     disk_size_mib: int | None,
     default_disk_size_mib: int,
 ) -> tuple[VMConfig, str]:
-    image_dir = (resolve_image_dir() / "sbx").resolve()
+    image_dir = base_image_dir()
     if not image_dir.is_dir():
         raise ConfigError(
             f"prepared sbx base image not found: {image_dir}; run 'sbx image build' first"

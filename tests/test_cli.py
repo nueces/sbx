@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from sbx import cli, guest_setup, runtime, vm_metadata, vm_state
+from sbx import cli, guest_setup, lifecycle_warnings, runtime, vm_metadata, vm_state
 
 _ORIGINAL_HOST_GIT_CONFIG = guest_setup.host_git_config
 
@@ -31,11 +31,13 @@ def isolated_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_guest_
     monkeypatch.setattr(guest_setup, "attach", lambda *args, **kwargs: 0)
     real_claim_vm = vm_metadata.claim_vm
 
-    def claim_vm(vm_name: str, project: object, run_user: str | None, *, created: bool):
+    def claim_vm(
+        vm_name: str, project: object, run_user: str | None, *, created: bool, **kwargs: object
+    ):
         if not created and vm_metadata.load_vm(vm_name) is None:
             real_claim_vm(vm_name, project, run_user or "root", created=True)
             vm_metadata.mark_provisioned(vm_name)
-        return real_claim_vm(vm_name, project, run_user, created=created)
+        return real_claim_vm(vm_name, project, run_user, created=created, **kwargs)
 
     monkeypatch.setattr(vm_metadata, "claim_vm", claim_vm)
 
@@ -434,22 +436,31 @@ def test_list_does_not_require_name(
     vm = SimpleNamespace(
         vm_id="vm1",
         status="running",
-        config=SimpleNamespace(rootfs_path=Path("/images/debian/rootfs.ext4")),
+        config=SimpleNamespace(rootfs_path=Path("/smolvm/disks/vm1.qcow2")),
         network=SimpleNamespace(ssh_host_port=2204),
     )
     monkeypatch.setattr(vm_state, "smolvm_vms", lambda all_vms=False: [vm])
+    sizes = {
+        Path("/images/debian"): 1536 * 1024 * 1024,
+        Path("/smolvm/disks/vm1.qcow2"): 512 * 1024 * 1024,
+    }
+    monkeypatch.setattr(lifecycle_warnings, "disk_usage_bytes", sizes.get)
+    monkeypatch.setattr(lifecycle_warnings, "rootfs_size_bytes", lambda path: 20 * 1024**3)
     vm_metadata.claim_vm(
         "vm1",
         {"project_root": "/project", "config_path": "/project/.sbx.toml"},
         "agent",
         created=True,
+        image="/images/debian",
+        agent="claude",
     )
 
     rc = cli.main(["list"])
 
     assert rc == 0
     assert capfd.readouterr().out == (
-        "NAME  STATUS   PROJECT   IMAGE   SSH\nvm1   running  /project  debian  2204\n"
+        "NAME  STATUS   PROJECT   AGENT   IMAGE   IMAGE SIZE  DISK USED  DISK SIZE  SSH\n"
+        "vm1   running  /project  claude  debian  1.5G        512M       20G        2204\n"
     )
 
 
@@ -465,6 +476,63 @@ def test_list_defaults_to_all_and_can_filter_running(
     assert calls == [True, False]
 
 
+def test_list_infers_image_from_kernel_dir_for_older_vms(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    image = tmp_path / "images" / "sbx"
+    image.mkdir(parents=True)
+    (image / "smolvm-image.json").write_text("{}", encoding="utf-8")
+    not_image = tmp_path / "kernels"
+    not_image.mkdir()
+    vms = [
+        SimpleNamespace(
+            vm_id=vm_id,
+            status="stopped",
+            config=SimpleNamespace(
+                kernel_path=kernel, rootfs_path=tmp_path / "disks" / f"{vm_id}.ext4"
+            ),
+            network=None,
+        )
+        for vm_id, kernel in (("old", image / "vmlinux.bin"), ("other", not_image / "vmlinux"))
+    ]
+    monkeypatch.setattr(vm_state, "smolvm_vms", lambda all_vms=False: vms)
+
+    assert cli.main(["ls", "--json"]) == 0
+
+    rows = json.loads(capsys.readouterr().out)
+    assert [(row["image"], row["image_path"]) for row in rows] == [
+        ("sbx", str(image)),
+        (None, None),
+    ]
+
+
+def test_list_agent_falls_back_to_project_config_for_older_vms(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with_agent = tmp_path / "a" / ".sbx.toml"
+    default_agent = tmp_path / "b" / ".sbx.toml"
+    for path, text in ((with_agent, '[sbx]\nagent = "codex"\n'), (default_agent, "[sbx]\n")):
+        path.parent.mkdir()
+        path.write_text(text, encoding="utf-8")
+    projects = {"old": with_agent, "default": default_agent, "gone": tmp_path / "missing.toml"}
+    for vm_id, config_path in projects.items():
+        vm_metadata.claim_vm(
+            vm_id,
+            {"project_root": str(config_path.parent), "config_path": str(config_path)},
+            "agent",
+            created=True,
+        )
+    vms = [
+        SimpleNamespace(vm_id=vm_id, status="stopped", config=None, network=None)
+        for vm_id in projects
+    ]
+    monkeypatch.setattr(vm_state, "smolvm_vms", lambda all_vms=False: vms)
+
+    assert cli.main(["ls", "--json"]) == 0
+
+    assert [row["agent"] for row in json.loads(capsys.readouterr().out)] == ["codex", "pi", None]
+
+
 def test_list_json_uses_null_for_missing_values(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -478,7 +546,12 @@ def test_list_json_uses_null_for_missing_values(
             "name": "vm1",
             "status": "stopped",
             "project": None,
+            "agent": None,
             "image": None,
+            "image_path": None,
+            "image_size_bytes": None,
+            "disk_used_bytes": None,
+            "disk_size_bytes": None,
             "ssh_port": None,
         }
     ]
@@ -2031,12 +2104,17 @@ def test_image_list_lists_local_images(
         encoding="utf-8",
     )
     (invalid_image / "smolvm-image.json").write_text("not json", encoding="utf-8")
+    with (plain_image / "rootfs.ext4").open("wb") as rootfs:
+        rootfs.truncate(2 * 1024**3)
 
     assert cli.main(["image", "list"]) == 0
 
     out = capsys.readouterr().out
     assert "NAME" in out
     assert "FEATURES" in out
+    assert "SIZE" in out
+    assert "VIRTUAL" in out
+    assert " 2G " in out
     assert "legacy-docker" in out
     assert "docker,nested-kvm" in out
     assert "legacy-plain" in out
@@ -2057,16 +2135,22 @@ def test_image_ls_json(
     assert cli.main(["image", "ls", "--json"]) == 0
 
     payload = json.loads(capsys.readouterr().out)
+    assert isinstance(payload[0].pop("disk_usage_bytes"), int)
     assert payload == [
         {
-            "agent": "pi",
             "features": ["docker", "nested-kvm"],
             "kernel": "vmlinux-docker.bin",
             "name": "legacy-docker",
             "path": str(image),
             "rootfs": "rootfs.ext4",
+            "virtual_size_bytes": None,
         }
     ]
+
+    with (image / "rootfs.ext4").open("wb") as rootfs:
+        rootfs.truncate(3 * 1024 * 1024)
+    assert cli.main(["image", "ls", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)[0]["virtual_size_bytes"] == 3 * 1024 * 1024
 
 
 def test_invalid_configured_vm_name_is_rejected(

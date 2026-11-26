@@ -505,6 +505,21 @@ def _print_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> None:
         print(line.rstrip())
 
 
+def _vm_agent(saved: Mapping[str, Any]) -> str | None:
+    """Agent recorded at creation, else [sbx].agent from the project's .sbx.toml."""
+    if saved.get("agent"):
+        return str(saved["agent"])
+    config_path = saved.get("config_path")
+    if not config_path:
+        return None
+    try:
+        with Path(config_path).open("rb") as handle:
+            agent = _sbx_config(tomllib.load(handle)).get("agent", "pi")  # same default as run
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    return str(agent)
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     metadata = vm_metadata.load_vm_metadata()
     rows = []
@@ -512,14 +527,34 @@ def cmd_list(args: argparse.Namespace) -> int:
         name = str(getattr(vm, "vm_id", "-"))
         status = getattr(getattr(vm, "status", "-"), "value", getattr(vm, "status", "-"))
         rootfs = getattr(getattr(vm, "config", None), "rootfs_path", None)
-        image_path = Path(rootfs) if rootfs is not None else None
+        disk = Path(rootfs) if rootfs is not None else None
+        # Per-VM disks live in SmolVM's disks dir, so the image comes from sbx metadata,
+        # or for older VMs from the (never copied) kernel's image directory.
+        image_value = metadata.get(name, {}).get("image")
+        image_path = Path(image_value) if image_value else None
+        kernel = getattr(getattr(vm, "config", None), "kernel_path", None)
+        if image_path is None and kernel is not None:
+            kernel_dir = Path(kernel).parent
+            if (kernel_dir / "smolvm-image.json").is_file():
+                image_path = kernel_dir
         rows.append(
             {
                 "name": name,
                 "status": str(status),
                 "project": metadata.get(name, {}).get("project_root"),
-                "image": (
-                    image_path.parent.name or image_path.name if image_path is not None else None
+                "agent": _vm_agent(metadata.get(name, {})),
+                "image": image_path.name if image_path is not None else None,
+                "image_path": str(image_path) if image_path is not None else None,
+                "image_size_bytes": (
+                    lifecycle_warnings.disk_usage_bytes(image_path)
+                    if image_path is not None
+                    else None
+                ),
+                "disk_used_bytes": (
+                    lifecycle_warnings.disk_usage_bytes(disk) if disk is not None else None
+                ),
+                "disk_size_bytes": (
+                    lifecycle_warnings.rootfs_size_bytes(disk) if disk is not None else None
                 ),
                 "ssh_port": getattr(getattr(vm, "network", None), "ssh_host_port", None),
             }
@@ -528,13 +563,27 @@ def cmd_list(args: argparse.Namespace) -> int:
         print(json.dumps(rows, indent=2, sort_keys=True))
     else:
         _print_table(
-            ("NAME", "STATUS", "PROJECT", "IMAGE", "SSH"),
+            (
+                "NAME",
+                "STATUS",
+                "PROJECT",
+                "AGENT",
+                "IMAGE",
+                "IMAGE SIZE",
+                "DISK USED",
+                "DISK SIZE",
+                "SSH",
+            ),
             [
                 [
                     row["name"],
                     row["status"],
                     row["project"] or "-",
+                    row["agent"] or "-",
                     row["image"] or "-",
+                    lifecycle_warnings.format_size(row["image_size_bytes"]),
+                    lifecycle_warnings.format_size(row["disk_used_bytes"]),
+                    lifecycle_warnings.format_size(row["disk_size_bytes"]),
                     str(row["ssh_port"]) if row["ssh_port"] is not None else "-",
                 ]
                 for row in rows
@@ -1283,7 +1332,12 @@ def _start_local_image(
             vm_name = str(vm.vm_id)
             operation.lock(vm_name)
             vm_metadata.claim_vm(
-                vm_name, _project_identity(args, config), run_user or "root", created=True
+                vm_name,
+                _project_identity(args, config),
+                run_user or "root",
+                created=True,
+                image=image_dir.resolve(),
+                agent=agent,
             )
             if gateway_config is None:
                 guest_setup.start_vm(vm_name, boot_timeout=boot_timeout, status="created")
@@ -1640,7 +1694,12 @@ def _cmd_start(args: argparse.Namespace, operation: vm_metadata.Lifecycle) -> in
             if gateway_config is not None
             else None,
             before_provision=lambda new_vm_name: vm_metadata.claim_vm(
-                new_vm_name, project_identity, str(run_user or "root"), created=True
+                new_vm_name,
+                project_identity,
+                str(run_user or "root"),
+                created=True,
+                image=smolvm_preset.base_image_dir(),
+                agent=str(agent),
             ),
             run_user=str(run_user),
             env_values=env_values,

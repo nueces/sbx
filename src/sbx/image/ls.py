@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from sbx import lifecycle_warnings
+
 
 def _image_cache_dir() -> Path:
     return Path.home() / ".smolvm" / "images"
@@ -33,13 +35,17 @@ def _image_row(path: Path) -> dict[str, Any] | None:
     sbx = manifest.get("sbx", {})
     if not isinstance(sbx, dict):
         sbx = {}
+    rootfs = lifecycle_warnings.manifest_path(path, manifest, "rootfs")
     return {
         "name": str(manifest.get("name") or path.name),
         "path": str(path),
-        "agent": str(sbx.get("agent") or "-"),
         "features": _features(sbx.get("features")),
         "kernel": manifest["kernel"],
         "rootfs": manifest["rootfs"],
+        # shortcut: counts files under the image dir only; manifest paths pointing outside
+        # the dir are not counted, add them if such images appear.
+        "disk_usage_bytes": lifecycle_warnings.disk_usage_bytes(path),
+        "virtual_size_bytes": lifecycle_warnings.rootfs_size_bytes(rootfs),
     }
 
 
@@ -52,12 +58,13 @@ def _images(cache_dir: Path | None = None) -> list[dict[str, Any]]:
 
 
 def _print_table(rows: list[dict[str, Any]]) -> None:
-    headers = ("NAME", "AGENT", "FEATURES", "KERNEL", "PATH")
+    headers = ("NAME", "FEATURES", "SIZE", "VIRTUAL", "KERNEL", "PATH")
     table = [
         (
             row["name"],
-            row["agent"],
             ",".join(row["features"]) or "-",
+            lifecycle_warnings.format_size(row["disk_usage_bytes"]),
+            lifecycle_warnings.format_size(row["virtual_size_bytes"]),
             row["kernel"],
             row["path"],
         )
