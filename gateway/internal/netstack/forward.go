@@ -37,8 +37,6 @@ const (
 	httpIdle               = 300 * time.Second
 )
 
-var errDefaultDenied = errors.New("no permitted default address")
-
 type FlowQuota struct {
 	tokens   chan struct{}
 	rejected atomic.Uint64
@@ -236,8 +234,10 @@ func (f *TCPForwarder) forward(request *tcp.ForwarderRequest, rule config.Rule, 
 	f.downloaded.Add(downloaded)
 }
 
-// forwardDefault dials before accepting, so a blocked or unreachable destination is
-// refused with a reset instead of looking open to the guest.
+// forwardDefault never contacts the mediator or credential broker. Every candidate,
+// literal or resolved, must pass the default address contract; only checked numeric
+// addresses are dialed, so DNS rebinding cannot reach protected addresses. It dials
+// before accepting, so a blocked or unreachable destination is refused with a reset.
 func (f *TCPForwarder) forwardDefault(request *tcp.ForwarderRequest, host string, port uint16, syntheticIP netip.Addr, synthetic bool) {
 	defer f.release(host)
 	if synthetic {
@@ -245,9 +245,9 @@ func (f *TCPForwarder) forwardDefault(request *tcp.ForwarderRequest, host string
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	upstream, err := f.dialDefault(ctx, host, port)
-	if err != nil {
-		if errors.Is(err, errDefaultDenied) {
+	upstream, permitted, err := dialPermitted(ctx, host, port, config.DefaultAllowsIP, f.lookup, f.defaultDial)
+	if upstream == nil {
+		if err == nil && !permitted {
 			f.defaultDenied.Add(1)
 		}
 		request.Complete(true)
@@ -300,22 +300,6 @@ func (f *TCPForwarder) dial(ctx context.Context, rule config.Rule, host string, 
 	}
 	if conn == nil {
 		return nil, fmt.Errorf("no permitted address for %s", host)
-	}
-	return conn, nil
-}
-
-// dialDefault never contacts the mediator or credential broker. Every candidate,
-// literal or resolved, must pass the default address contract; only checked numeric
-// addresses are dialed, so DNS rebinding cannot reach protected addresses.
-func (f *TCPForwarder) dialDefault(ctx context.Context, host string, port uint16) (net.Conn, error) {
-	conn, permitted, err := dialPermitted(ctx, host, port, config.DefaultAllowsIP, f.lookup, f.defaultDial)
-	switch {
-	case err != nil:
-		return nil, err
-	case !permitted:
-		return nil, fmt.Errorf("%w: %s", errDefaultDenied, host)
-	case conn == nil:
-		return nil, fmt.Errorf("no reachable default address for %s", host)
 	}
 	return conn, nil
 }
