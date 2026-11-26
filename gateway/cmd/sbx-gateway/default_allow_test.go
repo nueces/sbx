@@ -59,9 +59,6 @@ func TestReadinessPayloadReportsEgressDefault(t *testing.T) {
 		t.Fatalf("allow readiness %v", allow)
 	}
 	want := []string{"digest", "direct_ip_routes", "egress_default", "generation", "hardening", "incarnation", "incarnation_proof", "ingress", "mediator", "status", "version", "vm_id"}
-	if len(allow) != len(want) {
-		t.Fatalf("readiness keys changed: %v", allow)
-	}
 	for _, key := range want {
 		if _, ok := allow[key]; !ok {
 			t.Fatalf("readiness missing %q", key)

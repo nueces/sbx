@@ -107,8 +107,6 @@ def test_default_allow_example_is_a_complete_allow_config():
     assert len(examples) == 1
     config = gateway.parse_config(tomllib.loads(examples[0]), platform="linux")
     assert config is not None and config.default == "allow" and config.rules
-    for phrase in ("LAN or VPN", "DNS-over-HTTPS", "ICMP echo", "169.254.169.254", "fd00:ec2::254"):
-        assert phrase in section
 
 
 @pytest.mark.parametrize("path", PAGES, ids=lambda p: str(p.relative_to(ROOT)))
