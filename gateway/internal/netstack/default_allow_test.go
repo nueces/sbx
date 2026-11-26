@@ -114,24 +114,9 @@ func newDefaultHarness(t *testing.T, cfg config.Config, allow bool) *defaultHarn
 		var dialer net.Dialer
 		return dialer.DialContext(ctx, network, echo.Addr().String())
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	var pumps sync.WaitGroup
-	for _, pair := range [][2]*Network{{gateway, guest}, {guest, gateway}} {
-		pumps.Add(1)
-		go func(source, destination *Network) {
-			defer pumps.Done()
-			for {
-				frame := source.Read(ctx)
-				if frame == nil {
-					return
-				}
-				destination.Inject(frame)
-			}
-		}(pair[0], pair[1])
-	}
+	stopPump := pumpFrames(gateway, guest)
 	t.Cleanup(func() {
-		cancel()
-		pumps.Wait()
+		stopPump()
 		guest.Close()
 		gateway.Close()
 	})

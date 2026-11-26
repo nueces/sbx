@@ -7,6 +7,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -32,6 +33,26 @@ func TestForwarderQuotas(t *testing.T) {
 		t.Fatal("flow quota was not released")
 	}
 	f.release("example.com")
+}
+
+// pumpFrames carries frames between two stacks until stop is called.
+func pumpFrames(a, b *Network) (stop func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var pumps sync.WaitGroup
+	for _, pair := range [][2]*Network{{a, b}, {b, a}} {
+		pumps.Add(1)
+		go func(source, destination *Network) {
+			defer pumps.Done()
+			for {
+				frame := source.Read(ctx)
+				if frame == nil {
+					return
+				}
+				destination.Inject(frame)
+			}
+		}(pair[0], pair[1])
+	}
+	return func() { cancel(); pumps.Wait() }
 }
 
 func tcpPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {

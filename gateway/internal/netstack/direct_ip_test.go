@@ -4,7 +4,6 @@ import (
 	"context"
 	"net"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -51,22 +50,7 @@ func TestLiteralPacketAdmissionWithoutDNS(t *testing.T) {
 	cfg := config.Config{Quotas: config.DefaultQuotas(), Rules: []config.Rule{{ID: "ip", Protocol: "http", Host: "93.184.216.34", Ports: []uint16{443}}}}
 	resolver := syntheticdns.New(cfg)
 	network.ForwardTCP(cfg, resolver, mediator, NewFlowQuota(4))
-	ctx, cancel := context.WithCancel(context.Background())
-	var pumps sync.WaitGroup
-	for _, pair := range [][2]*Network{{network, guest}, {guest, network}} {
-		pumps.Add(1)
-		go func(source, destination *Network) {
-			defer pumps.Done()
-			for {
-				frame := source.Read(ctx)
-				if frame == nil {
-					return
-				}
-				destination.Inject(frame)
-			}
-		}(pair[0], pair[1])
-	}
-	defer func() { cancel(); pumps.Wait() }()
+	defer pumpFrames(network, guest)()
 	for _, tc := range []struct {
 		host    string
 		port    uint16
