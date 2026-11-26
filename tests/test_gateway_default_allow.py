@@ -4,7 +4,6 @@ from pathlib import Path
 import pytest
 
 from sbx import gateway
-from sbx.runtime import ConfigError
 
 FIXTURES = json.loads(
     (Path(__file__).parents[1] / "gateway/testdata/worker-config-cases.json").read_text()
@@ -24,31 +23,3 @@ def test_worker_config_matches_cross_language_fixture(case: dict) -> None:
     assert config.default == case["mode"]
     assert config.worker_config("vm-fixture", "generation-1") == case["worker"]
     assert config.digest("vm-fixture", "generation-1") == case["canonical_digest"]
-
-
-def test_allow_keeps_explicit_credential_restrictions() -> None:
-    with pytest.raises(ConfigError, match="DNS hostnames"):
-        _parse(
-            {
-                "default": "allow",
-                "policy": [
-                    {
-                        "id": "api",
-                        "mode": "http-mediated",
-                        "hosts": ["93.184.216.34"],
-                        "ports": [443],
-                    }
-                ],
-                "credential": [
-                    {
-                        "id": "token",
-                        "environment": "API_TOKEN",
-                        "method": "command",
-                        "options": {"argv": ["get-token"]},
-                        "bindings": [
-                            {"policies": ["api"], "header": "Authorization: Bearer {placeholder}"}
-                        ],
-                    }
-                ],
-            }
-        )

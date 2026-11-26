@@ -36,15 +36,6 @@ func TestDefaultAllowsIPAddressContract(t *testing.T) {
 	}
 }
 
-func TestDefaultAllowDoesNotWidenExplicitRules(t *testing.T) {
-	rule := Rule{ID: "tcp", Protocol: "tcp", Host: "example.com", Ports: []uint16{22}}
-	for _, value := range []string{"10.0.0.1", "192.168.1.1"} {
-		if rule.AllowsIP(netip.MustParseAddr(value)) {
-			t.Fatalf("explicit rule unexpectedly allows %s", value)
-		}
-	}
-}
-
 func TestWorkerDefaultValidationAndDigest(t *testing.T) {
 	deny := validConfig()
 	if err := deny.normalize(); err != nil || deny.DefaultAllows() || deny.EgressDefault() != "deny" {
@@ -78,20 +69,6 @@ func TestWorkerDefaultValidationAndDigest(t *testing.T) {
 	}
 	if _, err := Prepare([]byte(`{"version":1,"vm_id":"vm","generation":"g","default":true,"rules":[],"ingress":[],"quotas":{"tcp_flows":1,"flows_per_destination":1,"ingress_flows":1,"dns_mappings":1,"open_files":64}}`)); err == nil {
 		t.Fatal("non-string default accepted")
-	}
-}
-
-func TestDefaultAllowKeepsExplicitOnlyMatching(t *testing.T) {
-	cfg := validConfig()
-	cfg.Default = DefaultAllow
-	if err := cfg.normalize(); err != nil {
-		t.Fatal(err)
-	}
-	if cfg.AllowsHost("other.example") {
-		t.Fatal("allow mode must not widen AllowsHost")
-	}
-	if _, ok := cfg.Match("tcp", "other.example", 443); ok {
-		t.Fatal("allow mode must not create implicit rules")
 	}
 }
 

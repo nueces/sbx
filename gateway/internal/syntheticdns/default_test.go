@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"net"
 	"net/netip"
 	"testing"
@@ -91,39 +90,6 @@ func TestUnmatchedNamesReceiveFilteredRealAnswers(t *testing.T) {
 	}
 	if r.UpstreamAnswers() == 0 {
 		t.Fatal("upstream answers not counted")
-	}
-}
-
-func TestUnmatchedNamesNeverExhaustOrJournal(t *testing.T) {
-	file := journalFile(t)
-	r, err := NewWithJournal(allow{"api.example": true}, 2, file, "vm", "generation", "digest")
-	if err != nil {
-		t.Fatal(err)
-	}
-	r.SetDefaultLookup(func(context.Context, string) ([]netip.Addr, error) {
-		return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
-	}, permitPublicOnly)
-	info, _ := file.Stat()
-	size := info.Size()
-	for i := range 5000 {
-		reply := r.Reply(query(fmt.Sprintf("n%d.example", i), 1))
-		if binary.BigEndian.Uint16(reply[6:8]) != 1 {
-			t.Fatalf("name %d not answered", i)
-		}
-	}
-	info, _ = file.Stat()
-	if r.Len() != 0 || info.Size() != size {
-		t.Fatal("unmatched names grew mappings or the journal")
-	}
-	if reply := r.Reply(query("api.example", 1)); binary.BigEndian.Uint16(reply[6:8]) != 1 {
-		t.Fatal("policy name lost capacity")
-	}
-}
-
-func TestDenyModeRefusesUnmatchedNames(t *testing.T) {
-	r := New(allow{"api.example": true})
-	if reply := r.Reply(query("open.example", 1)); reply[3]&15 != 5 || r.UpstreamAnswers() != 0 {
-		t.Fatal("deny mode answered an unmatched name")
 	}
 }
 

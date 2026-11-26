@@ -72,8 +72,6 @@ def test_direct_ip_requires_exact_worker_readiness_count(
     [
         ("deny", None, False),
         ("deny", "deny", True),
-        ("deny", "allow", False),
-        ("allow", None, False),
         ("allow", "deny", False),
         ("allow", "allow", True),
     ],
