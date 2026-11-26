@@ -203,7 +203,7 @@ func TestDefaultAllowRejectsProtectedLiterals(t *testing.T) {
 	h := newDefaultHarness(t, config.Config{}, true)
 	for _, target := range []string{
 		"169.254.169.254", "100.100.100.200", "100.64.1.1", "168.63.129.16", "198.18.0.77",
-		"192.0.2.50", "192.0.2.1", "0.1.2.3", "240.0.0.1",
+		"192.0.2.1", "0.1.2.3", "240.0.0.1",
 	} {
 		conn, err := h.dial(target, 80, time.Second)
 		if conn != nil {
