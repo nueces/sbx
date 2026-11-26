@@ -107,6 +107,7 @@ class Console:
         deadline = time.monotonic() + timeout
         encoded = marker.encode()
         while encoded not in self.data:
+            assert b"GUEST_FAILED" not in self.data, f"guest script failed: {self.data[-3000:]!r}"
             assert time.monotonic() < deadline, (
                 f"guest timed out waiting for {marker}: {self.data[-3000:]!r}"
             )
@@ -246,7 +247,9 @@ def boot_guest(runtime, image, qemu_socket, share, tag):
         f"mkdir -p /run/{tag}; "
         f"mount -t 9p -o trans=virtio,version=9p2000.L,ro {tag} /run/{tag}; "
         "ip link set eth0 up; dhclient -1 eth0; "
-        f"python3 /run/{tag}/guest.py /run/{tag}/config.json"
+        # The console echoes this line back, so the marker is split here and only the
+        # echo output spells it out.
+        f"python3 /run/{tag}/guest.py /run/{tag}/config.json || echo GUEST_''FAILED"
     )
     return console
 
