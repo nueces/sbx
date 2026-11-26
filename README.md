@@ -73,7 +73,7 @@ sbx stop
 sbx ls
 ```
 
-`sbx ls` shows each VM's agent (chosen at creation; for older VMs, `[sbx].agent` from the project's `.sbx.toml`), its image, the image's host disk usage, and the VM disk's host usage (`DISK USED`) and virtual size (`DISK SIZE`). The image is recorded when the VM is created; for older VMs it is inferred from the kernel's image directory, else `-`.
+`sbx ls` shows each VM's agent (chosen at creation; for older VMs, `[sbx].agent` from the project's `.sbx.toml`, else `~/.config/sbx/config.toml`, default `pi`, or `-` if the project config is missing or invalid), its image, the image's host disk usage, and the VM disk's host usage (`DISK USED`) and virtual size (`DISK SIZE`). The image is recorded when the VM is created; for older VMs it is inferred from the kernel's image directory, else `-`.
 
 The nearest ancestor `.sbx.toml` supplies the sandbox name and project anchor; explicit names still win. Existing VM disks survive stop/start. Adding mounts or changing memory/CPUs requires stop/start; user/tool setup changes require explicit reprovisioning:
 

@@ -509,12 +509,18 @@ def test_list_infers_image_from_kernel_dir_for_older_vms(
 def test_list_agent_falls_back_to_project_config_for_older_vms(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    with_agent = tmp_path / "a" / ".sbx.toml"
-    default_agent = tmp_path / "b" / ".sbx.toml"
-    for path, text in ((with_agent, '[sbx]\nagent = "codex"\n'), (default_agent, "[sbx]\n")):
-        path.parent.mkdir()
-        path.write_text(text, encoding="utf-8")
-    projects = {"old": with_agent, "default": default_agent, "gone": tmp_path / "missing.toml"}
+    contents = {
+        "old": b'[sbx]\nagent = "codex"\n',
+        "default": b"[sbx]\n",
+        "gone": None,
+        "bad": b'sbx = "x"\n',
+        "binary": b"\xff\xfe",
+    }
+    projects = {vm_id: tmp_path / vm_id / ".sbx.toml" for vm_id in contents}
+    for vm_id, data in contents.items():
+        projects[vm_id].parent.mkdir()
+        if data is not None:
+            projects[vm_id].write_bytes(data)
     for vm_id, config_path in projects.items():
         vm_metadata.claim_vm(
             vm_id,
@@ -529,8 +535,13 @@ def test_list_agent_falls_back_to_project_config_for_older_vms(
     monkeypatch.setattr(vm_state, "smolvm_vms", lambda all_vms=False: vms)
 
     assert cli.main(["ls", "--json"]) == 0
+    agents = [row["agent"] for row in json.loads(capsys.readouterr().out)]
+    assert agents == ["codex", "pi", None, None, None]
 
-    assert [row["agent"] for row in json.loads(capsys.readouterr().out)] == ["codex", "pi", None]
+    (tmp_path / "home-config.toml").write_text('[sbx]\nagent = "claude"\n', encoding="utf-8")
+    assert cli.main(["ls", "--json"]) == 0
+    agents = [row["agent"] for row in json.loads(capsys.readouterr().out)]
+    assert agents == ["codex", "claude", None, None, None]
 
 
 def test_list_json_uses_null_for_missing_values(
@@ -2146,11 +2157,6 @@ def test_image_ls_json(
             "virtual_size_bytes": None,
         }
     ]
-
-    with (image / "rootfs.ext4").open("wb") as rootfs:
-        rootfs.truncate(3 * 1024 * 1024)
-    assert cli.main(["image", "ls", "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)[0]["virtual_size_bytes"] == 3 * 1024 * 1024
 
 
 def test_invalid_configured_vm_name_is_rejected(

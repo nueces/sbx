@@ -505,32 +505,42 @@ def _print_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> None:
         print(line.rstrip())
 
 
-def _vm_agent(saved: Mapping[str, Any]) -> str | None:
-    """Agent recorded at creation, else [sbx].agent from the project's .sbx.toml."""
+def _global_agent() -> str | None:
+    agent = None
+    for path in DEFAULT_CONFIG_PATHS:
+        if path.exists():
+            with suppress(ConfigError, ValueError):
+                agent = _sbx_config(_read_toml(path)).get("agent") or agent
+    return agent
+
+
+def _vm_agent(saved: Mapping[str, Any], global_agent: str | None) -> str | None:
+    """Agent recorded at creation, else [sbx].agent with `sbx run`'s config precedence."""
     if saved.get("agent"):
         return str(saved["agent"])
     config_path = saved.get("config_path")
     if not config_path:
         return None
-    try:
-        with Path(config_path).open("rb") as handle:
-            agent = _sbx_config(tomllib.load(handle)).get("agent", "pi")  # same default as run
-    except (OSError, tomllib.TOMLDecodeError):
+    try:  # ValueError: non-UTF-8 files; one bad project must not break the listing.
+        project_agent = _sbx_config(_read_toml(Path(config_path))).get("agent")
+    except (ConfigError, ValueError):
         return None
-    return str(agent)
+    return str(project_agent or global_agent or "pi")
 
 
 def cmd_list(args: argparse.Namespace) -> int:
     metadata = vm_metadata.load_vm_metadata()
+    global_agent = _global_agent()
     rows = []
     for vm in vm_state.smolvm_vms(all_vms=not args.running):
         name = str(getattr(vm, "vm_id", "-"))
         status = getattr(getattr(vm, "status", "-"), "value", getattr(vm, "status", "-"))
+        saved = metadata.get(name, {})
         rootfs = getattr(getattr(vm, "config", None), "rootfs_path", None)
         disk = Path(rootfs) if rootfs is not None else None
         # Per-VM disks live in SmolVM's disks dir, so the image comes from sbx metadata,
         # or for older VMs from the (never copied) kernel's image directory.
-        image_value = metadata.get(name, {}).get("image")
+        image_value = saved.get("image")
         image_path = Path(image_value) if image_value else None
         kernel = getattr(getattr(vm, "config", None), "kernel_path", None)
         if image_path is None and kernel is not None:
@@ -541,21 +551,13 @@ def cmd_list(args: argparse.Namespace) -> int:
             {
                 "name": name,
                 "status": str(status),
-                "project": metadata.get(name, {}).get("project_root"),
-                "agent": _vm_agent(metadata.get(name, {})),
+                "project": saved.get("project_root"),
+                "agent": _vm_agent(saved, global_agent),
                 "image": image_path.name if image_path is not None else None,
                 "image_path": str(image_path) if image_path is not None else None,
-                "image_size_bytes": (
-                    lifecycle_warnings.disk_usage_bytes(image_path)
-                    if image_path is not None
-                    else None
-                ),
-                "disk_used_bytes": (
-                    lifecycle_warnings.disk_usage_bytes(disk) if disk is not None else None
-                ),
-                "disk_size_bytes": (
-                    lifecycle_warnings.rootfs_size_bytes(disk) if disk is not None else None
-                ),
+                "image_size_bytes": lifecycle_warnings.disk_usage_bytes(image_path),
+                "disk_used_bytes": lifecycle_warnings.disk_usage_bytes(disk),
+                "disk_size_bytes": lifecycle_warnings.rootfs_size_bytes(disk),
                 "ssh_port": getattr(getattr(vm, "network", None), "ssh_host_port", None),
             }
         )

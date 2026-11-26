@@ -44,8 +44,10 @@ def format_size(size_bytes: int | None) -> str:
     return f"{value:.1f}".removesuffix(".0") + units[0]
 
 
-def disk_usage_bytes(path: Path) -> int | None:
+def disk_usage_bytes(path: Path | None) -> int | None:
     """Host-allocated bytes (sparse-aware) of a file or of all files under a directory."""
+    if path is None:
+        return None
     try:
         info = path.lstat()
         if not stat.S_ISDIR(info.st_mode):
@@ -59,11 +61,6 @@ def disk_usage_bytes(path: Path) -> int | None:
         return total
     except OSError:
         return None
-
-
-def qcow2_virtual_size_mib(path: Path) -> int | None:
-    size = qcow2_virtual_size_bytes(path)
-    return ceil_mib(size) if size is not None else None
 
 
 def qcow2_virtual_size_bytes(path: Path) -> int | None:
@@ -87,7 +84,9 @@ def qcow2_virtual_size_bytes(path: Path) -> int | None:
     return virtual_size
 
 
-def rootfs_size_bytes(rootfs_path: Path) -> int | None:
+def rootfs_size_bytes(rootfs_path: Path | None) -> int | None:
+    if rootfs_path is None:
+        return None
     if rootfs_path.suffix.lower() == ".qcow2":
         return qcow2_virtual_size_bytes(rootfs_path)
     try:

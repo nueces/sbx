@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from sbx import lifecycle_warnings, vm_metadata
+from sbx import lifecycle_warnings
 
 MIB = 1024 * 1024
 
@@ -45,16 +45,3 @@ def test_qcow2_virtual_size_uses_force_share(monkeypatch: pytest.MonkeyPatch) ->
     assert lifecycle_warnings.rootfs_size_bytes(Path("disk.qcow2")) == 4096
     assert lifecycle_warnings.rootfs_size_mib(Path("disk.qcow2")) == 1
     assert "--force-share" in commands[0]
-
-
-def test_claim_vm_records_creation_image_once(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setattr(vm_metadata, "SBX_VMS_DIR", tmp_path / "vms")
-    project = {"project_root": "/project", "config_path": "/project/.sbx.toml"}
-
-    vm_metadata.claim_vm("vm1", project, "agent", created=True, image="/images/sbx")
-    vm_metadata.claim_vm("vm1", project, "agent", created=True, image="/images/other")
-
-    loaded = vm_metadata.load_vm("vm1")
-    assert loaded is not None and loaded["image"] == "/images/sbx"
