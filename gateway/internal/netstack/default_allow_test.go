@@ -361,10 +361,14 @@ func isTimeout(err error) bool {
 func TestDefaultAllowDNSServesRealAnswersWithoutRegisteringThem(t *testing.T) {
 	cfg := config.Config{Rules: []config.Rule{{ID: "git", Protocol: "tcp", Host: "api.example", Ports: []uint16{22}}}}
 	h := newDefaultHarness(t, cfg, true)
-	h.resolver.SetDefaultLookup(func(context.Context, string) ([]netip.Addr, error) {
+	h.resolver.SetDefaultLookup(func(ctx context.Context, host string) ([]netip.Addr, error) {
+		if host == "hang.example" {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
 		return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
 	}, config.DefaultAllowsIP)
-	service, err := h.gateway.ServeDNS(h.resolver)
+	service, err := h.gateway.serveDNS(h.resolver, 50*time.Millisecond, 2*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,6 +403,9 @@ func TestDefaultAllowDNSServesRealAnswersWithoutRegisteringThem(t *testing.T) {
 	real := ask("open.example")
 	if real[7] != 1 || [4]byte(real[len(real)-4:]) != [4]byte{93, 184, 216, 34} {
 		t.Fatalf("real answer %v", real)
+	}
+	if hung := ask("hang.example"); hung[3]&15 != 2 {
+		t.Fatalf("timed-out host lookup was not answered with SERVFAIL: %v", hung)
 	}
 	synthetic := ask("api.example")
 	if synthetic[7] != 1 || synthetic[len(synthetic)-4] != 198 {

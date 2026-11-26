@@ -18,6 +18,8 @@ const (
 	dnsQueryBurst       = 200
 	maxOutstandingDNS   = 64
 	dnsQueryTimeout     = 5 * time.Second
+	// Host lookups stop early enough for their SERVFAIL to be sent before the reply cut-off.
+	dnsLookupTimeout = 4 * time.Second
 )
 
 type dnsLimiter struct {
@@ -54,6 +56,10 @@ func (s *DNSService) Rejected() uint64 { return s.limiter.denied.Load() }
 func (s *DNSService) Active() int64    { return s.active.Load() }
 
 func (n *Network) ServeDNS(resolver *syntheticdns.Resolver) (*DNSService, error) {
+	return n.serveDNS(resolver, dnsLookupTimeout, dnsQueryTimeout)
+}
+
+func (n *Network) serveDNS(resolver *syntheticdns.Resolver, lookupTimeout, replyTimeout time.Duration) (*DNSService, error) {
 	conn, err := gonet.DialUDP(n.Stack, &tcpip.FullAddress{
 		NIC: NICID, Addr: tcpip.AddrFrom4Slice(net.ParseIP(GatewayIP).To4()), Port: 53,
 	}, nil, ipv4.ProtocolNumber)
@@ -87,8 +93,9 @@ func (n *Network) ServeDNS(resolver *syntheticdns.Resolver) (*DNSService, error)
 			service.active.Add(1)
 			go func() {
 				defer func() { <-outstanding; service.active.Add(-1) }()
-				deadline := time.Now().Add(dnsQueryTimeout)
-				queryCtx, cancel := context.WithDeadline(context.Background(), deadline)
+				start := time.Now()
+				deadline := start.Add(replyTimeout)
+				queryCtx, cancel := context.WithDeadline(context.Background(), start.Add(lookupTimeout))
 				answer := resolver.Answer(queryCtx, packet)
 				cancel()
 				reply := answer.Packet
