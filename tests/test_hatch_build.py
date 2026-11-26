@@ -32,10 +32,10 @@ def workers(tmp_path, modes):
 
 
 def test_hook_accepts_executable_workers_without_changing_modes(monkeypatch, tmp_path):
-    paths = workers(tmp_path, [0o555, 0o755])
+    paths = workers(tmp_path, [0o555, 0o755, 0o700, 0o750])
     (paths[0].parent / ".DS_Store").write_bytes(b"")  # stray non-binary files are ignored
     load_hook(monkeypatch, tmp_path).initialize("editable", {})
-    assert [path.stat().st_mode & 0o777 for path in paths] == [0o555, 0o755]
+    assert [path.stat().st_mode & 0o777 for path in paths] == [0o555, 0o755, 0o700, 0o750]
 
 
 def test_hook_rejects_missing_workers(monkeypatch, tmp_path):

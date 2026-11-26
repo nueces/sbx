@@ -16,7 +16,7 @@ class CustomBuildHook(BuildHookInterface):
                 "gateway/scripts/build_release_artifacts.sh or restore it with git checkout"
             )
         for worker in workers:
-            if worker.stat().st_mode & 0o111 != 0o111:
+            if not worker.stat().st_mode & 0o100:
                 raise RuntimeError(
                     f"{worker} is not executable; run gateway/scripts/build_release_artifacts.sh "
                     "or restore it with git checkout"
