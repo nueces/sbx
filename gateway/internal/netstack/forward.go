@@ -145,7 +145,7 @@ func (f *TCPForwarder) handle(request *tcp.ForwarderRequest) {
 			reject()
 			return
 		}
-		go f.forward(request, rule, false, host, id.LocalPort, ip, synthetic)
+		go f.forward(request, rule, host, id.LocalPort, ip, synthetic)
 		return
 	}
 	if !f.config.DefaultAllows() {
@@ -162,7 +162,7 @@ func (f *TCPForwarder) handle(request *tcp.ForwarderRequest) {
 		reject()
 		return
 	}
-	go f.forward(request, config.Rule{}, true, host, id.LocalPort, ip, synthetic)
+	go f.forwardDefault(request, host, id.LocalPort, ip, synthetic)
 }
 
 func (f *TCPForwarder) match(host string, port uint16) (config.Rule, bool) {
@@ -199,44 +199,20 @@ func (f *TCPForwarder) release(host string) {
 	f.total.release()
 }
 
-func (f *TCPForwarder) forward(request *tcp.ForwarderRequest, rule config.Rule, fallback bool, host string, port uint16, syntheticIP netip.Addr, synthetic bool) {
+func (f *TCPForwarder) forward(request *tcp.ForwarderRequest, rule config.Rule, host string, port uint16, syntheticIP netip.Addr, synthetic bool) {
 	defer f.release(host)
 	if synthetic {
 		defer f.resolver.Release(syntheticIP)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	var defaultUpstream net.Conn
-	if fallback {
-		// Dial before accepting, so a blocked or unreachable destination is refused
-		// with a reset instead of looking open to the guest.
-		var err error
-		if defaultUpstream, err = f.dialDefault(ctx, host, port); err != nil {
-			if errors.Is(err, errDefaultDenied) {
-				f.defaultDenied.Add(1)
-			}
-			request.Complete(true)
-			return
-		}
-	}
 	var wq waiter.Queue
 	endpoint, tcpErr := request.CreateEndpoint(&wq)
 	request.Complete(tcpErr != nil)
 	if tcpErr != nil {
-		if defaultUpstream != nil {
-			defaultUpstream.Close()
-		}
 		return
 	}
 	guest := gonet.NewTCPConn(&wq, endpoint)
-	if fallback {
-		upstream := defaultUpstream
-		f.defaultForwarded.Add(1)
-		uploaded, downloaded := relayIdle(guest, upstream, rawTCPIdle)
-		f.uploaded.Add(uploaded)
-		f.downloaded.Add(downloaded)
-		return
-	}
 	if rule.Protocol == "tls" {
 		uploaded, downloaded, err := f.passthrough(ctx, guest, rule, host, port)
 		if err == nil {
@@ -256,6 +232,36 @@ func (f *TCPForwarder) forward(request *tcp.ForwarderRequest, rule config.Rule, 
 		idle = httpIdle
 	}
 	uploaded, downloaded := relayIdle(guest, upstream, idle)
+	f.uploaded.Add(uploaded)
+	f.downloaded.Add(downloaded)
+}
+
+// forwardDefault dials before accepting, so a blocked or unreachable destination is
+// refused with a reset instead of looking open to the guest.
+func (f *TCPForwarder) forwardDefault(request *tcp.ForwarderRequest, host string, port uint16, syntheticIP netip.Addr, synthetic bool) {
+	defer f.release(host)
+	if synthetic {
+		defer f.resolver.Release(syntheticIP)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	upstream, err := f.dialDefault(ctx, host, port)
+	if err != nil {
+		if errors.Is(err, errDefaultDenied) {
+			f.defaultDenied.Add(1)
+		}
+		request.Complete(true)
+		return
+	}
+	var wq waiter.Queue
+	endpoint, tcpErr := request.CreateEndpoint(&wq)
+	request.Complete(tcpErr != nil)
+	if tcpErr != nil {
+		upstream.Close()
+		return
+	}
+	f.defaultForwarded.Add(1)
+	uploaded, downloaded := relayIdle(gonet.NewTCPConn(&wq, endpoint), upstream, rawTCPIdle)
 	f.uploaded.Add(uploaded)
 	f.downloaded.Add(downloaded)
 }
