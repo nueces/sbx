@@ -40,6 +40,8 @@ sbx image build
 sbx image list
 ```
 
+`sbx image list` shows `SIZE` (actual host disk usage, sparse-aware) and `VIRTUAL` (rootfs size, the minimum `[sbx].disk_size`).
+
 The default image is `~/.smolvm/images/sbx`. It contains common tools, Node.js, SSH and rootless Docker, but no agent. New presets without `--image` also use this prepared Debian base; build it first. Old `[sbx].os` settings must be removed or set to `"debian"`.
 
 Kernel builds take time and need network access. See [image building and recovery](docs/build-local-debian-pi-image.md) for prerequisites, sizes, Landlock and optional nested KVM. Nested KVM is never enabled by default and increases the attack surface.
@@ -70,6 +72,8 @@ sbx shell
 sbx stop
 sbx ls
 ```
+
+`sbx ls` shows each VM's agent (chosen at creation; for older VMs, `[sbx].agent` from the project's `.sbx.toml`, else `~/.config/sbx/config.toml`, default `pi`, or `-` if the project config is missing or invalid), its image, the image's host disk usage, and the VM disk's host usage (`DISK USED`) and virtual size (`DISK SIZE`). The image is recorded when the VM is created; for older VMs it is inferred from the kernel's image directory, else `-`.
 
 The nearest ancestor `.sbx.toml` supplies the sandbox name and project anchor; explicit names still win. Existing VM disks survive stop/start. Adding mounts or changing memory/CPUs requires stop/start; user/tool setup changes require explicit reprovisioning:
 

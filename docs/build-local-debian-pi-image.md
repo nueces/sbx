@@ -85,6 +85,8 @@ sbx image list
 sbx image list --json
 ```
 
+`SIZE` (`disk_usage_bytes`) is the space the image directory actually uses on the host; `VIRTUAL` (`virtual_size_bytes`) is the rootfs size a VM disk must be at least as large as.
+
 The builder downloads the reviewed SmolVM kernel recipe and Moby checker from pinned commit URLs, verifies each file's SHA-256 before use, and then compiles a Docker-capable QEMU kernel from a separately SHA-256-verified Linux source tarball. It stores the kernel as `vmlinux.bin`. Builds therefore require access to GitHub, kernel.org, and package repositories.
 
 ## 4. Local image directory layout
