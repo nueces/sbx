@@ -136,6 +136,7 @@ def test_gateway_full_config_normalizes_and_preserves_legacy_ingress(
         ({"default": "open"}, "must be 'deny' or 'allow'"),
         ({"default": True}, "must be 'deny' or 'allow'"),
         ({"default": "Allow"}, "must be 'deny' or 'allow'"),
+        ({"default": ["allow"]}, "must be 'deny' or 'allow'"),
         ({"http": [{"host": "*.com", "ports": [443]}]}, "unknown field"),
         (
             {

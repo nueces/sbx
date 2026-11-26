@@ -38,6 +38,14 @@ def test_hook_accepts_executable_workers_without_changing_modes(monkeypatch, tmp
     assert [path.stat().st_mode & 0o777 for path in paths] == [0o555, 0o755]
 
 
+def test_hook_rejects_missing_workers(monkeypatch, tmp_path):
+    bin_dir = tmp_path / "src/sbx/gateway_runtime/bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / ".DS_Store").write_bytes(b"")
+    with pytest.raises(RuntimeError, match="no gateway worker"):
+        load_hook(monkeypatch, tmp_path).initialize("editable", {})
+
+
 def test_hook_rejects_non_executable_worker_without_changing_it(monkeypatch, tmp_path):
     (path,) = workers(tmp_path, [0o644])
     with pytest.raises(RuntimeError, match="not executable"):
