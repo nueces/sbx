@@ -83,7 +83,7 @@ def config_from_payload(value: dict[str, Any]) -> gateway.GatewayConfig:
         gateway.Reconnection(**value["reconnection"]),
         value["platform"],
         value.get("mitmweb", False),
-        value.get("default", "deny"),
+        value["default"],
     )
 
 

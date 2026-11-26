@@ -2049,12 +2049,12 @@ def test_supervisor_run_rejects_invalid_inherited_payload(tmp_path: Path) -> Non
         os.close(lock_fd)
 
 
-def test_supervisor_run_rejects_config_that_lost_a_field(
+def test_supervisor_run_rejects_config_that_does_not_match_its_digest(
     lifecycle_config: gateway.GatewayConfig,
 ) -> None:
     config = replace(lifecycle_config, default="allow")
     payload = gateway_supervisor.config_payload(config)
-    del payload["default"]
+    payload["default"] = "deny"
     metadata = {
         "config": payload,
         "requested_config_digest": config.digest("vm1", "generation1"),
