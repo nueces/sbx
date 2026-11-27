@@ -338,6 +338,8 @@ func run() error {
 			return nil
 		case err = <-resolver.Errors():
 			return fmt.Errorf("synthetic DNS state failed: %w", err)
+		case err = <-ingress.Errors():
+			return fmt.Errorf("ingress failed: %w", err)
 		case err = <-errs:
 			cancel()
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {

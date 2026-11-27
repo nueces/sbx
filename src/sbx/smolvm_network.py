@@ -21,6 +21,7 @@ from smolvm.types import VMInfo, VMState
 
 from sbx.constants import GATEWAY_UNIX_SOCKET_PATH_MAX_BYTES
 from sbx.runtime import ConfigError
+from sbx.smolvm_compat import microvm_argv_to_pci, virtio_bus
 
 _MINIMUM_QEMU_VERSION = (7, 2, 0)
 _MAC_PATTERN = re.compile(r"(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\Z")
@@ -216,6 +217,8 @@ def build_qemu_argv(
     )
     if external_network is None:
         return argv
+    if virtio_bus() == "pci":
+        argv = microvm_argv_to_pci(argv)
     if tcg:
         argv = _use_tcg_without_kvm(argv)
     argv = _replace_network(argv, external_network)

@@ -26,6 +26,94 @@ func tcpListener(t *testing.T) net.Listener {
 	return listener
 }
 
+type failedAcceptListener struct {
+	net.Listener
+	err error
+}
+
+func (l failedAcceptListener) Accept() (net.Conn, error) { return nil, l.err }
+
+func TestIngressReportsUnexpectedAcceptFailures(t *testing.T) {
+	for _, cause := range []error{syscall.EMFILE, net.ErrClosed} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			listener := failedAcceptListener{tcpListener(t), &net.OpError{Op: "accept", Net: "tcp", Err: cause}}
+			forwarder := NewIngressForwarder(nil, []RegisteredIngress{{Rule: ingressRule("ssh", 22), Listener: listener}}, NewFlowQuota(1), 1)
+			defer forwarder.Close()
+			forwarder.Start()
+			select {
+			case err := <-forwarder.Errors():
+				if !errors.Is(err, cause) {
+					t.Fatalf("accept error lost its cause: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("unexpected accept failure was not reported")
+			}
+		})
+	}
+}
+
+func TestIngressCloseDoesNotReportAcceptFailure(t *testing.T) {
+	forwarder := NewIngressForwarder(nil, []RegisteredIngress{{Listener: tcpListener(t)}}, NewFlowQuota(1), 1)
+	forwarder.Start()
+	forwarder.Close()
+	select {
+	case err := <-forwarder.Errors():
+		t.Fatalf("intentional shutdown reported an accept failure: %v", err)
+	default:
+	}
+}
+
+func TestIngressReplacementAcceptsAfterDescriptorExhaustion(t *testing.T) {
+	// The controller retains the listener; each worker receives its own descriptor.
+	controller := tcpListener(t).(*net.TCPListener)
+	defer controller.Close()
+	workerListener := func() net.Listener {
+		t.Helper()
+		file, err := controller.File()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		listener, err := net.FileListener(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return listener
+	}
+	rule := ingressRule("ssh", 22)
+	failed := NewIngressForwarder(nil, []RegisteredIngress{{Rule: rule, Listener: failedAcceptListener{workerListener(), syscall.EMFILE}}}, NewFlowQuota(1), 1)
+	defer failed.Close()
+	failed.Start()
+	select {
+	case err := <-failed.Errors():
+		if !errors.Is(err, syscall.EMFILE) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("descriptor exhaustion was not reported")
+	}
+	failed.Close()
+
+	replacement := NewIngressForwarder(nil, []RegisteredIngress{{Rule: rule, Listener: workerListener()}}, NewFlowQuota(1), 1)
+	defer replacement.Close()
+	dialed := make(chan struct{}, 1)
+	replacement.dial = func(context.Context, config.Ingress) (net.Conn, error) {
+		dialed <- struct{}{}
+		return nil, net.ErrClosed
+	}
+	replacement.Start()
+	conn, err := net.DialTimeout("tcp", controller.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	select {
+	case <-dialed:
+	case <-time.After(time.Second):
+		t.Fatal("replacement worker did not forward ingress")
+	}
+}
+
 func ingressRule(id string, guestPort int) config.Ingress {
 	return config.Ingress{ID: id, ListenHost: "127.0.0.1", GuestAddress: GuestIP, GuestPort: uint16(guestPort)}
 }

@@ -98,13 +98,14 @@ type IngressForwarder struct {
 	active      atomic.Int64
 	startOnce   sync.Once
 	closeOnce   sync.Once
+	errors      chan error
 }
 
 func NewIngressForwarder(network *Network, listeners []RegisteredIngress, total *FlowQuota, limit int) *IngressForwarder {
 	ctx, cancel := context.WithCancel(context.Background())
 	forwarder := &IngressForwarder{
 		stack: network, listeners: listeners, total: total, concurrent: make(chan struct{}, limit),
-		ctx: ctx, cancel: cancel, connections: make(map[net.Conn]struct{}),
+		ctx: ctx, cancel: cancel, connections: make(map[net.Conn]struct{}), errors: make(chan error, 1),
 	}
 	forwarder.dial = forwarder.dialGuest
 	return forwarder
@@ -169,11 +170,19 @@ func (f *IngressForwarder) Start() {
 	})
 }
 
+func (f *IngressForwarder) Errors() <-chan error { return f.errors }
+
 func (f *IngressForwarder) accept(item RegisteredIngress) {
 	defer f.wg.Done()
 	for {
 		conn, err := item.Listener.Accept()
 		if err != nil {
+			if f.ctx.Err() == nil {
+				select {
+				case f.errors <- fmt.Errorf("accept ingress %q: %w", item.Rule.ID, err):
+				default: // The first failure is enough to terminate the worker.
+				}
+			}
 			return
 		}
 		select {

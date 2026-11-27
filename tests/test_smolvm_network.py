@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 from smolvm.runtime.guest_platforms import _LINUX_SPEC
 from smolvm.runtime.qemu_args import build_qemu_argv as build_stock_qemu_argv
-from smolvm.types import NetworkConfig, VMConfig, VMInfo, VMState
+from smolvm.types import NetworkConfig, VMConfig, VMInfo, VMState, VsockConfig, WorkspaceMount
 
 from sbx import smolvm_network
 from sbx.runtime import ConfigError
@@ -175,13 +175,24 @@ def test_external_network_falls_back_to_tcg_without_usable_kvm(
 
 @pytest.mark.parametrize("state", [VMState.CREATED, VMState.STOPPED])
 @pytest.mark.parametrize("kvm", [False, True])
+@pytest.mark.parametrize("bus", [None, "mmio"])
 def test_automatic_machine_uses_q35_only_for_x86_tcg_without_mutating_saved_config(
-    monkeypatch, vm_info, unix_socket, state, kvm
+    monkeypatch, vm_info, unix_socket, state, kvm, bus
 ):
+    if bus is None:
+        monkeypatch.delenv("SBX_QEMU_VIRTIO_BUS", raising=False)
+    else:
+        monkeypatch.setenv("SBX_QEMU_VIRTIO_BUS", bus)
     vm_info = vm_info.model_copy(
         update={
             "status": state,
-            "config": vm_info.config.model_copy(update={"qemu_machine": "auto"}),
+            "config": vm_info.config.model_copy(
+                update={
+                    "qemu_machine": "auto",
+                    "workspace_mounts": [WorkspaceMount(host_path=unix_socket.parent)],
+                    "vsock": VsockConfig(guest_cid=7),
+                }
+            ),
         }
     )
     monkeypatch.setattr(smolvm_network, "_capture", support_capture)
@@ -198,9 +209,13 @@ def test_automatic_machine_uses_q35_only_for_x86_tcg_without_mutating_saved_conf
     assert machine.startswith("microvm,accel=kvm" if kvm else "q35,accel=tcg")
     assert argv[argv.index("-cpu") + 1] == ("host" if kvm else "max")
     assert vm_info.config.qemu_machine == "auto" and vm_info.status == state
-    if not kvm:
-        assert any(value.startswith("virtio-net-pci,") for value in argv)
-        assert any(value.startswith("virtio-blk-pci,drive=") for value in argv)
+    pci = not kvm or bus is None
+    if kvm:
+        assert ("pcie=on" if pci else "pcie=off") in machine.split(",")
+    devices = [argv[index + 1] for index, value in enumerate(argv[:-1]) if value == "-device"]
+    for model in ("virtio-net", "virtio-blk", "virtio-9p", "vhost-vsock"):
+        suffix = "pci" if pci else "device"
+        assert any(value.startswith(f"{model}-{suffix},") for value in devices)
 
 
 @pytest.mark.parametrize(
