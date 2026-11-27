@@ -264,7 +264,7 @@ func appendA(response []byte, addresses []netip.Addr) []byte {
 }
 
 func parseQuery(packet []byte) (string, uint16, int, error) {
-	if len(packet) < 17 || len(packet) > 1232 || packet[2]&0x80 != 0 || binary.BigEndian.Uint16(packet[4:6]) != 1 || binary.BigEndian.Uint16(packet[6:8]) != 0 || binary.BigEndian.Uint16(packet[8:10]) != 0 || binary.BigEndian.Uint16(packet[10:12]) != 0 {
+	if len(packet) < 17 || len(packet) > 1232 || packet[2]&0x80 != 0 || binary.BigEndian.Uint16(packet[4:6]) != 1 || binary.BigEndian.Uint16(packet[6:8]) != 0 || binary.BigEndian.Uint16(packet[8:10]) != 0 || binary.BigEndian.Uint16(packet[10:12]) > 1 {
 		return "", 0, 0, errors.New("invalid DNS header")
 	}
 	labels := make([]string, 0, 8)
@@ -290,8 +290,17 @@ func parseQuery(packet []byte) (string, uint16, int, error) {
 		labels = append(labels, label)
 		i += n
 	}
-	if len(labels) == 0 || i+4 > len(packet) || binary.BigEndian.Uint16(packet[i+2:i+4]) != 1 || i+4 != len(packet) {
+	if len(labels) == 0 || i+4 > len(packet) || binary.BigEndian.Uint16(packet[i+2:i+4]) != 1 {
 		return "", 0, 0, errors.New("invalid DNS question")
+	}
+	// One EDNS OPT record (root name, type 41) may follow the question; it is ignored.
+	extra := packet[i+4:]
+	if binary.BigEndian.Uint16(packet[10:12]) == 0 {
+		if len(extra) != 0 {
+			return "", 0, 0, errors.New("invalid DNS question")
+		}
+	} else if len(extra) < 11 || extra[0] != 0 || binary.BigEndian.Uint16(extra[1:3]) != 41 || int(binary.BigEndian.Uint16(extra[9:11])) != len(extra)-11 {
+		return "", 0, 0, errors.New("invalid DNS additional record")
 	}
 	return strings.Join(labels, "."), binary.BigEndian.Uint16(packet[i : i+2]), i + 4, nil
 }

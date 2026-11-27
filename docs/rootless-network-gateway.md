@@ -209,7 +209,7 @@ Before replacement readiness, queued ingress connections are accepted and closed
 
 ## Synthetic DNS identities and recovery
 
-Synthetic DNS answers advertise a 30-second TTL, but an issued address remains bound to its hostname for the entire VM generation. At the configured mapping limit, new names receive DNS REFUSED; existing mappings keep working. Addresses are not recycled merely because their connections close or their TTL expires.
+Synthetic DNS answers advertise a 30-second TTL, but an issued address remains bound to its hostname for the entire VM generation. At the configured mapping limit, new names receive DNS REFUSED; existing mappings keep working. Addresses are not recycled merely because their connections close or their TTL expires. A query may carry one EDNS record; it is accepted and ignored, and replies never include one.
 
 The supervisor opens an owner-only `dns-mappings.jsonl` in the generation directory and passes a dedicated append-capable descriptor to each worker. The 1 MiB journal is bound to the VM, generation and immutable worker-policy digest. Each mapping is appended and synced before any DNS answer exposes it. A replacement restores the mappings and registers all cached wildcard addresses before accepting guest frames; new allocations skip restored addresses. An exclusive journal lock prevents overlapping workers from allocating independently.
 
