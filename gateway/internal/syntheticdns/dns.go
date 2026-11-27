@@ -17,7 +17,8 @@ const MaxMappings = 1024
 // MaxUpstreamAnswers bounds real A records returned for names outside explicit policy.
 const MaxUpstreamAnswers = 8
 
-// LookupFunc resolves an unmatched name on the host (IPv4 only).
+// LookupFunc resolves an unmatched name on the host (IPv4 only). The name arrives rooted
+// (trailing dot), so the host's search domains are never applied to it.
 type LookupFunc func(ctx context.Context, host string) ([]netip.Addr, error)
 
 // defaultUpstream is installed only in default-allow mode.
@@ -228,7 +229,7 @@ func (r *Resolver) Answer(ctx context.Context, query []byte) Answer {
 
 // reply runs without the resolver lock: host resolution must not stall policy names.
 func (u *defaultUpstream) reply(ctx context.Context, name string, response []byte) []byte {
-	addresses, err := u.lookup(ctx, name)
+	addresses, err := u.lookup(ctx, name+".")
 	if err != nil {
 		var dnsErr *net.DNSError
 		if errors.As(err, &dnsErr) && dnsErr.IsNotFound {

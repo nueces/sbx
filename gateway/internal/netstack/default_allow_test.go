@@ -97,8 +97,9 @@ func newDefaultHarness(t *testing.T, cfg config.Config, allow bool) *defaultHarn
 	h.forwarder.lookup = func(_ context.Context, _ string, host string) ([]netip.Addr, error) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
-		values, ok := h.lookups[host]
-		if !ok {
+		name, rooted := strings.CutSuffix(host, ".") // unrooted names would pick up host search domains
+		values, ok := h.lookups[name]
+		if !rooted || !ok {
 			return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
 		}
 		var result []netip.Addr
@@ -362,7 +363,7 @@ func TestDefaultAllowDNSServesRealAnswersWithoutRegisteringThem(t *testing.T) {
 	cfg := config.Config{Rules: []config.Rule{{ID: "git", Protocol: "tcp", Host: "api.example", Ports: []uint16{22}}}}
 	h := newDefaultHarness(t, cfg, true)
 	h.resolver.SetDefaultLookup(func(ctx context.Context, host string) ([]netip.Addr, error) {
-		if host == "hang.example" {
+		if host == "hang.example." {
 			<-ctx.Done()
 			return nil, ctx.Err()
 		}

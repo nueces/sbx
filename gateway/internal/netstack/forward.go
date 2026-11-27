@@ -245,7 +245,11 @@ func (f *TCPForwarder) forwardDefault(request *tcp.ForwarderRequest, host string
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	upstream, permitted, err := dialPermitted(ctx, host, port, config.DefaultAllowsIP, f.lookup, f.defaultDial)
+	// The name is already fully qualified; rooting it keeps the host's search domains out.
+	rooted := func(ctx context.Context, network, name string) ([]netip.Addr, error) {
+		return f.lookup(ctx, network, name+".")
+	}
+	upstream, permitted, err := dialPermitted(ctx, host, port, config.DefaultAllowsIP, rooted, f.defaultDial)
 	if upstream == nil {
 		if err == nil && !permitted {
 			f.defaultDenied.Add(1)

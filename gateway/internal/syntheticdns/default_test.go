@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 )
 
@@ -26,8 +27,12 @@ func answers(t *testing.T, reply []byte) []netip.Addr {
 }
 
 func upstreamTable(table map[string][]string, err map[string]error, calls *int) LookupFunc {
-	return func(_ context.Context, host string) ([]netip.Addr, error) {
+	return func(_ context.Context, rooted string) ([]netip.Addr, error) {
 		*calls++
+		host, ok := strings.CutSuffix(rooted, ".")
+		if !ok {
+			return nil, errors.New("lookup name is not rooted: " + rooted)
+		}
 		if failure := err[host]; failure != nil {
 			return nil, failure
 		}
