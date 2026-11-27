@@ -100,6 +100,17 @@ def test_gateway_policy_and_literal_examples_use_the_real_schema():
             assert config is not None and config.rules and not config.credentials
 
 
+def test_default_allow_example_is_a_complete_allow_config():
+    text = (DOCS / "rootless-network-gateway.md").read_text()
+    section = text.split("## Default-allow egress\n", 1)[1].split("\n## ", 1)[0]
+    examples = re.findall(r"```toml\n(.*?)```", section, re.DOTALL)
+    assert len(examples) == 1
+    config = gateway.parse_config(tomllib.loads(examples[0]), platform="linux")
+    assert config is not None and config.default == "allow" and config.rules
+    for phrase in ("LAN or VPN", "DNS-over-HTTPS", "ICMP echo", "169.254.169.254", "fd00:ec2::254"):
+        assert phrase in section
+
+
 @pytest.mark.parametrize("path", PAGES, ids=lambda p: str(p.relative_to(ROOT)))
 def test_literal_cli_examples_parse_without_running_handlers(path):
     parser = cli.build_parser()

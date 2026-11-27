@@ -17,6 +17,7 @@ Unlike [environment forwarding](environment-forwarding.md), this mechanism does 
 | Multiple credentials on one request | [Separate credentials on distinct header names](#two-credentials-on-one-request); every matching binding must be satisfied. |
 | Narrower credential scope | Restrict a binding's methods and paths within its policies' permissions. Credential-bound policies require exact DNS hosts and HTTPS. |
 | Direct IPv4 networking without host credentials | Explicit [IP policies](rootless-network-gateway.md#direct-ipv4-policies) for raw TCP or mediated HTTP/HTTPS; DNS policies do not grant direct access to their resolved IPs. |
+| Open egress with scoped credentials | [`default = "allow"`](rootless-network-gateway.md#default-allow-egress) forwards unmatched TCP raw while credentials remain bound to their explicit policies. Token scoping is then not service-policy enforcement: the guest can reach the same service token-free by IP, alias or another port. |
 | Fetch timing | [`fetch = "lazy"` (default) or `"startup"`](#fetching-at-startup-for-authentication). Startup fetch failure aborts startup. |
 | Cache and refresh | [Per-credential in-memory caching and expiry refresh](#retrieval-and-refresh); the cache survives worker/mediator recovery, not a new supervisor session. |
 

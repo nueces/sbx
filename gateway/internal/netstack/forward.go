@@ -74,14 +74,20 @@ type TCPForwarder struct {
 	uploaded      atomic.Uint64
 	downloaded    atomic.Uint64
 	perDestDenied atomic.Uint64
+	// Default-allow forwarding only; never used for explicit rules.
+	lookup           func(ctx context.Context, network, host string) ([]netip.Addr, error)
+	defaultDial      func(ctx context.Context, network, address string) (net.Conn, error)
+	defaultForwarded atomic.Uint64
+	defaultDenied    atomic.Uint64
 }
 
 type ForwardStats struct {
 	Uploaded, Downloaded, PerDestinationRejected uint64
+	DefaultForwarded, DefaultDenied              uint64
 }
 
 func (f *TCPForwarder) Stats() ForwardStats {
-	return ForwardStats{f.uploaded.Load(), f.downloaded.Load(), f.perDestDenied.Load()}
+	return ForwardStats{f.uploaded.Load(), f.downloaded.Load(), f.perDestDenied.Load(), f.defaultForwarded.Load(), f.defaultDenied.Load()}
 }
 
 func NewMediator(address string, key []byte, vmID, incarnation string) (*Mediator, error) {
@@ -102,7 +108,9 @@ func (n *Network) ForwardTCP(cfg config.Config, resolver *syntheticdns.Resolver,
 	f := &TCPForwarder{
 		config: cfg, resolver: resolver, mediator: mediator, total: total,
 		perDest: make(map[string]int), dialer: net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second},
+		lookup: net.DefaultResolver.LookupNetIP,
 	}
+	f.defaultDial = f.dialer.DialContext
 	forwarder := tcp.NewForwarder(n.Stack, 0, cfg.Quotas.TCPFlows, f.handle)
 	n.Stack.SetTransportProtocolHandler(tcp.ProtocolNumber, forwarder.HandlePacket)
 	return f
@@ -120,21 +128,48 @@ func (f *TCPForwarder) handle(request *tcp.ForwarderRequest) {
 	if name, found := f.resolver.Acquire(ip); found {
 		host, synthetic = name, true
 	}
-	rule, allowed := f.config.Match("http", host, id.LocalPort)
-	if !allowed {
-		rule, allowed = f.config.Match("tls", host, id.LocalPort)
-	}
-	if !allowed {
-		rule, allowed = f.config.Match("tcp", host, id.LocalPort)
-	}
-	if !allowed || rule.Protocol == "http" && f.mediator == nil || !f.acquire(host) {
+	reject := func() {
 		if synthetic {
 			f.resolver.Release(ip)
 		}
 		request.Complete(true)
+	}
+	// Explicit policy is resolved completely before the default is considered, so a
+	// default can never hide an explicit rule of another protocol.
+	rule, matched := f.match(host, id.LocalPort)
+	if matched {
+		// A matched rule is enforced exactly; its failures never retry through the default.
+		if rule.Protocol == "http" && f.mediator == nil || !f.acquire(host) {
+			reject()
+			return
+		}
+		go f.forward(request, rule, host, id.LocalPort, ip, synthetic)
 		return
 	}
-	go f.forward(request, rule, host, id.LocalPort, ip, synthetic)
+	if !f.config.DefaultAllows() {
+		reject()
+		return
+	}
+	// Unissued synthetic, gateway-subnet and other protected literals fail here.
+	if !synthetic && !config.DefaultAllowsIP(ip) {
+		f.defaultDenied.Add(1)
+		reject()
+		return
+	}
+	if !f.acquire(host) {
+		reject()
+		return
+	}
+	go f.forwardDefault(request, host, id.LocalPort, ip, synthetic)
+}
+
+func (f *TCPForwarder) match(host string, port uint16) (config.Rule, bool) {
+	for _, protocol := range []string{"http", "tls", "tcp"} {
+		if rule, ok := f.config.Match(protocol, host, port); ok {
+			return rule, true
+		}
+	}
+	return config.Rule{}, false
 }
 
 func (f *TCPForwarder) acquire(host string) bool {
@@ -199,6 +234,42 @@ func (f *TCPForwarder) forward(request *tcp.ForwarderRequest, rule config.Rule, 
 	f.downloaded.Add(downloaded)
 }
 
+// forwardDefault never contacts the mediator or credential broker. Every candidate,
+// literal or resolved, must pass the default address contract; only checked numeric
+// addresses are dialed, so DNS rebinding cannot reach protected addresses. It dials
+// before accepting, so a blocked or unreachable destination is refused with a reset.
+func (f *TCPForwarder) forwardDefault(request *tcp.ForwarderRequest, host string, port uint16, syntheticIP netip.Addr, synthetic bool) {
+	defer f.release(host)
+	if synthetic {
+		defer f.resolver.Release(syntheticIP)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// The name is already fully qualified; rooting it keeps the host's search domains out.
+	rooted := func(ctx context.Context, network, name string) ([]netip.Addr, error) {
+		return f.lookup(ctx, network, name+".")
+	}
+	upstream, permitted, err := dialPermitted(ctx, host, port, config.DefaultAllowsIP, rooted, f.defaultDial)
+	if upstream == nil {
+		if err == nil && !permitted {
+			f.defaultDenied.Add(1)
+		}
+		request.Complete(true)
+		return
+	}
+	var wq waiter.Queue
+	endpoint, tcpErr := request.CreateEndpoint(&wq)
+	request.Complete(tcpErr != nil)
+	if tcpErr != nil {
+		upstream.Close()
+		return
+	}
+	f.defaultForwarded.Add(1)
+	uploaded, downloaded := relayIdle(gonet.NewTCPConn(&wq, endpoint), upstream, rawTCPIdle)
+	f.uploaded.Add(uploaded)
+	f.downloaded.Add(downloaded)
+}
+
 func (f *TCPForwarder) passthrough(ctx context.Context, guest net.Conn, rule config.Rule, host string, port uint16) (uint64, uint64, error) {
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = guest.SetReadDeadline(deadline)
@@ -224,29 +295,44 @@ func (f *TCPForwarder) dial(ctx context.Context, rule config.Rule, host string, 
 	if rule.Protocol == "http" {
 		return f.mediator.Dial(ctx, rule, host, port)
 	}
-	var addresses []netip.Addr
-	if ip, err := netip.ParseAddr(host); err == nil {
-		if !rule.AllowsDirectIP(ip) {
-			return nil, errors.New("direct-IP destination denied")
-		}
-		addresses = []netip.Addr{ip}
-	} else {
-		var err error
-		addresses, err = net.DefaultResolver.LookupNetIP(ctx, "ip", host)
-		if err != nil {
-			return nil, err
-		}
+	if ip, err := netip.ParseAddr(host); err == nil && !rule.AllowsDirectIP(ip) {
+		return nil, errors.New("direct-IP destination denied")
+	}
+	conn, _, err := dialPermitted(ctx, host, port, rule.AllowsIP, net.DefaultResolver.LookupNetIP, f.dialer.DialContext)
+	if err != nil {
+		return nil, err
+	}
+	if conn == nil {
+		return nil, fmt.Errorf("no permitted address for %s", host)
+	}
+	return conn, nil
+}
+
+// dialPermitted resolves host (unless it is a literal IP) and dials, in order, only the
+// numeric addresses allow accepts. permitted reports whether any address passed allow;
+// conn is nil when none could be dialed. Only lookup failures are returned as err.
+func dialPermitted(
+	ctx context.Context, host string, port uint16, allow func(netip.Addr) bool,
+	lookup func(ctx context.Context, network, host string) ([]netip.Addr, error),
+	dial func(ctx context.Context, network, address string) (net.Conn, error),
+) (conn net.Conn, permitted bool, err error) {
+	addresses := []netip.Addr{}
+	if ip, parseErr := netip.ParseAddr(host); parseErr == nil {
+		addresses = append(addresses, ip)
+	} else if addresses, err = lookup(ctx, "ip", host); err != nil {
+		return nil, false, err
 	}
 	for _, ip := range addresses {
-		if !rule.AllowsIP(ip) {
+		ip = ip.Unmap()
+		if !allow(ip) {
 			continue
 		}
-		conn, err := f.dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), strconv.Itoa(int(port))))
-		if err == nil {
-			return conn, nil
+		permitted = true
+		if conn, err := dial(ctx, "tcp", net.JoinHostPort(ip.String(), strconv.Itoa(int(port)))); err == nil {
+			return conn, true, nil
 		}
 	}
-	return nil, fmt.Errorf("no permitted address for %s", host)
+	return nil, permitted, nil
 }
 
 func (m *Mediator) Dial(ctx context.Context, rule config.Rule, host string, port uint16) (net.Conn, error) {

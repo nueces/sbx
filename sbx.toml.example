@@ -42,9 +42,11 @@ git_config = true
 # port_forwards = ["3000", "8080:3000", "0.0.0.0:3000:3000"]
 
 # Optional rootless gateway policy. Default is deny; add only destinations the guest needs.
+# default = "allow" enforces listed policies and forwards other TCP raw (no tokens) to
+# public and RFC1918 private addresses, including services on the host's LAN address.
 # Linux amd64 is tested. macOS artifacts exist but runtime is unverified.
 # [network]
-# default = "deny"
+# default = "deny"  # or "allow"
 # mitmweb = false  # Opt-in authenticated, read-only host-loopback metadata UI.
 #
 # [[network.policy]]

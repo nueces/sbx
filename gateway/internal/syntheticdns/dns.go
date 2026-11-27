@@ -1,15 +1,32 @@
 package syntheticdns
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
+	"net"
 	"net/netip"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 const MaxMappings = 1024
+
+// MaxUpstreamAnswers bounds real A records returned for names outside explicit policy.
+const MaxUpstreamAnswers = 8
+
+// LookupFunc resolves an unmatched name on the host (IPv4 only). The name arrives rooted
+// (trailing dot), so the host's search domains are never applied to it.
+type LookupFunc func(ctx context.Context, host string) ([]netip.Addr, error)
+
+// defaultUpstream is installed only in default-allow mode.
+type defaultUpstream struct {
+	lookup  LookupFunc
+	permit  func(netip.Addr) bool
+	answers atomic.Uint64
+}
 
 var ErrCapacity = errors.New("synthetic DNS capacity exhausted")
 
@@ -30,14 +47,30 @@ type Mapping struct {
 }
 
 type Resolver struct {
-	policy  Policy
-	limit   int
-	mu      sync.Mutex
-	byName  map[string]*entry
-	byIP    map[netip.Addr]*entry
-	next    uint32
-	clock   uint64
-	journal *journalState
+	policy   Policy
+	limit    int
+	mu       sync.Mutex
+	byName   map[string]*entry
+	byIP     map[netip.Addr]*entry
+	next     uint32
+	clock    uint64
+	journal  *journalState
+	upstream *defaultUpstream
+}
+
+// SetDefaultLookup enables real, filtered answers for names outside explicit policy.
+// It must be called before the resolver serves queries. Real answers never receive
+// synthetic identities, are never journaled and never consume mapping capacity.
+func (r *Resolver) SetDefaultLookup(lookup LookupFunc, permit func(netip.Addr) bool) {
+	r.upstream = &defaultUpstream{lookup: lookup, permit: permit}
+}
+
+// UpstreamAnswers counts replies served from host resolution for unmatched names.
+func (r *Resolver) UpstreamAnswers() uint64 {
+	if r.upstream == nil {
+		return 0
+	}
+	return r.upstream.answers.Load()
 }
 
 func New(policy Policy) *Resolver { return NewWithLimit(policy, MaxMappings) }
@@ -153,10 +186,20 @@ func (r *Resolver) Len() int {
 	return len(r.byName)
 }
 
+// Answer is a DNS reply; Synthetic is valid only when the reply carries a synthetic identity.
+type Answer struct {
+	Packet    []byte
+	Synthetic netip.Addr
+}
+
 func (r *Resolver) Reply(query []byte) []byte {
+	return r.Answer(context.Background(), query).Packet
+}
+
+func (r *Resolver) Answer(ctx context.Context, query []byte) Answer {
 	name, qtype, questionEnd, err := parseQuery(query)
 	if err != nil {
-		return nil
+		return Answer{}
 	}
 	response := append([]byte(nil), query[:questionEnd]...)
 	response[2], response[3] = 0x81, 0x80
@@ -165,10 +208,13 @@ func (r *Resolver) Reply(query []byte) []byte {
 	binary.BigEndian.PutUint16(response[10:12], 0)
 	if _, err := netip.ParseAddr(name); err == nil {
 		response[3] = 0x85
-		return response
+		return Answer{Packet: response}
 	}
 	if qtype != 1 {
-		return response
+		return Answer{Packet: response}
+	}
+	if r.upstream != nil && !r.policy.AllowsHost(name) {
+		return Answer{Packet: r.upstream.reply(ctx, name, response)}
 	}
 	ip, err := r.Resolve(name)
 	if err != nil {
@@ -176,16 +222,49 @@ func (r *Resolver) Reply(query []byte) []byte {
 		if errors.Is(err, ErrPersistence) {
 			response[3] = 0x82 // SERVFAIL; the worker also receives the fatal persistence error.
 		}
+		return Answer{Packet: response}
+	}
+	return Answer{Packet: appendA(response, []netip.Addr{ip}), Synthetic: ip}
+}
+
+// reply runs without the resolver lock: host resolution must not stall policy names.
+func (u *defaultUpstream) reply(ctx context.Context, name string, response []byte) []byte {
+	addresses, err := u.lookup(ctx, name+".")
+	if err != nil {
+		var dnsErr *net.DNSError
+		if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+			response[3] = 0x83 // NXDOMAIN
+		} else {
+			response[3] = 0x82 // SERVFAIL; not fatal to the worker
+		}
 		return response
 	}
-	binary.BigEndian.PutUint16(response[6:8], 1)
-	answer := []byte{0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4}
-	answer = append(answer, ip.AsSlice()...)
-	return append(response, answer...)
+	permitted := make([]netip.Addr, 0, MaxUpstreamAnswers)
+	for _, ip := range addresses {
+		ip = ip.Unmap()
+		if !ip.Is4() || !u.permit(ip) || slices.Contains(permitted, ip) {
+			continue
+		}
+		permitted = append(permitted, ip)
+		if len(permitted) == MaxUpstreamAnswers {
+			break
+		}
+	}
+	u.answers.Add(1)
+	return appendA(response, permitted) // no permitted answers: NOERROR/NODATA
+}
+
+func appendA(response []byte, addresses []netip.Addr) []byte {
+	binary.BigEndian.PutUint16(response[6:8], uint16(len(addresses)))
+	for _, ip := range addresses {
+		response = append(response, 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4)
+		response = append(response, ip.AsSlice()...)
+	}
+	return response
 }
 
 func parseQuery(packet []byte) (string, uint16, int, error) {
-	if len(packet) < 17 || len(packet) > 1232 || packet[2]&0x80 != 0 || binary.BigEndian.Uint16(packet[4:6]) != 1 || binary.BigEndian.Uint16(packet[6:8]) != 0 || binary.BigEndian.Uint16(packet[8:10]) != 0 || binary.BigEndian.Uint16(packet[10:12]) != 0 {
+	if len(packet) < 17 || len(packet) > 1232 || packet[2]&0x80 != 0 || binary.BigEndian.Uint16(packet[4:6]) != 1 || binary.BigEndian.Uint16(packet[6:8]) != 0 || binary.BigEndian.Uint16(packet[8:10]) != 0 || binary.BigEndian.Uint16(packet[10:12]) > 1 {
 		return "", 0, 0, errors.New("invalid DNS header")
 	}
 	labels := make([]string, 0, 8)
@@ -211,8 +290,17 @@ func parseQuery(packet []byte) (string, uint16, int, error) {
 		labels = append(labels, label)
 		i += n
 	}
-	if len(labels) == 0 || i+4 > len(packet) || binary.BigEndian.Uint16(packet[i+2:i+4]) != 1 || i+4 != len(packet) {
+	if len(labels) == 0 || i+4 > len(packet) || binary.BigEndian.Uint16(packet[i+2:i+4]) != 1 {
 		return "", 0, 0, errors.New("invalid DNS question")
+	}
+	// One EDNS OPT record (root name, type 41) may follow the question; it is ignored.
+	extra := packet[i+4:]
+	if binary.BigEndian.Uint16(packet[10:12]) == 0 {
+		if len(extra) != 0 {
+			return "", 0, 0, errors.New("invalid DNS question")
+		}
+	} else if len(extra) < 11 || extra[0] != 0 || binary.BigEndian.Uint16(extra[1:3]) != 41 || int(binary.BigEndian.Uint16(extra[9:11])) != len(extra)-11 {
+		return "", 0, 0, errors.New("invalid DNS additional record")
 	}
 	return strings.Join(labels, "."), binary.BigEndian.Uint16(packet[i : i+2]), i + 4, nil
 }

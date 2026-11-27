@@ -67,6 +67,41 @@ def test_direct_ip_requires_exact_worker_readiness_count(
         instance.close()
 
 
+@pytest.mark.parametrize(
+    ("configured", "reported", "accepted"),
+    [
+        ("deny", None, False),
+        ("deny", "deny", True),
+        ("allow", "deny", False),
+        ("allow", "allow", True),
+    ],
+)
+def test_worker_readiness_must_report_configured_egress_default(
+    lifecycle_config, tmp_path, monkeypatch, configured, reported, accepted
+):
+    config = replace(lifecycle_config, default=configured)
+    instance, _runner, _listeners = controller(config, tmp_path, monkeypatch)
+    original = instance._read_worker_status
+
+    def readiness(expected, deadline=None):
+        payload = original(expected, deadline)
+        if expected == "ready":
+            payload.pop("egress_default", None)
+            if reported is not None:
+                payload["egress_default"] = reported
+        return payload
+
+    monkeypatch.setattr(instance, "_read_worker_status", readiness)
+    try:
+        if accepted:
+            instance.prepare()
+        else:
+            with pytest.raises(gateway.GatewayAuthenticationError, match="identity mismatch"):
+                instance.prepare()
+    finally:
+        instance.close()
+
+
 @pytest.mark.parametrize("routes", [1, 2])
 def test_direct_ip_readiness_is_rechecked_on_replacement(
     lifecycle_config, tmp_path, monkeypatch, routes
@@ -237,6 +272,7 @@ class FakeRunner:
                 "incarnation_proof": hmac.new(token, message, hashlib.sha256).hexdigest(),
                 "mediator": True,
                 "ingress": 1,
+                "egress_default": policy.get("default", "deny"),
                 "hardening": "no_new_privs,seccomp,landlock-unavailable,rlimits",
             }
             network_ready = b'\n{"status":"network-ready","qemu_pid":12345}\n'
@@ -690,6 +726,15 @@ def test_two_vm_resources_and_quota_failure_are_isolated(
     b_state = gateway.read_state(b.directory)
     assert b_state["counters"]["dns_rejected"] == 1
     assert b_state["last_failure"]["code"] == "quota_exhausted"
+    a._worker_buffer.extend(
+        b'{"status":"stats","default_forwarded":3,"default_denied":2,"dns_upstream_answers":5}\n'
+    )
+    a._drain_worker_stats()
+    a_counters = gateway.read_state(a.directory)["counters"]
+    assert a_counters["default_forwarded"] == 3
+    assert a_counters["default_denied"] == 2
+    assert a_counters["dns_upstream_answers"] == 5
+    # Default-route denials are policy outcomes, not resource exhaustion.
     assert gateway.read_state(a.directory)["last_failure"] is None
 
     a_pids = {process.pid for process in a.processes.values()}
@@ -1490,7 +1535,7 @@ print(json.dumps({'status':'ready','version':1,'vm_id':sys.argv[3],
                   'generation':sys.argv[4],'digest':policy['digest'],
                   'incarnation':sys.argv[5],
                   'incarnation_proof':hmac.new(token,message,hashlib.sha256).hexdigest(),
-                  'mediator':True,'ingress':1,
+                  'mediator':True,'ingress':1,'egress_default':policy.get('default','deny'),
                   'hardening':'no_new_privs,seccomp,landlock-unavailable,rlimits'}), flush=True)
 print(json.dumps({'status':'network-ready','qemu_pid':os.getppid()}), flush=True)
 signal.pause()
@@ -1504,7 +1549,7 @@ print(json.dumps({'status':'ready','version':1,'vm_id':sys.argv[3],
                   'generation':sys.argv[4],'digest':policy['digest'],
                   'incarnation':sys.argv[5],
                   'incarnation_proof':hmac.new(token,message,hashlib.sha256).hexdigest(),
-                  'mediator':True,'ingress':1,
+                  'mediator':True,'ingress':1,'egress_default':policy.get('default','deny'),
                   'hardening':'no_new_privs,seccomp,landlock-unavailable,rlimits'}), flush=True)
 while True:
     print('{"status":"stats"}', flush=True)
@@ -2004,6 +2049,36 @@ def test_supervisor_run_rejects_invalid_inherited_payload(tmp_path: Path) -> Non
         os.close(lock_fd)
 
 
+def test_supervisor_run_rejects_config_that_does_not_match_its_digest(
+    lifecycle_config: gateway.GatewayConfig,
+) -> None:
+    config = replace(lifecycle_config, default="allow")
+    payload = gateway_supervisor.config_payload(config)
+    payload["default"] = "deny"
+    metadata = {
+        "config": payload,
+        "requested_config_digest": config.digest("vm1", "generation1"),
+        "vm_id": "vm1",
+        "generation": "generation1",
+    }
+    parent, child = socket.socketpair()
+    config_read, config_write = os.pipe()
+    secret_read, secret_write = os.pipe()
+    os.write(config_write, json.dumps(metadata).encode())
+    os.close(config_write)
+    os.close(secret_write)
+    lock_fd = os.open("/dev/null", os.O_RDONLY)
+    try:
+        assert (
+            gateway_supervisor.run(os.dup(child.fileno()), config_read, secret_read, lock_fd) == 1
+        )
+        assert "does not match its digest" in gateway_supervisor.recv_frame(parent, 1)["error"]
+    finally:
+        parent.close()
+        child.close()
+        os.close(lock_fd)
+
+
 @pytest.mark.parametrize("sanitized", [False, True])
 @pytest.mark.parametrize("fetch", ["lazy", "startup"])
 def test_persistent_bootstrap_uses_fresh_subprocess_and_inherited_provider_fd(
@@ -2198,11 +2273,15 @@ def test_configuration_drift_uses_live_generation_digest(
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux gateway worker acceptance")
-def test_persistent_supervisor_survives_bootstrap_and_drains_data_plane(tmp_path: Path) -> None:
+@pytest.mark.parametrize("default", ["deny", "allow"])
+def test_persistent_supervisor_survives_bootstrap_and_drains_data_plane(
+    tmp_path: Path, default: str
+) -> None:
     del tmp_path
     config = gateway.parse_config(
         {
             "network": {
+                "default": default,
                 "policy": [
                     {
                         "id": "discard",
@@ -2216,7 +2295,7 @@ def test_persistent_supervisor_survives_bootstrap_and_drains_data_plane(tmp_path
                         "hosts": ["*.example.com"],
                         "ports": [443],
                     },
-                ]
+                ],
             }
         },
         platform="linux",

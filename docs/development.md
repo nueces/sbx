@@ -92,7 +92,7 @@ Resource snapshots do not establish an hour-long plateau. A short smoke does not
 
 ## Packaging and integration seams
 
-`hatch_build.py` normalizes packaged workers to mode `0755`; shared worktrees may not expose the executable bit correctly. Execute the clean-installed worker and mediator, verify asset parity, and do not infer installability from a source inspection.
+`hatch_build.py` fails the build if a packaged worker is missing or not executable; it never changes file modes. Shared worktrees may not expose the executable bit correctly. Execute the clean-installed worker and mediator, verify asset parity, and do not infer installability from a source inspection.
 
 The [fragile-glue ledger](fragile-glue.md) names private upstream APIs and exit conditions. Check changes to pinned SmolVM/Moby/kernel inputs and notices:
 

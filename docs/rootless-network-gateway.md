@@ -84,11 +84,11 @@ guest_port = 3000
 
 Old `[sbx].port_forwards` entries remain accepted and are normalized into ingress rules.
 
-All supported policy modes use TCP. Overlapping host/port scopes are rejected even when their mode names differ: for example, HTTP mediation for `*.example.com:443` cannot coexist with raw TCP for `db.example.com:443`. Distinct ports or disjoint host scopes remain valid. Merely adding `[network]` still enables default-deny outbound networking.
+All supported policy modes use TCP. Overlapping host/port scopes are rejected even when their mode names differ: for example, HTTP mediation for `*.example.com:443` cannot coexist with raw TCP for `db.example.com:443`. Distinct ports or disjoint host scopes remain valid. Merely adding `[network]` still enables default-deny outbound networking; see [default-allow egress](#default-allow-egress) for the opt-in alternative.
 
 ## Network policies
 
-Policy examples below are network fragments: merge them into your `.sbx.toml` rather than repeat existing tables. `[network]` enables default-deny networking; without it the normal backend uses SLIRP. All destinations use the same policy table with an explicit mode:
+Policy examples below are network fragments: merge them into your `.sbx.toml` rather than repeat existing tables. `[network]` enables default-deny networking unless `default = "allow"` is set; without it the normal backend uses SLIRP. All destinations use the same policy table with an explicit mode:
 
 ```toml
 [[network.policy]]
@@ -125,6 +125,39 @@ ports = [5432]
 `allow_ranges` is valid only for TLS passthrough and raw TCP. Each normalized CIDR explicitly permits an otherwise forbidden resolved address; it does not authorize additional hosts. Mediated HTTP rejects this option and remains public-unicast-only. Literal TCP additionally follows the hard exclusions below.
 
 Methods normalize to uppercase. Paths repeatedly percent-decode within a fixed bound, reject invalid encoding, control characters, backslashes and dot segments, then match the whole prefix or a slash-delimited descendant. Credential bindings may narrow but never widen their parent policies; see [bindings](network-credentials.md#bindings).
+
+## Default-allow egress
+
+`default = "allow"` keeps every explicit policy exactly as written and forwards all other guest TCP (ports 1–65535) raw, without the mediator, credential retrieval, token injection or TLS interception. Explicit policies then mainly decide where sbx may inject host-held credentials. Complete configuration:
+
+```toml
+[network]
+default = "allow"
+
+[[network.policy]]
+id = "service-api"
+mode = "http-mediated"
+hosts = ["api.example.com"]
+ports = [443]
+methods = ["GET", "POST"]
+path_prefixes = ["/v1/"]
+```
+
+- A connection matching a policy host and port is enforced by that policy only. Denied methods/paths, SNI mismatches, missing mediation, authentication, DNS or upstream failures are rejected; they never retry token-free through the default route. `api.example.com:80` and every other destination are unmatched and use the default route.
+- Unmatched traffic may reach public unicast addresses and IPv4 private networks (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`). Loopback, link-local (including the AWS/GCP/Azure/OCI `169.254.169.254` metadata address), `0.0.0.0/8`, CGNAT `100.64.0.0/10` (including Alibaba `100.100.100.200`), Azure `168.63.129.16`, the guest/gateway subnet, the synthetic pool, documentation, reserved, broadcast and multicast space are blocked. IPv6 is limited to global `2000::/3` minus transition/documentation ranges; ULA (including AWS `fd00:ec2::254`) and NAT64 are blocked. Every literal and every resolved address is checked, and only the checked numeric address is dialed. A blocked or unreachable destination is refused with a TCP reset. Other provider-specific metadata services cannot be guaranteed.
+- Names matched by a policy keep synthetic identities. Other names are resolved on the host as fully qualified names (the host's DNS search domains are not applied) and receive their real IPv4 answers (up to 8, TTL 30), filtered by the same address rules: NXDOMAIN for missing names, an empty answer when only blocked addresses resolve, SERVFAIL for other resolver failures. These answers never consume synthetic mappings or the DNS journal.
+- Explicit `allow_ranges` and direct-IP rules are unchanged and are not widened; default allow does not add exceptions to explicit policies.
+- Changing `default` changes the configuration identity; stop/start to apply it. Old workers reject allow-mode configs, and readiness reports `egress_default`, so a mismatched worker fails closed.
+- On Linux, allow mode keeps Landlock filesystem confinement but no longer restricts the worker's outbound TCP connect ports; the address rules above are the enforcement.
+
+**Security boundaries:**
+
+- **Token scoping is not service-policy enforcement.** The guest can reach a policy's service token-free through a literal IP, an alias, another port, or by resolving names itself over DNS-over-HTTPS, DNS-over-TLS or TCP/53. Hostname attribution is unavailable for unmatched names because the guest connects to real addresses.
+- **Private access includes the host.** Services bound to the host's LAN or VPN addresses are reachable; host firewalls and service authentication still matter.
+- **No payload filtering on the default route.** Host-held credentials are never fetched or injected there, and guest-supplied data is forwarded opaquely.
+- **TCP only.** UDP other than gateway DNS, QUIC/HTTP/3 and guest IPv6 are not forwarded. ICMP echo may appear to succeed for arbitrary destinations; it does not indicate reachability.
+
+Status counters `default_forwarded`, `default_denied` and `dns_upstream_answers` record default-route activity without payloads.
 
 ## Direct IPv4 policies
 
@@ -176,7 +209,7 @@ Before replacement readiness, queued ingress connections are accepted and closed
 
 ## Synthetic DNS identities and recovery
 
-Synthetic DNS answers advertise a 30-second TTL, but an issued address remains bound to its hostname for the entire VM generation. At the configured mapping limit, new names receive DNS REFUSED; existing mappings keep working. Addresses are not recycled merely because their connections close or their TTL expires.
+Synthetic DNS answers advertise a 30-second TTL, but an issued address remains bound to its hostname for the entire VM generation. At the configured mapping limit, new names receive DNS REFUSED; existing mappings keep working. Addresses are not recycled merely because their connections close or their TTL expires. A query may carry one EDNS record; it is accepted and ignored, and replies never include one.
 
 The supervisor opens an owner-only `dns-mappings.jsonl` in the generation directory and passes a dedicated append-capable descriptor to each worker. The 1 MiB journal is bound to the VM, generation and immutable worker-policy digest. Each mapping is appended and synced before any DNS answer exposes it. A replacement restores the mappings and registers all cached wildcard addresses before accepting guest frames; new allocations skip restored addresses. An exclusive journal lock prevents overlapping workers from allocating independently.
 
@@ -243,7 +276,7 @@ Guest-facing policy/credential denials now use HTTP 403 with a fixed empty body.
 ## Security notes
 
 - The guest's effective DNS resolver must be the gateway at `192.0.2.1`. UDP DNS sent elsewhere has no forwarding path; TCP port 53 is denied unless an explicit TCP policy allows it. DNS-over-HTTPS and DNS-over-TLS are ordinary HTTPS/TLS traffic, so do not allow their providers unless intended. Addresses learned through another resolver do not grant egress by themselves.
-- Unknown destinations, unconfigured direct IP egress, alternate DNS, UDP/443/QUIC, identity mismatches, crashes, and unsupported protocols fail closed.
+- In default-deny mode, unknown destinations, unconfigured direct IP egress, alternate DNS, UDP/443/QUIC, identity mismatches, crashes, and unsupported protocols fail closed. In [default-allow mode](#default-allow-egress), unmatched TCP to permitted addresses is forwarded raw, including alternate DNS over TCP and DNS-over-HTTPS/TLS; UDP/QUIC, identity mismatches, crashes and explicit-policy failures still fail closed.
 - Raw TCP/TLS forwarding denies non-public/special-use addresses by default, including `100.64.0.0/10` and Alibaba metadata `100.100.100.200`, reserved/documentation ranges and IPv6 transition/special-use space. Explicit `allow_ranges` exceptions remain available for those forwarding modes; IPv4-mapped addresses are checked as IPv4.
 - DNS-named mediated HTTP resolves the admitted hostname once per new upstream connection, validates every answer as public unicast (including IPv4-mapped addresses), and pins a validated numeric destination. Loopback/private/link-local/metadata, reserved/non-public and multicast answers are denied, including mixed public/private results. TLS identity remains the logical hostname. HTTP mode does not allow private-range exceptions; local protocol tests use a test-only launcher, not a production option.
 - Secrets stay host-side; the guest receives placeholders only, scoped by destination and approved fields.

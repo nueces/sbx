@@ -158,6 +158,16 @@ Use the [IPv4 examples](rootless-network-gateway.md#direct-ipv4-policies) with a
 
 The automated direct-IP fixture uses owned isolated public-address origins, not an arbitrary third-party endpoint. It does not weaken production address checks.
 
+## Optional default-allow check
+
+Change `default` to `"allow"` in the step 1 config, then stop/start to apply it; `network status` must report a new configuration digest. Repeat step 3 in the guest with these expectations instead:
+
+- `example.com` still resolves to a `198.18.0.0/15` synthetic address and the denied `POST` remains denied (it never retries token-free).
+- `getent ahostsv4 www.example.com` returns real public addresses; `curl -fsSI https://www.example.com/` and `http://example.com/` succeed through the default route without a mediator audit record.
+- A service you own on an RFC1918 address is reachable. Link-local metadata (`curl --max-time 5 http://169.254.169.254/`), `100.100.100.200` and other blocked classes from the [default-allow guide](rootless-network-gateway.md#default-allow-egress) must fail.
+
+Host diagnostics should show increasing `default_forwarded` and `default_denied` counters. Restore `default = "deny"` and stop/start afterwards.
+
 ## Failure, preservation and optional cleanup (host)
 
 **Default on failure: stop if possible and retain the VM, disk and entire private temporary tree.** Do not run `remove`, `recreate`, a recursive deletion or a failed request again to manufacture evidence. If guest export is unavailable, keep the stopped disk for later recovery. Never post raw logs, state, CA keys or UI login files; URLs can contain secrets.

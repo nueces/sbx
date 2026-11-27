@@ -51,6 +51,11 @@ func TestLinuxProfileAllowsRequiredSocketsAndDeniesPrivilegeAndFiles(t *testing.
 		t.Fatalf("hardening child failed: %v\n%s", err, output)
 	}
 	<-done
+	anyPort := exec.CommandContext(ctx, binary, "-test.run=TestLinuxHardeningChild")
+	anyPort.Env = append(os.Environ(), "SBX_HARDENING_CHILD=1", "SBX_ALLOWED_PORT="+strconv.Itoa(port), "SBX_ANY_TCP_PORT=1")
+	if anyOutput, err := anyPort.CombinedOutput(); err != nil {
+		t.Fatalf("default-allow hardening child failed: %v\n%s", err, anyOutput)
+	}
 	t.Logf("child profile: %s", output)
 	if !strings.Contains(string(output), "no_new_privs,seccomp,") || !strings.Contains(string(output), ",rlimits") {
 		t.Fatalf("active profile missing: %s", output)
@@ -62,6 +67,7 @@ func TestLinuxHardeningChild(t *testing.T) {
 		return
 	}
 	port, _ := strconv.Atoi(os.Getenv("SBX_ALLOWED_PORT"))
+	anyTCPPort := os.Getenv("SBX_ANY_TCP_PORT") == "1"
 	const threads = 4
 	ready := make(chan int, threads)
 	verify := make(chan Status)
@@ -99,7 +105,7 @@ func TestLinuxHardeningChild(t *testing.T) {
 	if len(tids) != threads {
 		t.Fatal("did not establish distinct pre-existing OS threads")
 	}
-	status, err := Apply(128, []uint16{uint16(port)})
+	status, err := Apply(128, []uint16{uint16(port)}, anyTCPPort)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,12 +132,19 @@ func TestLinuxHardeningChild(t *testing.T) {
 	if !status.NoNewPrivs || !status.Seccomp || !status.Limits {
 		t.Fatalf("required Linux hardening unavailable: %s", status.Encode())
 	}
-	conn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
-	if err != nil {
-		t.Fatalf("allowed loopback socket failed: %v", err)
+	if !anyTCPPort {
+		conn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		if err != nil {
+			t.Fatalf("allowed loopback socket failed: %v", err)
+		}
+		conn.Close()
 	}
-	conn.Close()
-	if status.Landlock {
+	if status.Landlock && anyTCPPort {
+		if _, err := net.Dial("tcp", "127.0.0.1:1"); errors.Is(err, os.ErrPermission) {
+			t.Fatalf("default-allow confinement denied an arbitrary TCP port: %v", err)
+		}
+	}
+	if status.Landlock && !anyTCPPort {
 		if _, err := net.Dial("tcp", "127.0.0.1:1"); !errors.Is(err, os.ErrPermission) {
 			t.Fatalf("unapproved TCP port was not denied: %v", err)
 		}

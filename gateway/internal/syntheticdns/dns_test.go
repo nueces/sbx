@@ -1,6 +1,7 @@
 package syntheticdns
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -157,8 +158,50 @@ func TestSnapshotRestore(t *testing.T) {
 	}
 }
 
+// withAdditional appends raw additional-section bytes and sets the header's record count.
+func withAdditional(count byte, extra ...byte) []byte {
+	packet := query("api.example", 1)
+	packet[11] = count
+	return append(packet, extra...)
+}
+
+func TestQueryMayCarryOneEDNSRecord(t *testing.T) {
+	opt := []byte{0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0, 0, 0} // root name, type OPT, 1232-byte payload, no options
+	withOption := append(append([]byte(nil), opt[:9]...), 0, 4, 0, 10, 0, 0)
+	r := New(allow{"api.example": true})
+	plain := r.Reply(query("api.example", 1))
+	if plain == nil {
+		t.Fatal("plain query not answered")
+	}
+	for name, packet := range map[string][]byte{
+		"bare OPT":         withAdditional(1, opt...),
+		"OPT with options": withAdditional(1, withOption...),
+	} {
+		if reply := r.Reply(packet); !bytes.Equal(reply, plain) {
+			t.Errorf("%s: reply %v, want the plain reply %v", name, reply, plain)
+		}
+	}
+	notOPT := append([]byte(nil), opt...)
+	notOPT[2] = 1
+	longData := append([]byte(nil), opt...)
+	longData[10] = 4
+	for name, packet := range map[string][]byte{
+		"two records":             withAdditional(2, append(append([]byte(nil), opt...), opt...)...),
+		"record is not OPT":       withAdditional(1, notOPT...),
+		"data length past packet": withAdditional(1, longData...),
+		"non-root name":           withAdditional(1, append([]byte{1, 'a'}, opt...)...),
+		"count without record":    withAdditional(1),
+		"stray byte, count zero":  withAdditional(0, 0),
+	} {
+		if reply := r.Reply(packet); reply != nil {
+			t.Errorf("%s: malformed query was answered: %v", name, reply)
+		}
+	}
+}
+
 func FuzzReply(f *testing.F) {
 	f.Add(query("api.example", 1))
+	f.Add(withAdditional(1, 0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0, 0, 0))
 	r := New(allow{"api.example": true})
 	f.Fuzz(func(t *testing.T, packet []byte) { _ = r.Reply(packet) })
 }
